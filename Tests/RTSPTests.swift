@@ -62,11 +62,16 @@ final class RTSPTests: XCTestCase {
         m=video 0 RTP/AVP 96 97
         a=rtpmap:96 H264/90000
         a=rtpmap:97 H265/90000
+        a=fmtp:96 sprop-parameter-sets=Zw==,aA==
+        a=fmtp:97 sprop-vps=QA==; sprop-sps=Qg==; sprop-pps=RA==
         a=control:rtsp://user:secret@evil.example:999/track1
         """
         let description = try RTSPSDPParser.parse(sdp, baseURL: URL(string: "rtsp://192.0.2.1:554/live/")!, preferredCodec: "H265")
         XCTAssertEqual(description.codec, "H265")
         XCTAssertEqual(description.payloadType, 97)
+        XCTAssertEqual(description.parameterSets, [Data([0x40]), Data([0x42]), Data([0x44])])
+        let h264 = try RTSPSDPParser.parse(sdp, baseURL: description.controlURL, preferredCodec: "H264")
+        XCTAssertEqual(h264.parameterSets, [Data([0x67]), Data([0x68])])
         XCTAssertEqual(description.controlURL.absoluteString, "rtsp://192.0.2.1:554/track1")
         XCTAssertThrowsError(try RTSPSDPParser.parse("m=video 0 RTP/AVP 26\na=rtpmap:26 JPEG/90000\na=control:track", baseURL: description.controlURL))
         XCTAssertThrowsError(try RTSPSDPParser.parse(sdp + "\na=fmtp:97 sprop-max-don-diff=1", baseURL: description.controlURL))

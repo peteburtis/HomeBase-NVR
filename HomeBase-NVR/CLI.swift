@@ -7,7 +7,7 @@ import os
 struct HBNVR: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "hbnvr", abstract: "Manage the HomeBase NVR service.", version: BuildInfo.version,
-        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Agent.self])
+        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Store.self, Agent.self])
 }
 
 func command(_ work: () throws -> Void) throws {
@@ -67,8 +67,12 @@ struct Status: ParsableCommand {
             } else if let status = reply.status {
                 print("hbnvr ready — version \(status.version), PID \(status.pid), uptime \(Int(status.uptimeSeconds))s")
                 for stream in status.streams ?? [] {
-                    print("  \(stream.name): \(stream.state) — \(stream.frames) frames, \(String(format: "%.1f", stream.framesPerSecond)) fps, \(String(format: "%.1f", stream.receiveKbps)) kb/s (discard)")
+                    print("  \(stream.name): \(stream.state) — \(stream.frames) frames, \(String(format: "%.1f", stream.framesPerSecond)) fps, \(String(format: "%.1f", stream.receiveKbps)) kb/s (\(stream.mode))")
                     if let error = stream.lastError { print("    \(error)") }
+                }
+                for store in status.stores ?? [] {
+                    print("  Store \(store.name): \(store.state) — \(store.activeRecordings) active, \(store.completedShards) completed shards, \(store.pendingBytes) queued bytes")
+                    if let error = store.lastError { print("    \(error)") }
                 }
             }
         }
@@ -84,6 +88,7 @@ struct Agent: ParsableCommand {
     func run() throws {
         try command {
             guard geteuid() != 0 else { throw ServiceError(.permission, "Run local agents without sudo; launchd runs the system agent as _hbnvr.") }
+            umask(0o077)
             let authorization: Authorization
             let directory: String
             if system {

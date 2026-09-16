@@ -31,6 +31,7 @@ struct RTSPVideoDescription {
     let payloadType: UInt8
     let clockRate: UInt32
     let codec: String
+    var parameterSets: [Data] = []
 }
 enum RTSPURLResolver {
     static func constrain(_ candidate: URL, to authority: URL) -> URL? {
@@ -52,6 +53,7 @@ enum RTSPSDPParser {
             var mappings: [UInt8: (String, UInt32)] = [:]
             var control: String?
             var don = false
+            var parameters: [UInt8: [Data]] = [:]
         }
         var tracks: [Track] = [], track: Track?, sessionControl: String?
         for line in text.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespaces) }) {
@@ -71,10 +73,16 @@ enum RTSPSDPParser {
                     }
                 }
             } else if line.lowercased().hasPrefix("a=fmtp:") {
-                let parameters = line.split(separator: " ", maxSplits: 1).dropFirst().first ?? ""
+                let parts = line.dropFirst(7).split(separator: " ", maxSplits: 1)
+                let payload = parts.first.flatMap { UInt8($0) }
+                let parameters = parts.dropFirst().first ?? ""
                 for field in parameters.components(separatedBy: ";") {
-                    let pair = field.trimmingCharacters(in: .whitespaces).components(separatedBy: "=")
+                    let pair = field.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1).map(String.init)
                     if pair.count == 2, pair[0].hasSuffix("sprop-max-don-diff"), (Int(pair[1]) ?? 0) > 0 { track?.don = true }
+                    if pair.count == 2, let payload, ["sprop-parameter-sets", "sprop-vps", "sprop-sps", "sprop-pps"].contains(pair[0].lowercased()) {
+                        let sets = pair[1].split(separator: ",").compactMap { Data(base64Encoded: String($0)) }.filter { !$0.isEmpty && $0.count <= 65536 }
+                        track?.parameters[payload, default: []].append(contentsOf: sets)
+                    }
                 }
             }
         }
@@ -88,7 +96,7 @@ enum RTSPSDPParser {
                       let url = RTSPURLResolver.resolve(control, baseURL: baseURL) else {
                     throw RTSPError.invalidResponse("Video track omitted its control URL.")
                 }
-                return RTSPVideoDescription(controlURL: url, payloadType: payload, clockRate: clock, codec: codec)
+                return RTSPVideoDescription(controlURL: url, payloadType: payload, clockRate: clock, codec: codec, parameterSets: track.parameters[payload] ?? [])
             }
         }
         throw RTSPError.unsupported("No matching H.264/H.265 video track in SDP.")
@@ -269,8 +277,7 @@ final class RTSPClient: @unchecked Sendable {
     enum Event: Sendable {
         case connected(String)
         case received(Int)
-        // Only counters leave the transport queue; frame payloads are discarded here.
-        case video(packets: UInt64, frames: UInt64, dropped: UInt64)
+        case video(packets: UInt64, frames: UInt64, dropped: UInt64, media: EncodedMedia?)
         case failed(RTSPError)
     }
 
@@ -299,6 +306,7 @@ final class RTSPClient: @unchecked Sendable {
     private var sessionIdentifier: String?
     private var aggregateURL: URL
     private var depacketizer: RTPFrameAssembler?
+    private var videoDescription: RTSPVideoDescription?
     private var keepalive: DispatchSourceTimer?
     private var requestTimeout: DispatchWorkItem?
     private var connectTimeout: DispatchWorkItem?
@@ -417,6 +425,7 @@ final class RTSPClient: @unchecked Sendable {
                     payloadType: description.payloadType,
                     codec: description.codec
                 )
+                self.videoDescription = description
                 self.sendSetup(description)
             } catch let error as RTSPError {
                 self.fail(error)
@@ -657,8 +666,9 @@ final class RTSPClient: @unchecked Sendable {
                     }
                     if packet.payloadType == assembler.payloadType {
                         let before = assembler.droppedFrames
-                        let complete = assembler.consume(packet) != nil
-                        eventHandler(.video(packets: 1, frames: complete ? 1 : 0, dropped: assembler.droppedFrames - before))
+                        let complete = assembler.consume(packet)
+                        let media = complete.flatMap { frame in videoDescription.map { EncodedMedia(codec: $0.codec, clockRate: $0.clockRate, parameterSets: $0.parameterSets, frame: frame) } }
+                        eventHandler(.video(packets: 1, frames: complete == nil ? 0 : 1, dropped: assembler.droppedFrames - before, media: media))
                     }
                 }
                 continue

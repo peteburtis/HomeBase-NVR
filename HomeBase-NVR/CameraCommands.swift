@@ -17,7 +17,7 @@ enum CameraPrompt {
             value = String(cString: buffer)
         } else {
             FileHandle.standardError.write(Data(message.utf8))
-            guard let input = readLine() else { throw ServiceError("Input ended; no camera changes were made.") }
+            guard let input = readLine() else { throw ServiceError("Input ended; no configuration changes were made.") }
             value = input.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return value.isEmpty ? fallback ?? "" : value
@@ -27,7 +27,7 @@ enum CameraPrompt {
         for (index, label) in labels.enumerated() { print("  \(index + 1). \(label)") }
         while true {
             let answer = try line("Choose 1...\(labels.count) (q to cancel)", default: defaultIndex.map { String($0 + 1) })
-            if answer.lowercased() == "q" { throw ServiceError("Cancelled; no camera changes were made.") }
+            if answer.lowercased() == "q" { throw ServiceError("Cancelled; no configuration changes were made.") }
             if let number = Int(answer), labels.indices.contains(number - 1) { return number - 1 }
             print("Please choose a listed number.")
         }
@@ -141,7 +141,7 @@ struct Add: ParsableCommand {
             guard try CameraPrompt.confirm("Save this camera and its login to HBNVR?") else { print("Cancelled; no changes made."); return }
             let reply = try connection.send(Request(protocolVersion: 1, operation: "cameras.add", camera: camera))
             guard let saved = reply.camera else { throw ServiceError(.invalidMessage, "Agent did not confirm the added camera. Check configuration before retrying.") }
-            print("Added \(saved.name) (\(saved.id)). Configuration saved; recording is not implemented yet.")
+            print("Added \(saved.name) (\(saved.id)). Enabled stores will record automatically.")
         }
     }
 }

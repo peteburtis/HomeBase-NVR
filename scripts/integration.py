@@ -184,6 +184,57 @@ class Integration(unittest.TestCase):
     def camera_request(self, directory, operation, **fields):
         return self.request(directory, json.dumps(dict(protocolVersion=1, operation=operation, **fields)).encode() + b"\n")
 
+    def test_local_store_cli_permissions_lifecycle_and_persistence(self):
+        directory, process = self.agent()
+        output = self.root / "recordings"
+        args = ("store", "add", "--runtime-dir", directory)
+        cancelled = self.cli(*args, input=f"\n{output}\n\n\n\nno\n")
+        self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+        self.assertFalse(output.exists())
+        self.assertIn("[~/NVR]", cancelled.stderr)
+        self.assertIn("[1m]", cancelled.stderr)
+        self.assertIn("[1w]", cancelled.stderr)
+        added = self.cli(*args, input=f"Local test\n{output}\n1s\n1M\nyes\nyes\n")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+        stores = json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout)
+        self.assertEqual(len(stores), 1)
+        store = stores[0]
+        self.assertEqual(store["Directory"], str(output.resolve()))
+        self.assertEqual(store["ShardDuration"], "1s")
+        self.assertEqual(store["RetentionPeriod"], "1M")
+        self.assertTrue(store["Enabled"])
+        store_id = store["ID"]
+        for action in ["disable", "disable", "enable", "enable"]:
+            result = self.cli("store", action, store_id, "--runtime-dir", directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        changed = self.cli("store", "change", store_id, "--runtime-dir", directory, input="Renamed\n\n2s\n1w\nno\nyes\n")
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        process.terminate(); process.wait(timeout=4)
+        self.agent()
+        result = self.cli("status", "--runtime-dir", directory, "--json")
+        status = json.loads(result.stdout)["status"]["stores"][0]
+        self.assertEqual(status["name"], "Renamed")
+        self.assertEqual(status["state"], "disabled")
+        self.assertFalse(status["enabled"])
+        result = self.cli("store", "remove", store_id, "--runtime-dir", directory, input="yes\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(output.exists())
+        self.assertEqual(json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout), [])
+
+    def test_local_store_rejects_unsafe_directory_and_invalid_duration(self):
+        directory, _ = self.agent()
+        existing = self.root / "existing"
+        existing.mkdir(mode=0o755)
+        result = self.cli("store", "add", "--runtime-dir", directory, input=f"Test\n{existing}\n1m\n1w\nyes\nyes\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(existing.stat().st_mode & 0o777, 0o755)
+        invalid = self.root / "invalid"
+        result = self.cli("store", "add", "--runtime-dir", directory, input=f"Test\n{invalid}\n0m\n1w\nyes\nyes\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(invalid.exists())
+        self.assertEqual(json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout), [])
+
     def rtsp_fixture(self, codec="H264", auth="digest"):
         server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), RTSPFixture)
         server.daemon_threads = True

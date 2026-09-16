@@ -3,9 +3,20 @@
 The foundation of an independent macOS NVR: a headless system LaunchDaemon,
 authenticated Unix-socket control, and an unprivileged foreground development mode.
 Interactive camera setup, direct ONVIF discovery, and one-time Homebase imports
-are supported. Recording, buffering, S3, and ongoing Homebase synchronization
-are not implemented yet.
+are supported. Version 0.5.0 adds independent local recording stores, playable MP4
+shards, and per-store retention. Version 0.5.1 makes incremental recording and crash
+recovery explicit, with visible `.mp4.recording` files and periodic checkpoints.
+Version 0.5.2 tolerates transient AVFoundation backpressure and slow finalization,
+including first-use initialization under the service account, and preserves the
+original failure in status instead of replacing it with a cleanup error.
+Version 0.5.3 writes directly into display-name camera folders under the chosen
+recording root, with readable local start-time filenames.
+S3, recording triggers, pre-event buffering, and
+ongoing Homebase synchronization are not implemented yet.
 Requires macOS 26.1 and Xcode 26.1 or newer.
+
+See [the CLI roadmap](CLI-ROADMAP.md) for planned camera/store command families,
+streaming versus recording controls, and independent recording-store behavior.
 
 ## Build and test
 
@@ -125,8 +136,9 @@ The flow is:
 
 There is no stream-URL prompt on successful import. HBNVR obtains the chosen
 profile's RTSP URL from the camera. It saves that URL and VideoProfile metadata.
-The running agent immediately opens the saved stream in discard mode; no recording
-is created and camera settings are not modified.
+The running agent immediately opens the saved stream. Enabled stores record it
+automatically; without an enabled store, video is discarded. Camera settings are
+not modified.
 
 Hardware identity uses the same manufacturer/serial-number normalization and
 escaping as Homebase. Names come from aliases.json and the optional DisplayName in
@@ -209,7 +221,7 @@ For an isolated agent or a different Homebase configuration directory:
     hbnvr add --runtime-dir /tmp/hbnvr-dev --homebase-dir /path/to/HomeBase
     hbnvr remove --runtime-dir /tmp/hbnvr-dev
 
-Reinstall after building 0.3.0 so the system agent also understands VideoProfile.
+Reinstall after building an update so the system agent understands the new commands.
 Local development needs no installation or sudo.
 
 ### Editable JSON
@@ -272,7 +284,201 @@ pinning, cancellation, hardware changes, and persistence without touching real
 Homebase files. Hardware smoke checks should use read-only discovery and cancel
 before saving unless an actual import is intended.
 
-## Continuous receive / discard mode (0.4.0)
+## Local recording stores (0.5.0)
+
+After reinstalling the updated binary, run these as the controller **without sudo**:
+
+```sh
+hbnvr store add
+hbnvr store list
+hbnvr status
+hbnvr store change "Local recordings"
+hbnvr store disable "Local recordings"
+hbnvr store enable "Local recordings"
+hbnvr store remove "Local recordings"
+```
+
+Add/change share an interactive options editor. Defaults are `~/NVR` (the requesting
+user's home), `1m` shards, `1w` retention, and enabled. There is only a local store
+type today; multiple independent instances are supported. Each command accepts
+`--runtime-dir PATH` for an isolated foreground agent. List/status support `--json`.
+Change/enable/disable/remove accept an exact name or UUID; omit it for a terminal
+picker. Ambiguous or missing selections are errors outside a terminal.
+
+Every enabled store records **all configured cameras**, beginning at their next
+usable keyframe. There are no camera start/stop or enable/disable controls in this
+slice. Disabling one store finalizes its current shards without affecting other
+stores or the camera connections. Retention continues for disabled stores. Removing
+a store removes only configuration: recordings, directories, and permissions are
+preserved, and retention stops. Moving a destination requires remove/add; existing
+recordings are not migrated or adopted by the new store.
+
+### Private destination setup
+
+After confirmation, setup creates a dedicated directory with mode 0700 and explicit
+inheritable macOS ACLs granting read/write access to the requesting user and agent
+account (`_hbnvr` for the installed service). Locally those are the same identity.
+Recording files use mode 0600 plus inherited ACLs. Other ordinary users have no
+access; root retains administrative access. The directory remains owned by its
+creator; daemon-created subdirectories/files belong to the daemon. This is
+filesystem access protection, not video encryption.
+
+Setup does not broaden ancestor permissions or silently adopt an existing directory
+with unrelated permissions. Existing destinations must already match the private
+ownership/ACL policy; otherwise choose a new directory. The parent must exist and
+be accessible to both accounts. `~/NVR` avoids Documents/Desktop privacy controls,
+but customized home permissions and macOS privacy rules can still deny daemon
+access. Such failures are reported, not bypassed. No sudo is needed for store setup;
+running add as root is rejected. A failed save may leave the new private directory
+in place, with an explicit message so it can be inspected or reused.
+
+The chosen directory is the recording root; there is no additional store directory.
+Each camera gets a folder named for its display name:
+
+```text
+~/NVR/
+  Bedroom Camera/
+    2026-09-16_14-30-00.mp4
+    2026-09-16_14-31-00.mp4.recording
+  Living Room Camera/
+    2026-09-16_14-30-01.mp4
+```
+
+Filenames use `yyyy-MM-dd_HH-mm-ss`: local recording-start time, Gregorian calendar,
+24-hour clock, and filename-safe hyphens instead of time colons. A `-2`, `-3`, etc.
+suffix distinguishes starts within the same second or a repeated wall-clock time
+(including daylight-saving changes). Finalization only removes `.recording`.
+Unsafe camera-name characters become hyphens, leading/trailing dots and whitespace
+are trimmed, and long names are truncated safely. Duplicate names get ` (2)`, etc.,
+without combining cameras. Renaming a camera creates a newly named folder for new
+shards; old folders remain covered by retention.
+
+A hidden `.hbnvr.lock` serializes use of the root. Each camera folder has a small
+private `.hbnvr-camera.json` identity file, so duplicate names and retention remain
+scoped to the correct store and camera. Do not delete these files or add unrelated
+timestamp-named videos to managed camera folders. Unmarked directories are not adopted.
+Old `hbnvr-<store-UUID>` layouts are not moved or renamed; their existing retention
+policy continues to apply. New recordings use only the layout above.
+Two stores cannot use duplicate or nested destination paths. Do not point a local
+development store at a production destination. Permissions are deliberately
+preserved on store removal and system uninstall; recordings remain accessible to
+the original requester and daemon account.
+
+### Duration options and JSON
+
+Use positive whole-number duration components: `s` seconds, `m` minutes, `h` hours,
+`d` days, `w` weeks, `M` months, `y` years. Compounds such as `1h30m` or `1w2d` work,
+with optional spaces. A month is exactly 31 days and a year exactly 365 days;
+`12M` is deliberately not `1y`. Fractions, unitless numbers, and overflow are errors.
+The prompt shows the exact seconds. Local shard duration supports `1s` through `1d`;
+retention must be at least that duration and at most `100y`.
+
+Store configurations are plain, pretty-printed `<UUID>.json` files in:
+
+- Installed: `/Library/Application Support/HomeBase-NVR/private/stores/`
+- Local: `<runtime-dir>/stores/`
+
+Fields are `SchemaVersion`, `ID`, `Name`, `Type` (`Local`), `Enabled`, `Directory`
+(expanded absolute path), `ShardDuration`, `RetentionPeriod`, `OwnerUID`, and
+`OwnerUUID`. Configuration files are mode 0600 in a 0700 directory, owned by the
+agent. The owner identity is recorded from authenticated IPC, never trusted from
+a client's submitted JSON. Preserve it when hand-editing. Stop/edit/restart is the
+manual workflow; external file edits are not hot-reloaded. Install/uninstall preserve
+configuration. A shorter retention setting can immediately expire older shards;
+change warns before confirmation.
+
+### Media, retention, and limits
+
+The camera receiver distributes encoded access units and codec/timing metadata.
+Each store owns its container and shard writer. The local implementation uses system
+AVFoundation to pass H.264/H.265 into MP4 without decoding/re-encoding. Future S3
+delivery/buffering will remain independent of local stores. No ffmpeg is required.
+
+Shard duration is a **target**: files begin at a keyframe and rotate at the next
+keyframe at or after the target. Disconnect, damaged frames, codec changes, disable,
+and graceful shutdown finalize the current shard; new recording waits for a keyframe.
+Audio is not recorded. Profiles with reordered presentation timestamps (B-frames)
+are not supported in this increment and fail explicitly; use a no-B-frame profile.
+
+**Local-store durability goal:** put incoming media on disk incrementally, keeping
+as little solely in memory as practical without excessive disk activity. A shard is
+not an all-or-nothing transaction or a whole-file RAM buffer. Its visible
+`.mp4.recording` file grows while frames arrive, with the same private access as a
+completed file. Successful finalization flushes it and removes the `.recording`
+suffix, keeping the original start timestamp; committing does not copy the video
+into a second file.
+
+The writer requests an initial recovery fragment at one second and subsequent
+fragments at five-second intervals, independently of shard duration. This writes
+container metadata during capture using AVFoundation's
+[movie fragments](https://developer.apple.com/videos/play/wwdc2020/10011/), rather
+than depending solely on the final file index. File syncs are batched about every
+five seconds while frames arrive, plus finalization; directory entries are synced
+when the file appears and when it is renamed. These are best-effort checkpoints,
+not a strict maximum-loss guarantee: framework buffering, media timing, the OS,
+and storage hardware can delay persistence. No per-frame fsync or full-drive
+hardware-cache flush is requested.
+
+An interruption leaves a clearly named recording for recovery. The writer does
+not cancel/delete it on a finalization timeout; it may continue finishing in the
+background, but is not reported or renamed as a successful shard. Restart never
+silently truncates or resumes an abandoned file. Some completed fragments can be
+playable after a process crash; the trailing fragment or a very short recording
+may be incomplete. Power loss can lose cached bytes and metadata, so recovery is
+not guaranteed. Copy an abandoned recording outside the managed camera folders, with
+an `.mp4` suffix, before trying playback or repair tools. Automatic repair is not
+implemented.
+
+Retention runs on startup and approximately every 30 seconds. New completed files
+age from their filesystem modification time, set at finalization; abandoned
+`.mp4.recording` files age from filesystem creation time. This is independent of
+the filename's local start time and avoids timezone ambiguity. Touching a completed
+file extends its retention. Legacy filenames retain their original embedded
+completion/creation timestamps, including `.mp4.partial` files. Cleanup only removes
+recognized, agent-owned regular files with a single link within folders identified
+for this store (or its exact legacy directory). Unknown files, unmarked folders,
+symlinks, hardlinks, and other store directories are not deleted. Cleanup
+requires a running agent and accessible destination; it is not an exact deletion
+deadline. The current open shard is never expired.
+
+Each store has its own serial writer and bounded queue (32 MiB of encoded payloads,
+at most 2,048 events). Temporary writer backpressure is allowed up to 30 seconds
+on that store's worker; reception, other stores, and status remain independent.
+Finalization has a separate 30-second deadline. These waits do not extend the IPC
+deadline: an operation that cannot drain within its existing three-second budget
+returns a pending-work error and can be retried after the work finishes. The queue
+limits still apply during a stall. An actual writer failure is reported immediately,
+with framework/underlying error codes but no error-userInfo secrets. Status preserves
+the first failure; secondary cleanup errors remain in the logs.
+A stalled/full/unavailable destination reports an error and
+stops accepting new media without blocking other stores or camera reception. There
+is no local-store disk-full fallback or automatic error recovery yet: fix the cause
+and run enable again (or disable/enable). Pending RAM is not durable; checkpoints
+reduce the open shard's recovery risk but do not eliminate it. A disabled store whose directory is unavailable
+still remains disabled, with a retention warning.
+
+`status` reports each store's configured enablement, state, active recordings,
+completed shards, pending bytes, and last error. JSON also has `recordedFrames`
+(samples submitted to the writer, not individually durable commits). Counters reset
+on agent restart or store reconfiguration, including disable/enable. Camera mode
+`record` means media is routed to at least one healthy enabled store; check store
+activity/completed shards to confirm actual recording. Agent readiness alone is
+not a guarantee of camera or storage health.
+
+Tests generate both H.264 and H.265 video, shard it, and decode every output frame.
+They also cover permissions/ACL validation, duration parsing, retention scoping,
+independent failures, bounded queues, locking, CLI cancellation, and persistence.
+Injected-clock tests cover temporary backpressure/slow finalization longer than
+the old deadlines, genuine timeouts, immediate framework failures, and preserving
+the initial error during cleanup.
+Recovery tests check file growth and playback before commit, inode-preserving
+rename, retention of unfinished/legacy files, and playable fragments after SIGKILL
+of an isolated synthetic-video test subprocess. These are not physical power-cut tests.
+Live camera recording is an opt-in smoke check, not part of the default test suite.
+After reinstalling, verify an installed store can write as `_hbnvr` and the requesting
+user can play/delete a completed MP4; local tests do not prove cross-account access.
+
+## Continuous receiving
 
 Every running agent—system or local—opens **all configured camera streams**. Adding
 a camera starts its receiver immediately; removing it closes the connection. Startup
@@ -280,10 +486,11 @@ loads the private JSON configurations independently of Homebase. Stop/restart af
 manual edits. A missing RTSPURL is reported as `unconfigured` and makes no connection.
 
 This increment consumes encoded H.264/H.265 video over RTSP interleaved TCP. It
-assembles complete RTP access units in bounded memory and then discards them; it
-does **not** decode pixels, save recordings, buffer a recording history, upload to
-S3, or perform motion detection. Continuous receiving still consumes camera/LAN
-bandwidth even though nothing is recorded. Audio tracks and UDP transport are not
+assembles complete RTP access units in bounded memory and routes them to enabled
+stores. With no enabled stores it discards them, with no media writes. The receiver
+does not decode pixels, buffer a pre-event history, upload to S3, or perform motion
+detection. Continuous receiving still consumes camera/LAN bandwidth even when
+nothing is recorded. Audio tracks and UDP transport are not
 requested. There is no ffmpeg or Homebase-process dependency.
 
 RTSP supports Basic and MD5/MD5-sess Digest authentication (no qop or qop=auth).
@@ -309,14 +516,14 @@ reconnects, lastFrameAgeSeconds, and a sanitized lastError when applicable. Coun
 reset with the agent (or camera removal/re-add); rates are sampled about once per
 second. Received bytes include RTSP/RTP/RTCP application traffic but not IP/TCP/TLS
 overhead, so this is not a network-interface or billing meter. `droppedFrames`
-counts incomplete/invalid access units, not the intentional disposal of all good
+counts incomplete/invalid access units, not the intentional disposal of good
 frames. `streaming` means complete encoded access units are arriving, not that a
 pixel decoder has validated the image. Agent `ready` and exit 0 mean IPC is healthy;
 inspect individual stream states for camera health.
 
-All video and counters remain in memory, with an 8 MiB assembly limit per camera,
-64 KiB RTSP header limit, and 1 MiB response-body limit. There are no periodic media
-or statistics writes. Lifecycle/errors still use normal stderr/unified logging.
+The receiver has an 8 MiB assembly limit per camera, 64 KiB RTSP header limit, and
+1 MiB response-body limit. Counters remain in memory; media writes belong to stores.
+Lifecycle/errors still use normal stderr/unified logging.
 Tests include H.264/H.265 packet assembly, a local authenticated RTSP simulator,
 keepalives, disconnect/stall recovery, add/remove/restart, and unchanged runtime
 files during reception. Actual installed `_hbnvr` network access should also be
@@ -333,7 +540,7 @@ and one JSON reply are exchanged per connection, terminated with a newline:
 ```
 
 A successful response has `protocolVersion: 1` and a `status` object containing
-`ready`, `version`, `pid`, `uptimeSeconds`, and `streams`. An error response has `error` and
+`ready`, `version`, `pid`, `uptimeSeconds`, `streams`, and `stores`. An error response has `error` and
 `code`. Messages are limited to 64 KiB (excluding the newline). Clients use a
 five-second total deadline; the serial server bounds each accepted connection to
 five seconds. It handles one active client at a time with a bounded listen backlog.
@@ -350,6 +557,14 @@ nonsecret summaries; cameras.add accepts a camera configuration object;
 cameras.remove accepts a cameraID. Add/remove return a nonsecret camera summary.
 The client verifies the agent's OS peer UID before sending credentials. Requests
 are processed serially, including atomic configuration writes.
+
+Store operations use the same transport: `stores.list`, `stores.add`, `stores.change`,
+`stores.enable`, `stores.disable`, and `stores.remove`. Add/change take a `store`
+configuration; the other mutations take `storeID`. Store setup requires the
+requesting non-root controller; root can list, enable, disable, and remove. The
+daemon validates destination access independently and rolls back a configuration
+change if opening the destination fails. On a client timeout, inspect list/status
+before retrying: a mutation may have completed even if its reply was lost.
 
 Exit codes: 0 success; 1 operational failure; 2 CLI usage; 3 unavailable;
 4 permission/authorization denied; 5 incompatible protocol; 6 timeout; 7 invalid message.

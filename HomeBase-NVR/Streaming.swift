@@ -43,9 +43,12 @@ final class StreamingCoordinator: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var stopped = false
     private let log: (String) -> Void
+    private let record: (RecordingEvent) -> Void
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
-    init(log: @escaping (String) -> Void) { self.log = log }
+    init(log: @escaping (String) -> Void, record: @escaping (RecordingEvent) -> Void = { _ in }) {
+        self.log = log; self.record = record
+    }
 
     func add(id: String, camera: CameraConfiguration) {
         queue.sync {
@@ -66,7 +69,7 @@ final class StreamingCoordinator: @unchecked Sendable {
     }
 
     func remove(id: String) {
-        queue.sync { entries.removeValue(forKey: id)?.client?.stop() }
+        queue.sync { entries.removeValue(forKey: id)?.client?.stop(); record(.end(camera: id)) }
     }
 
     func snapshot() -> [CameraStreamStatus] {
@@ -84,6 +87,7 @@ final class StreamingCoordinator: @unchecked Sendable {
             stopped = true
             timer?.cancel(); timer = nil
             let clients = entries.values.compactMap(\.client)
+            entries.keys.forEach { record(.end(camera: $0)) }
             entries.removeAll()
             return clients
         }
@@ -109,7 +113,7 @@ final class StreamingCoordinator: @unchecked Sendable {
         let client = RTSPClient(source: source) { [weak self, weak entry] event in
             guard let self, let entry else { return }
             // Synchronous counter updates provide backpressure instead of accumulating events.
-            // Events contain no frame payload, URL, or credentials.
+            // Stores enqueue bounded references and never perform I/O on this queue.
             self.queue.sync {
                 guard !self.stopped, self.entries[entry.status.id] === entry,
                       entry.generation == generation, entry.client != nil else { return }
@@ -119,14 +123,16 @@ final class StreamingCoordinator: @unchecked Sendable {
                     entry.status.state = "waitingForVideo"
                     entry.began = self.now
                 case .received(let bytes): entry.status.receivedBytes &+= UInt64(bytes)
-                case .video(let packets, let frames, let dropped):
+                case .video(let packets, let frames, let dropped, let media):
                     entry.status.rtpPackets &+= packets
                     entry.status.frames &+= frames
                     entry.status.droppedFrames &+= dropped
+                    if dropped > 0 { self.record(.end(camera: entry.status.id)) }
+                    if let media { self.record(.media(camera: entry.status.id, name: entry.status.name, media)) }
                     if frames > 0 {
                         if entry.firstFrame == nil {
                             entry.firstFrame = self.now
-                            self.log("Camera \(entry.status.id): receiving \(entry.status.codec ?? "video") (discard mode)")
+                            self.log("Camera \(entry.status.id): receiving \(entry.status.codec ?? "video")")
                         }
                         entry.lastFrame = self.now
                         entry.status.state = "streaming"
@@ -141,6 +147,7 @@ final class StreamingCoordinator: @unchecked Sendable {
     }
 
     private func retry(_ entry: Entry, error: String) {
+        record(.end(camera: entry.status.id))
         let client = entry.client
         entry.client = nil
         entry.generation = UUID()

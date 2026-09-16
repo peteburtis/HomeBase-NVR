@@ -16,6 +16,10 @@
 		A10000000000000000000031 /* HomeBase-NVR/ONVIF.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000030 /* HomeBase-NVR/ONVIF.swift */; };
 		A10000000000000000000033 /* RTSP in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000032; };
 		A10000000000000000000035 /* Streaming in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000034; };
+		A10000000000000000000037 /* Durations in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000036; };
+		A10000000000000000000039 /* StoreDirectory in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000038; };
+		A10000000000000000000041 /* Stores in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000040; };
+		A10000000000000000000043 /* LocalRecordingStore in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000042; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -51,6 +55,10 @@
 		E2C3C6C5305B1BD900FAD4F6 /* hbnvr */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = hbnvr; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000032 /* RTSP.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/RTSP.swift"; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000034 /* Streaming.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/Streaming.swift"; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000036 /* Durations.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/Durations.swift"; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000038 /* StoreDirectory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/StoreDirectory.swift"; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000040 /* Stores.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/Stores.swift"; sourceTree = SOURCE_ROOT; };
+		A10000000000000000000042 /* LocalRecordingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/LocalRecordingStore.swift"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -212,6 +220,10 @@
 				A10000000000000000000027 /* HomeBase-NVR/IPC.swift in Sources */,
 				A10000000000000000000029 /* HomeBase-NVR/Cameras.swift in Sources */,
 				A10000000000000000000031 /* HomeBase-NVR/ONVIF.swift in Sources */,
+				A10000000000000000000043 /* LocalRecordingStore in Sources */,
+				A10000000000000000000041 /* Stores in Sources */,
+				A10000000000000000000039 /* StoreDirectory in Sources */,
+				A10000000000000000000037 /* Durations in Sources */,
 				A10000000000000000000035 /* Streaming in Sources */,
 				A10000000000000000000033 /* RTSP in Sources */,
 			);
@@ -242,6 +254,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.graygoolabs.hbnvr.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/HomeBase-NVR/Platform.h";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Debug;
@@ -253,6 +266,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = com.graygoolabs.hbnvr.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/HomeBase-NVR/Platform.h";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;
@@ -389,6 +403,7 @@
 				PRODUCT_NAME = hbnvr;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/HomeBase-NVR/Platform.h";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Debug;
@@ -407,6 +422,7 @@
 				PRODUCT_NAME = hbnvr;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "$(SRCROOT)/HomeBase-NVR/Platform.h";
 				SWIFT_VERSION = 5.0;
 			};
 			name = Release;

@@ -7,6 +7,8 @@ struct Request: Codable {
     let operation: String
     var camera: CameraConfiguration? = nil
     var cameraID: String? = nil
+    var store: RecordingStoreConfiguration? = nil
+    var storeID: String? = nil
 }
 struct AgentStatus: Codable {
     let ready: Bool
@@ -14,6 +16,7 @@ struct AgentStatus: Codable {
     let pid: Int32
     let uptimeSeconds: Double
     var streams: [CameraStreamStatus]? = nil
+    var stores: [RecordingStoreStatus]? = nil
 }
 struct Reply: Codable {
     let protocolVersion: Int
@@ -22,6 +25,8 @@ struct Reply: Codable {
     let code: FailureCode?
     var cameras: [CameraSummary]? = nil
     var camera: CameraSummary? = nil
+    var stores: [RecordingStoreConfiguration]? = nil
+    var store: RecordingStoreConfiguration? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
 }
 
@@ -169,7 +174,11 @@ enum AgentReadiness {
 }
 
 final class AgentServer {
-    private lazy var streams = StreamingCoordinator { [weak self] message in self?.log(message) }
+    private lazy var recordings = RecordingStoreManager(log: { [weak self] message in self?.log(message) })
+    private lazy var streams = StreamingCoordinator(log: { [weak self] message in self?.log(message) }, record: { [weak self] event in self?.recordings.accept(event) })
+    var stores: RecordingStoreRepository {
+        RecordingStoreRepository(directory: system ? Paths.system.base + "/private/stores" : directory + "/stores")
+    }
     let directory: String
     let authorization: Authorization
     let system: Bool
@@ -210,7 +219,8 @@ final class AgentServer {
             source.resume(); return source
         }
         defer { sources.forEach { $0.cancel() } }
-        defer { streams.stop() }
+        defer { streams.stop(); recordings.stop() }
+        recordings.load(try stores.list())
         for (id, camera) in try cameras.configurations() { streams.add(id: id, camera: camera) }
         let started = ProcessInfo.processInfo.systemUptime
         log("hbnvr ready (PID \(getpid())) at \(path)")
@@ -226,6 +236,7 @@ final class AgentServer {
             close(client)
         }
         streams.stop()
+        recordings.stop()
         log("hbnvr stopped")
     }
     func handle(_ fd: Int32, started: TimeInterval) {
@@ -242,7 +253,11 @@ final class AgentServer {
             var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
             switch request.operation {
             case "status":
-                let status = AgentStatus(ready: true, version: BuildInfo.version, pid: getpid(), uptimeSeconds: ProcessInfo.processInfo.systemUptime - started, streams: streams.snapshot())
+                let storeStatus = recordings.snapshot()
+                var streamStatus = streams.snapshot()
+                let recording = storeStatus.contains { $0.enabled && $0.state != "error" && $0.state != "stopping" }
+                for index in streamStatus.indices { streamStatus[index].mode = recording ? "record" : "discard" }
+                let status = AgentStatus(ready: true, version: BuildInfo.version, pid: getpid(), uptimeSeconds: ProcessInfo.processInfo.systemUptime - started, streams: streamStatus, stores: storeStatus)
                 reply = Reply(protocolVersion: 1, status: status, error: nil, code: nil)
             case "cameras.list":
                 reply.cameras = try cameras.list()
@@ -254,6 +269,44 @@ final class AgentServer {
                 guard let id = request.cameraID else { throw ServiceError(.invalidMessage, "Camera ID is required.") }
                 reply.camera = try cameras.remove(id: id)
                 streams.remove(id: id)
+            case "stores.list": reply.stores = try stores.list()
+            case "stores.add", "stores.change":
+                guard var config = request.store, uid != 0 else { throw ServiceError(.permission, "Run store setup as the requesting user, without sudo.") }
+                let old = try stores.list().first { $0.id == config.id }
+                if let old {
+                    guard request.operation == "stores.change", old.ownerUID == uid else { throw ServiceError(.permission, "Only the requesting owner may change this store.") }
+                    guard old.directory == config.directory else { throw ServiceError("Directory changes require removing and adding a store; existing recordings are preserved.") }
+                } else if request.operation == "stores.change" { throw ServiceError("Store no longer exists.") }
+                config.ownerUID = uid; config.ownerUUID = try StoreDirectory.identity(uid)
+                try config.validate()
+                let root = try StoreDirectory.openDirectory(config.directory); defer { close(root) }
+                try StoreDirectory.validate(root, owner: uid, daemon: geteuid())
+                try stores.save(config, replacing: old != nil)
+                do { try recordings.install(config) }
+                catch {
+                    if let old { try? stores.save(old, replacing: true); recordings.load([old]) }
+                    else { try? stores.remove(config.id) }
+                    throw error
+                }
+                reply.store = config
+            case "stores.enable", "stores.disable", "stores.remove":
+                guard let id = request.storeID, var config = try stores.list().first(where: { $0.id == id }) else { throw ServiceError("Unknown recording store.") }
+                if request.operation == "stores.remove" {
+                    try recordings.remove(id)
+                    do { try stores.remove(id) }
+                    catch { recordings.load([config]); throw error }
+                } else {
+                    let old = config
+                    config.enabled = request.operation == "stores.enable"
+                    if old.enabled == config.enabled, recordings.snapshot().contains(where: { $0.id == id && $0.state != "error" && $0.state != "stopping" }) {
+                        reply.store = config
+                        break
+                    }
+                    try stores.save(config, replacing: true)
+                    do { try recordings.install(config) }
+                    catch { try? stores.save(old, replacing: true); recordings.load([old]); throw error }
+                }
+                reply.store = config
             default:
                 throw ServiceError(.invalidMessage, "Unknown operation. Camera commands require hbnvr 0.2.0 or newer; reinstall if the agent is older.")
             }
