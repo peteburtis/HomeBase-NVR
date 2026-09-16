@@ -2,13 +2,26 @@ import Foundation
 import Darwin
 import os
 
-struct Request: Codable { let protocolVersion: Int; let operation: String }
-struct AgentStatus: Codable { let ready: Bool; let version: String; let pid: Int32; let uptimeSeconds: Double }
+struct Request: Codable {
+    let protocolVersion: Int
+    let operation: String
+    var camera: CameraConfiguration? = nil
+    var cameraID: String? = nil
+}
+struct AgentStatus: Codable {
+    let ready: Bool
+    let version: String
+    let pid: Int32
+    let uptimeSeconds: Double
+    var streams: [CameraStreamStatus]? = nil
+}
 struct Reply: Codable {
     let protocolVersion: Int
     let status: AgentStatus?
     let error: String?
     let code: FailureCode?
+    var cameras: [CameraSummary]? = nil
+    var camera: CameraSummary? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
 }
 
@@ -86,6 +99,13 @@ enum SocketIO {
 
 enum SocketClient {
     static func status(directory: String, timeout: TimeInterval = 5) throws -> Reply {
+        let reply = try exchange(Request(protocolVersion: 1, operation: "status"), directory: directory, timeout: timeout)
+        guard let status = reply.status, status.ready else { throw ServiceError(.invalidMessage, "Agent reply omitted ready status.") }
+        return reply
+    }
+    static func exchange(_ request: Request, directory: String, timeout: TimeInterval = 5, expectedUID: uid_t? = nil) throws -> Reply {
+        let encoded = try JSONEncoder().encode(request)
+        guard encoded.count <= SocketIO.limit else { throw ServiceError(.invalidMessage, "IPC message exceeds 64 KiB.") }
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ServiceError.posix("Create client socket") }
@@ -102,14 +122,20 @@ enum SocketClient {
                 throw ServiceError(error == EACCES || error == EPERM ? .permission : .unavailable, "Could not connect to agent: \(String(cString: strerror(error))).")
             }
         }
+        // Never send camera credentials to an unexpected server account.
+        if let expectedUID {
+            var uid: uid_t = 0, gid: gid_t = 0
+            guard getpeereid(fd, &uid, &gid) == 0, uid == expectedUID else {
+                throw ServiceError(.permission, "Unexpected agent identity; refusing to send camera configuration.")
+            }
+        }
         // Server authenticates first and may immediately send a denial. A failed write can still have a readable denial.
-        do { try SocketIO.write(JSONEncoder().encode(Request(protocolVersion: 1, operation: "status")), fd: fd, deadline: deadline) }
+        do { try SocketIO.write(encoded, fd: fd, deadline: deadline) }
         catch { /* Read the server's error, if one is available. */ }
         let data = try SocketIO.read(fd: fd, deadline: deadline)
         guard let reply = try? JSONDecoder().decode(Reply.self, from: data) else { throw ServiceError(.invalidMessage, "Malformed agent reply.") }
         guard reply.protocolVersion == 1 else { throw ServiceError(.incompatible, "Incompatible IPC protocol version.") }
         if let error = reply.error { throw ServiceError(reply.code ?? .failure, error) }
-        guard let status = reply.status, status.ready else { throw ServiceError(.invalidMessage, "Agent reply omitted ready status.") }
         return reply
     }
 }
@@ -143,9 +169,13 @@ enum AgentReadiness {
 }
 
 final class AgentServer {
+    private lazy var streams = StreamingCoordinator { [weak self] message in self?.log(message) }
     let directory: String
     let authorization: Authorization
     let system: Bool
+    var cameras: CameraStore {
+        CameraStore(directory: system ? Paths.system.base + "/private/cameras" : directory + "/cameras")
+    }
     private let cancellation = Cancellation()
     private let logger = Logger(subsystem: "com.graygoolabs.hbnvr", category: "agent")
     init(directory: String, authorization: Authorization, system: Bool) {
@@ -180,6 +210,8 @@ final class AgentServer {
             source.resume(); return source
         }
         defer { sources.forEach { $0.cancel() } }
+        defer { streams.stop() }
+        for (id, camera) in try cameras.configurations() { streams.add(id: id, camera: camera) }
         let started = ProcessInfo.processInfo.systemUptime
         log("hbnvr ready (PID \(getpid())) at \(path)")
         // A bounded serial request loop: at most one active client, each with a five-second deadline.
@@ -193,6 +225,7 @@ final class AgentServer {
             handle(client, started: started)
             close(client)
         }
+        streams.stop()
         log("hbnvr stopped")
     }
     func handle(_ fd: Int32, started: TimeInterval) {
@@ -206,9 +239,24 @@ final class AgentServer {
             let data = try SocketIO.read(fd: fd, deadline: deadline, cancellation: cancellation)
             guard let request = try? JSONDecoder().decode(Request.self, from: data) else { throw ServiceError(.invalidMessage, "Malformed request.") }
             guard request.protocolVersion == 1 else { throw ServiceError(.incompatible, "Unsupported IPC protocol version.") }
-            guard request.operation == "status" else { throw ServiceError(.invalidMessage, "Unknown operation.") }
-            let status = AgentStatus(ready: true, version: BuildInfo.version, pid: getpid(), uptimeSeconds: ProcessInfo.processInfo.systemUptime - started)
-            let reply = Reply(protocolVersion: 1, status: status, error: nil, code: nil)
+            var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
+            switch request.operation {
+            case "status":
+                let status = AgentStatus(ready: true, version: BuildInfo.version, pid: getpid(), uptimeSeconds: ProcessInfo.processInfo.systemUptime - started, streams: streams.snapshot())
+                reply = Reply(protocolVersion: 1, status: status, error: nil, code: nil)
+            case "cameras.list":
+                reply.cameras = try cameras.list()
+            case "cameras.add":
+                guard let camera = request.camera else { throw ServiceError(.invalidMessage, "Camera configuration is required.") }
+                reply.camera = try cameras.add(camera)
+                streams.add(id: reply.camera!.id, camera: camera)
+            case "cameras.remove":
+                guard let id = request.cameraID else { throw ServiceError(.invalidMessage, "Camera ID is required.") }
+                reply.camera = try cameras.remove(id: id)
+                streams.remove(id: id)
+            default:
+                throw ServiceError(.invalidMessage, "Unknown operation. Camera commands require hbnvr 0.2.0 or newer; reinstall if the agent is older.")
+            }
             try SocketIO.write(JSONEncoder().encode(reply), fd: fd, deadline: deadline, cancellation: cancellation)
         } catch {
             let failure = error as? ServiceError ?? ServiceError("Request failed: \(error)")
