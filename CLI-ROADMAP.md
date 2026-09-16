@@ -1,9 +1,9 @@
 # HBNVR CLI roadmap
 
-Recorded September 16, 2026. The baseline below is implemented; subsequent camera
-controls and S3 sections are a roadmap. No plugin loader is planned.
+Recorded September 16, 2026. The baseline below is implemented; S3 and triggers
+remain a roadmap. No plugin loader is planned.
 
-## Current baseline (0.5.3)
+## Current baseline (0.6.0)
 
 - System lifecycle: `install`, `uninstall`, `start`, and `stop` require sudo.
 - `agent` supports both the system daemon and an unprivileged local instance.
@@ -11,8 +11,8 @@ controls and S3 sections are a roadmap. No plugin loader is planned.
 - `add` and `remove` interactively manage cameras over authenticated IPC.
 - Camera import reads Homebase configuration and credentials, then queries cameras
   directly. Manual RTSP-only configuration is also supported.
-- Every configured camera with a stream URL is continuously received. Enabled
-  stores record all cameras automatically; with no enabled stores, frames are discarded.
+- Every enabled camera with a stream URL is continuously received. Enabled stores
+  record cameras whose persistent recording intent is started; otherwise frames are discarded.
 - `store add/list/change/remove/enable/disable` manage independent local stores.
   Defaults: `~/NVR`, `1m` shards, `1w` retention, enabled. The shared duration parser,
   private requester/daemon directory setup, MP4 sharding, and retention are implemented.
@@ -23,15 +23,16 @@ controls and S3 sections are a roadmap. No plugin loader is planned.
   `yyyy-MM-dd_HH-mm-ss.mp4` shards (local start time, 24-hour clock). Hidden identity
   files scope ownership/retention; numeric suffixes resolve name/time collisions.
   Legacy layouts are preserved in place and continue to receive retention cleanup.
-- Camera namespace/enablement/recording controls are explicitly deferred. The local
-  store increment does not add or change the camera API.
-- Camera add already has a shared options editor intended for future change:
+- `camera add/list/change/remove/enable/disable/start/stop` are implemented. Both
+  streaming enablement and recording intent persist; new/legacy cameras default
+  enabled and started. Stop leaves streaming intact; disable preserves recording intent.
+- Camera add/change use the same options editor:
   display name and video profile today, more camera options later.
 
-## Planned command families
+## Command families
 
-The `store` family below is available for local stores. The `camera` family is future
-work; top-level camera add/remove continue to work today.
+The `store` family below is available for local stores. The `camera` family and
+top-level camera add/remove shortcuts are implemented.
 
 Keep daemon lifecycle at the top level. Put resource operations under singular
 `camera` and `store` namespaces:
@@ -59,7 +60,8 @@ and `hbnvr stop` retain their existing system-service meanings; they are not
 recording controls.
 
 An omitted selector opens an interactive picker. Stable IDs identify configurations;
-names are editable human labels, not filenames or identity. Ambiguous names require
+names are editable human labels, not identity (local recording folders derive from
+display names). Ambiguous names require
 disambiguation, never an arbitrary match. Noninteractive callers must receive a
 clear error instead of a prompt when a selection is missing or ambiguous.
 
@@ -72,20 +74,23 @@ accessible to the agent's account, not merely to the invoking CLI user.
 
 | Command | Intended effect |
 | --- | --- |
-| `camera enable` | Persist enabled state and open/maintain the stream. Do not implicitly start recording. |
-| `camera disable` | Finish any active recording, close the stream, and persist disabled state. |
-| `camera start` | Start recording an enabled camera to enabled recording stores. Reject a disabled camera clearly. |
-| `camera stop` | Finish the current recording; keep receiving and discarding the stream. |
+| `camera enable` | Persist enabled state and maintain the stream. Resume recording if saved recording intent is started. |
+| `camera disable` | Finish recording, close the stream, persist disabled state, and preserve recording intent. |
+| `camera start` | Persist recording intent and record to enabled stores. Reject a disabled camera clearly. |
+| `camera stop` | Persist stopped recording intent and finish the shard; leave streaming enablement unchanged. |
 
-Enabled state is configuration. Recording state is operational, eventually driven
-by manual commands and triggers. Report configured enablement, actual stream health,
+Enabled state and recording intent are both configuration. Actual recording activity
+depends on stream/store availability. Report configured enablement, actual stream health,
 and recording state separately: an enabled camera can be offline, and a streaming
 camera can be idle or recording. Repeated enable/disable/start/stop should be harmless.
 
-When introducing enablement, preserve today's behavior for existing camera files:
-missing enablement means enabled. Define recording restart/reconnect behavior before
-implementing recording commands; do not confuse persistent enablement with an
-instruction to resume recording automatically.
+JSON uses `Enabled` and `RecordingStarted`, both true on add and when absent from
+legacy files. Both survive restart/reboot/reconnect. Start with no usable store saves
+intent and reports waiting; it resumes at a usable keyframe when a store becomes
+available. Stop is allowed while disabled. Start/stop do not reconnect the receiver.
+Disable/re-enable preserves recording intent. Configuration save failures leave
+runtime unchanged. If finalization exceeds the bounded drain wait, settings remain
+saved/applied and the command reports pending work, rather than undoing the request.
 
 ## Recording stores
 
@@ -273,11 +278,12 @@ and durable/volatile backlog. Do not expose credentials in listings, errors, or 
    private directory setup, keyframe-aligned sharding, retention, and playable-video
    verification. Cameras record automatically to every enabled store. No S3 stub
    is exposed as if it could record.
-2. Future: introduce the `camera` namespace and compatibility shortcuts; implement
-   list/change using existing stable IDs and the camera options editor. Extract
-   further genuinely shared configuration/selection helpers when both need them.
-3. Future: persistent camera enable/disable, operational camera start/stop, and
-   explicit migration/restart behavior from today's automatic-recording policy.
+2. **Implemented in 0.6.0:** `camera` namespace and shortcuts, list/change with
+   stable IDs, shared name/profile editor and camera/store selection helper.
+   Daemon-side profile discovery keeps credentials private; stale edits are rejected.
+3. **Implemented in 0.6.0:** persistent camera enable/disable and start/stop,
+   default-true migration, per-camera routing, bounded shard draining, and distinct
+   configured intent/stream health/recording status.
 4. Implement the self-contained S3 store with bounded buffering, optional private
    disk spooling, retry/restart recovery, and independent retention.
 5. Add trigger-driven recording and any additional camera/store options through the
@@ -293,18 +299,14 @@ cover independent shard durations/formats and
 failures, backlog recovery, retention boundaries, and safe removal. Exercise a
 file-free test consumer to verify the shared delivery contract has no file dependency.
 
-## Decisions to settle before recording/storage implementation
+## Remaining decisions for future recording/storage work
 
-- Manual recording behavior across daemon restart, camera disconnect, and trigger
-  overlap; behavior when no enabled/usable store exists.
-- Exact encoded-media/event types, codec initialization and changes, timing, bounded
-  fan-out, and acceptance/durability acknowledgements.
-- Shard-duration defaults and bounds, store-specific keyframe boundaries, and how
-  start/stop finalizes partial output.
-- How a newly enabled store joins an active recording (including initialization and
-  keyframe requirements), and how disabling finalizes its current output.
-- Retention age origin/enforcement timing, local ownership boundaries, and S3 lifecycle
-  scope versus store-managed cleanup for durations native lifecycle cannot express.
+- How trigger-driven recording combines with persistent manual recording intent,
+  including overlapping triggers and any temporary overrides.
+- Acceptance/durability acknowledgements for future backends. Local media routing,
+  keyframe starts, shard finalization, restart behavior, and retention are implemented.
+- S3 lifecycle scope versus store-managed cleanup for durations native lifecycle
+  cannot express.
 - S3 credential sources, spool location/limits, overflow policy, retry limits, and
   safe credential/destination changes with pending work.
 

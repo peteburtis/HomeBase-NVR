@@ -44,20 +44,109 @@ enum CameraPrompt {
     }
 }
 
-/// Reusable UX adapter. A future change command will pass saved configuration
-/// into this same flow after selecting a camera and refreshing its capabilities.
+/// The same name/profile editor is used by add and change.
 enum CameraOptionsUI {
+    static func name(_ current: String) throws -> String { try CameraPrompt.line("Camera name", default: current) }
+    static func choose(_ profiles: [VideoProfile], defaultIndex: Int?, current: VideoProfile?) throws -> Int {
+        let hint = current == nil ? "default: nearest 720p"
+            : defaultIndex == nil ? "saved profile unavailable; choose a replacement" : "default: saved profile"
+        return try CameraPrompt.choose(profiles.map(\.label), title: "Video quality (\(hint))", defaultIndex: defaultIndex)
+    }
     static func edit(_ current: CameraConfiguration, client: ONVIFClient, media: ONVIFClient.Media) throws -> CameraConfiguration {
-        try CameraOptionsEditor.edit(current, profiles: media.profiles, askName: {
-            try CameraPrompt.line("Camera name", default: $0)
-        }, chooseProfile: { profiles, defaultIndex in
-            let hint = current.videoProfile == nil ? "default: nearest 720p"
-                : defaultIndex == nil ? "saved profile unavailable; choose a replacement" : "default: saved profile"
-            return try CameraPrompt.choose(profiles.map(\.label), title: "Video quality (\(hint))", defaultIndex: defaultIndex)
+        try CameraOptionsEditor.edit(current, profiles: media.profiles, askName: name, chooseProfile: { profiles, defaultIndex in
+            try choose(profiles, defaultIndex: defaultIndex, current: current.videoProfile)
         }, resolveStream: {
             try client.stream(profile: $0, media: media, deadline: ProcessInfo.processInfo.systemUptime + 5)
         })
     }
+}
+
+enum ResourceSelection {
+    static func select<T>(_ values: [T], selector: String?, id: (T) -> String, name: (T) -> String,
+                          label: (T) -> String, kind: String) throws -> T {
+        let matches: [T]
+        if let selector, let exact = values.first(where: { id($0) == selector }) { return exact }
+        if let selector { matches = values.filter { name($0) == selector } } else { matches = values }
+        guard !matches.isEmpty else { throw ServiceError("No matching \(kind)s.") }
+        if selector != nil, matches.count == 1 { return matches[0] }
+        guard isatty(STDIN_FILENO) == 1 else { throw ServiceError("Specify an unambiguous \(kind) name or UUID when not using a terminal.") }
+        return matches[try CameraPrompt.choose(matches.map(label), title: "Choose a \(kind)")]
+    }
+}
+
+struct Camera: ParsableCommand {
+    static let configuration = CommandConfiguration(abstract: "Configure cameras and persist streaming/recording controls. No sudo.",
+        subcommands: [Add.self, CameraList.self, CameraChange.self, Remove.self, CameraEnable.self, CameraDisable.self, CameraStart.self, CameraStop.self])
+}
+struct CameraTarget: ParsableArguments {
+    @Option(help: "Local agent runtime directory; omit for the installed service.") var runtimeDir: String?
+    @Argument(help: "Camera name or UUID. Omit for an interactive picker.") var selector: String?
+    func selected() throws -> (CameraConnection, CameraSummary) {
+        let connection = try CameraConnection(runtimeDir: runtimeDir)
+        let selected = try ResourceSelection.select(connection.list(), selector: selector, id: { $0.id }, name: { $0.name },
+            label: { "\($0.name) — \($0.ipAddress):\($0.rtspPort) [\($0.id)]" }, kind: "camera")
+        return (connection, selected)
+    }
+}
+struct CameraList: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "list", abstract: "List camera configuration and persistent state without credentials.")
+    @Option var runtimeDir: String?
+    @Flag(help: "Print JSON.") var json = false
+    func run() throws { try command {
+        let cameras = try CameraConnection(runtimeDir: runtimeDir).list()
+        if json { print(String(decoding: try CameraJSON.encode(cameras), as: UTF8.self)) }
+        else if cameras.isEmpty { print("No cameras are configured.") }
+        else { for camera in cameras {
+            print("\(camera.name) [\(camera.id)] — \(camera.enabled ? "enabled" : "disabled"), recording intent: \(camera.recordingStarted ? "started" : "stopped")")
+            if let profile = camera.videoProfile { print("  \(profile.label)") }
+        } }
+    } }
+}
+struct CameraChange: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "change", abstract: "Edit camera name and video profile. Login and persistent controls are preserved; no camera hardware settings are changed.")
+    @OptionGroup var target: CameraTarget
+    func run() throws { try command {
+        let (connection, camera) = try target.selected()
+        guard let options = try connection.send(Request(protocolVersion: 1, operation: "cameras.options", cameraID: camera.id)).cameraOptions else {
+            throw ServiceError("Agent does not support camera editing; install hbnvr 0.6.0 or newer.")
+        }
+        let (name, profile) = try CameraOptionsEditor.select(name: options.name, profile: options.selectedProfile, profiles: options.profiles,
+            askName: CameraOptionsUI.name, chooseProfile: { try CameraOptionsUI.choose($0, defaultIndex: $1, current: options.selectedProfile) })
+        if options.profiles == nil { print("RTSP-only camera: keeping its configured stream URL.") }
+        guard try CameraPrompt.confirm("Save these camera options? Any active shard will be finalized.") else { print("Cancelled; no changes made."); return }
+        let edit = CameraEdit(name: name, profileToken: profile?.token, revision: options.revision)
+        let reply = try connection.send(Request(protocolVersion: 1, operation: "cameras.change", cameraID: camera.id, cameraEdit: edit))
+        guard reply.camera?.id == camera.id else { throw ServiceError("Agent did not confirm the change; check camera list before retrying.") }
+        print("Updated \(name).")
+    } }
+}
+enum CameraControl {
+    static func run(_ operation: String, target: CameraTarget) throws {
+        let (connection, camera) = try target.selected()
+        let reply = try connection.send(Request(protocolVersion: 1, operation: "cameras." + operation, cameraID: camera.id))
+        guard let saved = reply.camera, saved.id == camera.id else { throw ServiceError("Agent did not confirm camera control; check camera list before retrying.") }
+        print("\(saved.name): \(saved.enabled ? "enabled" : "disabled"), recording intent: \(saved.recordingStarted ? "started" : "stopped") (saved).")
+    }
+}
+struct CameraEnable: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "enable", abstract: "Persistently enable streaming; resume recording if its saved state is started.")
+    @OptionGroup var target: CameraTarget
+    func run() throws { try command { try CameraControl.run("enable", target: target) } }
+}
+struct CameraDisable: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "disable", abstract: "Finalize recording and persistently disconnect; preserve recording intent.")
+    @OptionGroup var target: CameraTarget
+    func run() throws { try command { try CameraControl.run("disable", target: target) } }
+}
+struct CameraStart: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "start", abstract: "Persist recording intent for an enabled camera; resume across reconnects/restarts. Wait if no store is usable.")
+    @OptionGroup var target: CameraTarget
+    func run() throws { try command { try CameraControl.run("start", target: target) } }
+}
+struct CameraStop: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "stop", abstract: "Persistently stop recording and finalize its shard; leave streaming enabled.")
+    @OptionGroup var target: CameraTarget
+    func run() throws { try command { try CameraControl.run("stop", target: target) } }
 }
 
 struct CameraConnection {
@@ -148,14 +237,10 @@ struct Add: ParsableCommand {
 
 struct Remove: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Interactively remove a camera and its HBNVR credential copy. Homebase is unchanged. No sudo; agent must be running.")
-    @Option(help: "Local agent runtime directory. Omit to configure the installed service.") var runtimeDir: String?
+    @OptionGroup var target: CameraTarget
     func run() throws {
         try command {
-            let connection = try CameraConnection(runtimeDir: runtimeDir)
-            let cameras = try connection.list()
-            guard !cameras.isEmpty else { print("No cameras are configured."); return }
-            let index = try CameraPrompt.choose(cameras.map { "\($0.name) — \($0.ipAddress):\($0.rtspPort) [\($0.id)]" }, title: "Remove a camera")
-            let camera = cameras[index]
+            let (connection, camera) = try target.selected()
             guard try CameraPrompt.confirm("Remove \(camera.name) and its saved HBNVR login?") else { print("Cancelled; no changes made."); return }
             let reply = try connection.send(Request(protocolVersion: 1, operation: "cameras.remove", cameraID: camera.id))
             guard reply.camera?.id == camera.id else { throw ServiceError(.invalidMessage, "Agent did not confirm removal. Check configuration before retrying.") }

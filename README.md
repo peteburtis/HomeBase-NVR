@@ -11,6 +11,9 @@ including first-use initialization under the service account, and preserves the
 original failure in status instead of replacing it with a cleanup error.
 Version 0.5.3 writes directly into display-name camera folders under the chosen
 recording root, with readable local start-time filenames.
+Version 0.6.0 adds `camera add/list/change/remove/enable/disable/start/stop`, with
+persistent streaming enablement and recording intent, shared name/profile editing,
+and separate stream-health and recording-state reporting.
 S3, recording triggers, pre-event buffering, and
 ongoing Homebase synchronization are not implemented yet.
 Requires macOS 26.1 and Xcode 26.1 or newer.
@@ -174,16 +177,60 @@ fail closed. Import is a snapshot, not ongoing synchronization. Cameras with exp
 stream URLs may need runtime refresh using the saved profile token; this slice
 does not implement that runtime behavior.
 
-### Shared camera-options workflow: add and future change
+### Camera commands and persistent controls (0.6.0)
+
+```sh
+hbnvr camera list --json
+hbnvr camera add
+hbnvr camera change "Bedroom Camera"
+hbnvr camera stop "Bedroom Camera"
+hbnvr camera start "Bedroom Camera"
+hbnvr camera disable "Bedroom Camera"
+hbnvr camera enable "Bedroom Camera"
+hbnvr camera remove "Bedroom Camera"
+```
+
+Camera controls use authenticated IPC without sudo. Commands accept a name or stable
+UUID, or open a picker when omitted in a terminal. Missing or ambiguous selectors
+are errors in noninteractive use. `hbnvr add/remove` remain shortcuts. Top-level
+`hbnvr start/stop` still manage the system daemon and require sudo.
+
+Two independent settings are saved in each camera's JSON:
+
+- `Enabled`: maintain the stream connection. Disable finalizes recording and
+  disconnects, but does not erase recording intent. Enable reconnects and resumes
+  recording only if its saved intent is started.
+- `RecordingStarted`: record incoming video to enabled, usable stores. Stop saves
+  false and finalizes the current shard, while an enabled camera keeps receiving
+  and discarding frames. Start saves true without reconnecting an existing stream;
+  it rejects a disabled camera. Stop is allowed while disabled.
+
+New cameras default to **enabled and started**. Existing camera files missing either
+field default that field to true, preserving pre-0.6.0 behavior. Both settings survive
+daemon restart, logout, reboot, and camera reconnect. No usable store or no stream
+does not clear recording intent: status reports `waitingForStore` or `waitingForStream`,
+and recording begins at the next usable keyframe when both become available. Other
+states are `disabled`, `stopped`, and `recording`. No historical backfill is performed.
+Repeated controls are harmless; unchanged configuration is not rewritten.
+
+Disable/stop/change/remove drain queued recording work with a bounded wait. If the
+writer needs longer, the command reports that settings were already saved/applied
+and finalization is pending; it does not undo the requested state or discard the
+unfinished file. Check status and retry after it drains. Other cameras continue.
+Changing a name or profile restarts that receiver and finalizes its current shard;
+start/stop alone preserve the receiver and its counters.
+
+### Shared camera-options workflow: add and change
 
 Name and video profile are **camera options** in HBNVR. Import/discovery obtains
 connection details and capabilities; it is separate from editing those options.
 The imported add path now uses CameraOptionsUI and CameraOptionsEditor rather
 than owning its own name/quality form.
 
-A future change command should select an existing camera, load its saved
-configuration, refresh capabilities directly from that camera, and invoke the
-same editor. Add seeds the editor with Homebase's name and the nearest-720p
+`camera change` selects an existing camera and asks the daemon to refresh profiles
+using its private credential copy. Only editable options, profile descriptions, and
+an opaque edit-conflict token return to the CLI—not credentials or stream URLs.
+It invokes the same editor. Add seeds it with Homebase's name and the nearest-720p
 default; change seeds it with the saved name and profile. Existing profiles are
 matched by token, not menu position. If a saved profile disappeared, the user
 must explicitly choose its replacement. RTSP-only cameras without discoverable
@@ -197,9 +244,10 @@ credentials, and unrelated options and must not reimport from Homebase.
 
 These currently configure HBNVR's name and stream selection, not camera firmware
 settings. Future options that write settings to physical cameras need explicit
-semantics and must not take effect while merely editing a draft. The change
-command and its authenticated update/persistence operation are **not implemented
-in this increment**.
+semantics and must not take effect while merely editing a draft. Discovery is bounded
+within the IPC deadline; an offline ONVIF camera fails without saving. Confirmation
+revalidates changed profile selections on the camera. Concurrent configuration changes
+reject a stale editor rather than overwriting a newer control or edit.
 
 ### Manual RTSP-only setup
 
@@ -243,6 +291,8 @@ Example imported camera (all credentials are placeholders):
 {
   "SchemaVersion": 1,
   "Name": "Hall Camera",
+  "Enabled": true,
+  "RecordingStarted": true,
   "Provider": "ONVIF",
   "IPAddress": "192.0.2.10",
   "ONVIFPort": 2020,
@@ -268,8 +318,10 @@ Example imported camera (all credentials are placeholders):
 RTSPURL, Credentials, ONVIFPort, HomebaseDeviceID, and VideoProfile are optional
 for backward compatibility and manual configurations. VideoProfile, when supplied,
 requires RTSPURL; FrameRate and BitrateKbps are optional. Use Provider: "RTSP" for a
-manual RTSP-only camera. All other example fields are required. Unknown fields in
-other camera files are not rewritten by add/remove. UUID filenames are stable
+manual RTSP-only camera. Enabled and RecordingStarted are optional for legacy files
+and default to true; when present, they must be booleans. All other example fields
+are required. Control/change commands preserve unrecognized JSON fields and the
+credential object; other camera files are not rewritten. UUID filenames are stable
 identifiers; use uuidgen when adding files manually. This increment permits up to
 64 cameras and 64 KiB per file, with one camera per case-insensitive host/RTSP-port pair.
 
@@ -305,9 +357,8 @@ type today; multiple independent instances are supported. Each command accepts
 Change/enable/disable/remove accept an exact name or UUID; omit it for a terminal
 picker. Ambiguous or missing selections are errors outside a terminal.
 
-Every enabled store records **all configured cameras**, beginning at their next
-usable keyframe. There are no camera start/stop or enable/disable controls in this
-slice. Disabling one store finalizes its current shards without affecting other
+Every enabled store records **enabled cameras whose recording intent is started**,
+beginning at their next usable keyframe. Disabling one store finalizes its current shards without affecting other
 stores or the camera connections. Retention continues for disabled stores. Removing
 a store removes only configuration: recordings, directories, and permissions are
 preserved, and retention stops. Moving a destination requires remove/add; existing
@@ -480,14 +531,15 @@ user can play/delete a completed MP4; local tests do not prove cross-account acc
 
 ## Continuous receiving
 
-Every running agent—system or local—opens **all configured camera streams**. Adding
+Every running agent—system or local—opens **all enabled camera streams**. Adding
 a camera starts its receiver immediately; removing it closes the connection. Startup
 loads the private JSON configurations independently of Homebase. Stop/restart after
 manual edits. A missing RTSPURL is reported as `unconfigured` and makes no connection.
 
 This increment consumes encoded H.264/H.265 video over RTSP interleaved TCP. It
 assembles complete RTP access units in bounded memory and routes them to enabled
-stores. With no enabled stores it discards them, with no media writes. The receiver
+stores only when that camera's recording intent is started. With recording stopped
+or no enabled stores it discards them, with no media writes. The receiver
 does not decode pixels, buffer a pre-event history, upload to S3, or perform motion
 detection. Continuous receiving still consumes camera/LAN bandwidth even when
 nothing is recorded. Audio tracks and UDP transport are not
@@ -511,9 +563,11 @@ hbnvr status --json
 ```
 
 Status shows each camera's state, cumulative complete frames, recent fps and kb/s.
-JSON's `status.streams` also includes codec, receivedBytes, rtpPackets, droppedFrames,
+JSON's `status.streams` also includes enabled, recordingStarted, recordingState,
+codec, receivedBytes, rtpPackets, droppedFrames,
 reconnects, lastFrameAgeSeconds, and a sanitized lastError when applicable. Counters
-reset with the agent (or camera removal/re-add); rates are sampled about once per
+reset with the agent or receiver replacement (enable/disable, name/profile change,
+removal/re-add), but not camera start/stop; rates are sampled about once per
 second. Received bytes include RTSP/RTP/RTCP application traffic but not IP/TCP/TLS
 overhead, so this is not a network-interface or billing meter. `droppedFrames`
 counts incomplete/invalid access units, not the intentional disposal of good

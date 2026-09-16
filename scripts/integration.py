@@ -265,6 +265,125 @@ class Integration(unittest.TestCase):
             time.sleep(0.1)
         self.fail(f"Timed out waiting for streams: {streams}")
 
+    def test_camera_controls_are_persistent_and_stop_keeps_receiver_alive(self):
+        directory, process = self.agent()
+        first, second = self.rtsp_fixture(), self.rtsp_fixture()
+        camera_id = self.add_stream(directory, first, "First")
+        self.add_stream(directory, second, "Second")
+        self.await_streams(directory, lambda s: len(s) == 2 and all(x['frames'] >= 5 for x in s))
+        def control(action, name=camera_id):
+            result = self.cli('camera', action, name, '--runtime-dir', directory)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result
+        config_path = directory / 'cameras' / (camera_id + '.json')
+        initial = json.loads(config_path.read_text())
+        self.assertTrue(initial['Enabled']); self.assertTrue(initial['RecordingStarted'])
+        connections = first.connections
+        control('stop', 'First')
+        stopped = self.await_streams(directory, lambda s: any(x['id'] == camera_id and x['recordingState'] == 'stopped' for x in s))
+        count = next(x['frames'] for x in stopped if x['id'] == camera_id)
+        self.await_streams(directory, lambda s: any(x['id'] == camera_id and x['frames'] > count + 5 for x in s))
+        self.assertEqual(first.connections, connections)
+        stamp = config_path.stat().st_mtime_ns
+        control('stop')
+        self.assertEqual(config_path.stat().st_mtime_ns, stamp)
+        process.terminate(); process.wait(timeout=3)
+        directory, process = self.agent()
+        self.await_streams(directory, lambda s: len(s) == 2 and all(x['frames'] >= 5 for x in s)
+                           and next(x for x in s if x['id'] == camera_id)['recordingState'] == 'stopped')
+        control('disable')
+        self.await_streams(directory, lambda s: next(x for x in s if x['id'] == camera_id)['state'] == 'disabled')
+        self.assertNotEqual(self.cli('camera', 'start', camera_id, '--runtime-dir', directory).returncode, 0)
+        control('stop')  # Allowed while disabled; intent remains independently configurable.
+        control('enable')
+        self.await_streams(directory, lambda s: any(x['id'] == camera_id and x['state'] == 'streaming' and not x['recordingStarted'] for x in s))
+        connections = first.connections
+        control('start')
+        self.await_streams(directory, lambda s: any(x['id'] == camera_id and x['recordingState'] == 'waitingForStore' for x in s))
+        self.assertEqual(first.connections, connections)
+        # A failed persistence step must not change the running receiver's intent.
+        (directory / 'cameras').chmod(0o500)
+        try:
+            self.assertNotEqual(self.cli('camera', 'stop', camera_id, '--runtime-dir', directory).returncode, 0)
+            self.await_streams(directory, lambda s: any(x['id'] == camera_id and x['recordingStarted'] for x in s))
+        finally:
+            (directory / 'cameras').chmod(0o700)
+        control('disable')
+        process.terminate(); process.wait(timeout=3)
+        connections = first.connections
+        self.agent()
+        self.await_streams(directory, lambda s: any(x['id'] == camera_id and x['state'] == 'disabled' and x['recordingStarted'] for x in s))
+        self.assertEqual(first.connections, connections)
+        control('enable')
+        self.await_streams(directory, lambda s: any(x['id'] == camera_id and x['state'] == 'streaming' and x['recordingStarted'] for x in s))
+        listing = self.cli('camera', 'list', '--runtime-dir', directory, '--json')
+        self.assertEqual(len(json.loads(listing.stdout)), 2)
+        self.assertNotIn('stream-secret', listing.stdout)
+        self.assertNotIn('rtsp://', listing.stdout)
+
+    def test_camera_selection_manual_change_and_edit_conflicts(self):
+        directory, _ = self.agent()
+        camera_id = self.add_stream(directory, self.rtsp_fixture(), 'Same')
+        self.add_stream(directory, self.rtsp_fixture(), 'Same')
+        for arguments in [('camera', 'stop'), ('camera', 'stop', 'Same'), ('camera', 'remove')]:
+            result = self.cli(*arguments, '--runtime-dir', directory, input='')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('unambiguous', result.stderr)
+        path = directory / 'cameras' / (camera_id + '.json')
+        before = path.read_bytes()
+        cancelled = self.cli('camera', 'change', camera_id, '--runtime-dir', directory, input='Unsaved\nno\n')
+        self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        options = self.camera_request(directory, 'cameras.options', cameraID=camera_id)['cameraOptions']
+        self.assertNotIn('stream-secret', json.dumps(options))
+        self.assertNotIn('rtsp://', json.dumps(options))
+        self.camera_request(directory, 'cameras.stop', cameraID=camera_id)
+        stale = dict(name='Stale', profileToken=None, revision=options['revision'])
+        self.assertIn('error', self.camera_request(directory, 'cameras.change', cameraID=camera_id, cameraEdit=stale))
+        self.camera_request(directory, 'cameras.disable', cameraID=camera_id)
+        changed = self.cli('camera', 'change', camera_id, '--runtime-dir', directory, input='Renamed\nyes\n')
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        saved = json.loads(path.read_text())
+        self.assertEqual(saved['Name'], 'Renamed')
+        self.assertFalse(saved['Enabled']); self.assertFalse(saved['RecordingStarted'])
+        self.assertEqual(saved['Credentials'], json.loads(before)['Credentials'])
+        self.assertEqual(saved['RTSPURL'], json.loads(before)['RTSPURL'])
+        before = path.read_bytes()
+        options = self.camera_request(directory, 'cameras.options', cameraID=camera_id)['cameraOptions']
+        for name, token in [('', None), ('Bad profile', 'invented')]:
+            bad = dict(name=name, profileToken=token, revision=options['revision'])
+            self.assertIn('error', self.camera_request(directory, 'cameras.change', cameraID=camera_id, cameraEdit=bad))
+            self.assertEqual(path.read_bytes(), before)
+        removed = self.cli('camera', 'remove', 'Renamed', '--runtime-dir', directory, input='yes\n')
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(path.exists())
+
+    def test_camera_change_uses_daemon_credentials_and_preserves_controls(self):
+        directory, _ = self.agent()
+        homebase = self.homebase_fixture()
+        result = self.cli('camera', 'add', '--runtime-dir', directory, '--homebase-dir', homebase, input='1\n1\nFront\n\nyes\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        camera_id = self.camera_request(directory, 'cameras.list')['cameras'][0]['id']
+        self.camera_request(directory, 'cameras.disable', cameraID=camera_id)
+        path = directory / 'cameras' / (camera_id + '.json')
+        before = json.loads(path.read_text())
+        result = self.cli('camera', 'change', camera_id, '--runtime-dir', directory, input='Front Door\n1\nyes\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('import-secret', result.stdout + result.stderr)
+        saved = json.loads(path.read_text())
+        self.assertEqual(saved['Name'], 'Front Door')
+        self.assertEqual(saved['VideoProfile']['Token'], 'main')
+        self.assertEqual(saved['RTSPURL'], 'rtsp://127.0.0.1:8554/stream/main?channel=1')
+        self.assertEqual(saved['Credentials'], before['Credentials'])
+        self.assertFalse(saved['Enabled']); self.assertTrue(saved['RecordingStarted'])
+        preserved = path.read_bytes()
+        self.servers[0][0].mode = 'unauthorized'
+        result = self.cli('camera', 'change', camera_id, '--runtime-dir', directory, input='Nope\n')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(path.read_bytes(), preserved)
+        self.assertNotIn('import-secret', result.stderr)
+        self.assertEqual(set(self.servers[0][0].operations), {'GetDeviceInformation', 'GetCapabilities', 'GetProfiles', 'GetStreamUri'})
+
     def test_streams_receive_discard_keepalive_remove_and_restart(self):
         directory, process = self.agent()
         first, second = self.rtsp_fixture(), self.rtsp_fixture(codec="H265", auth="basic")
@@ -370,10 +489,10 @@ class Integration(unittest.TestCase):
         config["Name"] = "Renamed by hand"
         path.write_text(json.dumps(config))
         self.assertEqual(self.camera_request(directory, "cameras.list")["cameras"][0]["name"], "Renamed by hand")
-        cancelled = self.cli("remove", "--runtime-dir", directory, input="1\nno\n")
+        cancelled = self.cli("remove", saved['id'], "--runtime-dir", directory, input="no\n")
         self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
         self.assertTrue(path.exists())
-        removed = self.cli("remove", "--runtime-dir", directory, input="1\nyes\n")
+        removed = self.cli("remove", saved['id'], "--runtime-dir", directory, input="yes\n")
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(path.exists())
         self.assertEqual((homebase / "credentials/front.json").read_bytes(), original)

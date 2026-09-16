@@ -104,6 +104,7 @@ protocol RecordingDestination: AnyObject {
     func accept(_ event: RecordingEvent)
     func snapshot() -> RecordingStoreStatus
     func finish(timeout: TimeInterval) -> Bool
+    func flush(timeout: TimeInterval) -> Bool
 }
 
 /// Routing does not perform muxing or disk I/O on camera queues.
@@ -144,6 +145,15 @@ final class RecordingStoreManager: @unchecked Sendable {
     }
     var hasWritableStore: Bool {
         snapshot().contains { $0.enabled && $0.state != "error" && $0.state != "stopping" }
+    }
+    func drain(timeout: TimeInterval = 3) throws {
+        lock.lock(); let values = Array(destinations.values); lock.unlock()
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        for store in values {
+            guard store.flush(timeout: max(0, deadline - ProcessInfo.processInfo.systemUptime)) else {
+                throw ServiceError(.timeout, "Camera settings were saved and applied; recording finalization is still pending. Check status before retrying.")
+            }
+        }
     }
     func snapshot() -> [RecordingStoreStatus] {
         lock.lock(); let values = Array(destinations.values), errors = Array(unavailable.values); lock.unlock()

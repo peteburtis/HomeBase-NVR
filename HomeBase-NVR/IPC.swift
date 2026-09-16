@@ -7,6 +7,7 @@ struct Request: Codable {
     let operation: String
     var camera: CameraConfiguration? = nil
     var cameraID: String? = nil
+    var cameraEdit: CameraEdit? = nil
     var store: RecordingStoreConfiguration? = nil
     var storeID: String? = nil
 }
@@ -25,6 +26,7 @@ struct Reply: Codable {
     let code: FailureCode?
     var cameras: [CameraSummary]? = nil
     var camera: CameraSummary? = nil
+    var cameraOptions: CameraEditableOptions? = nil
     var stores: [RecordingStoreConfiguration]? = nil
     var store: RecordingStoreConfiguration? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
@@ -256,7 +258,7 @@ final class AgentServer {
                 let storeStatus = recordings.snapshot()
                 var streamStatus = streams.snapshot()
                 let recording = storeStatus.contains { $0.enabled && $0.state != "error" && $0.state != "stopping" }
-                for index in streamStatus.indices { streamStatus[index].mode = recording ? "record" : "discard" }
+                for index in streamStatus.indices { streamStatus[index].updateRecordingState(hasWritableStore: recording) }
                 let status = AgentStatus(ready: true, version: BuildInfo.version, pid: getpid(), uptimeSeconds: ProcessInfo.processInfo.systemUptime - started, streams: streamStatus, stores: storeStatus)
                 reply = Reply(protocolVersion: 1, status: status, error: nil, code: nil)
             case "cameras.list":
@@ -269,6 +271,43 @@ final class AgentServer {
                 guard let id = request.cameraID else { throw ServiceError(.invalidMessage, "Camera ID is required.") }
                 reply.camera = try cameras.remove(id: id)
                 streams.remove(id: id)
+                try recordings.drain()
+            case "cameras.options":
+                guard let id = request.cameraID else { throw ServiceError(.invalidMessage, "Camera ID is required.") }
+                let camera = try cameras.configuration(id: id)
+                let profiles = try camera.onvifPort == nil ? nil : camera.onvifClient().media(expectedID: camera.homebaseDeviceID, deadline: min(deadline - 0.5, ProcessInfo.processInfo.systemUptime + 3)).profiles
+                reply.cameraOptions = CameraEditableOptions(name: camera.name, selectedProfile: camera.videoProfile, profiles: profiles, revision: camera.revision)
+            case "cameras.change":
+                guard let id = request.cameraID, let edit = request.cameraEdit else { throw ServiceError(.invalidMessage, "Camera ID and options are required.") }
+                var camera = try cameras.configuration(id: id)
+                guard edit.revision == camera.revision else { throw ServiceError("Camera changed while editing; run camera change again.") }
+                camera.name = edit.name
+                try camera.validate()
+                if edit.profileToken != camera.videoProfile?.token {
+                    guard let token = edit.profileToken else { throw ServiceError("A video profile cannot be cleared through camera change.") }
+                    let client = try camera.onvifClient(), discoveryDeadline = min(deadline - 0.5, ProcessInfo.processInfo.systemUptime + 3)
+                    let media = try client.media(expectedID: camera.homebaseDeviceID, deadline: discoveryDeadline)
+                    guard let profile = media.profiles.first(where: { $0.token == token }) else { throw ServiceError("Selected video profile is no longer available; run camera change again.") }
+                    camera.rtspURL = try client.stream(profile: profile, media: media, deadline: discoveryDeadline)
+                    camera.videoProfile = profile
+                }
+                reply.camera = try cameras.save(camera, id: id)
+                streams.add(id: id, camera: camera)
+                try recordings.drain(timeout: max(0, min(3, deadline - ProcessInfo.processInfo.systemUptime - 0.3)))
+            case "cameras.enable", "cameras.disable", "cameras.start", "cameras.stop":
+                guard let id = request.cameraID else { throw ServiceError(.invalidMessage, "Camera ID is required.") }
+                var camera = try cameras.configuration(id: id)
+                switch request.operation {
+                case "cameras.enable": camera.enabled = true
+                case "cameras.disable": camera.enabled = false
+                case "cameras.start":
+                    guard camera.enabled else { throw ServiceError("Camera is disabled; enable it before starting recording.") }
+                    camera.recordingStarted = true
+                default: camera.recordingStarted = false
+                }
+                reply.camera = try cameras.save(camera, id: id)
+                streams.add(id: id, camera: camera)
+                if !camera.enabled || !camera.recordingStarted { try recordings.drain() }
             case "stores.list": reply.stores = try stores.list()
             case "stores.add", "stores.change":
                 guard var config = request.store, uid != 0 else { throw ServiceError(.permission, "Run store setup as the requesting user, without sudo.") }
@@ -308,7 +347,7 @@ final class AgentServer {
                 }
                 reply.store = config
             default:
-                throw ServiceError(.invalidMessage, "Unknown operation. Camera commands require hbnvr 0.2.0 or newer; reinstall if the agent is older.")
+                throw ServiceError(.invalidMessage, "Unknown operation. Camera controls require hbnvr 0.6.0 or newer; reinstall if the agent is older.")
             }
             try SocketIO.write(JSONEncoder().encode(reply), fd: fd, deadline: deadline, cancellation: cancellation)
         } catch {

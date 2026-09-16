@@ -30,6 +30,83 @@ final class CameraTests: XCTestCase {
         try anonymous.validate()
         XCTAssertEqual(try JSONDecoder().decode(CameraConfiguration.self, from: CameraJSON.encode(value)), value)
     }
+    func testPersistentControlsDefaultTrueForLegacyFilesAndRoundTrip() throws {
+        var fields = try XCTUnwrap(JSONSerialization.jsonObject(with: CameraJSON.encode(camera())) as? [String: Any])
+        fields.removeValue(forKey: "Enabled"); fields.removeValue(forKey: "RecordingStarted")
+        let old = try JSONDecoder().decode(CameraConfiguration.self, from: JSONSerialization.data(withJSONObject: fields))
+        XCTAssertTrue(old.enabled); XCTAssertTrue(old.recordingStarted)
+        for enabled in [false, true] { for started in [false, true] {
+            var value = old; value.enabled = enabled; value.recordingStarted = started
+            XCTAssertEqual(try JSONDecoder().decode(CameraConfiguration.self, from: CameraJSON.encode(value)), value)
+        } }
+        for key in ["Enabled", "RecordingStarted"] {
+            var invalid = fields; invalid[key] = NSNull()
+            XCTAssertThrowsError(try JSONDecoder().decode(CameraConfiguration.self, from: JSONSerialization.data(withJSONObject: invalid)))
+            invalid[key] = "yes"
+            XCTAssertThrowsError(try JSONDecoder().decode(CameraConfiguration.self, from: JSONSerialization.data(withJSONObject: invalid)))
+        }
+    }
+    func testCameraUpdatesPreserveIdentityCredentialsAndRejectInvalidDrafts() throws {
+        let store = CameraStore(directory: try temporary() + "/cameras")
+        let original = camera(), saved = try store.add(original)
+        var changed = original; changed.name = "Den"; changed.enabled = false; changed.recordingStarted = false
+        let result = try store.save(changed, id: saved.id)
+        XCTAssertEqual(result.id, saved.id)
+        let loaded = try store.configuration(id: saved.id)
+        XCTAssertEqual(loaded, changed); XCTAssertEqual(loaded.credentials, original.credentials)
+        XCTAssertNotEqual(original.revision, changed.revision)
+        XCTAssertEqual(loaded.revision, changed.revision)
+        let path = store.directory + "/" + saved.id + ".json"
+        let before = try Data(contentsOf: URL(fileURLWithPath: path)), inode = try SecureFiles.info(path)!.st_ino
+        _ = try store.save(changed, id: saved.id)
+        XCTAssertEqual(try SecureFiles.info(path)!.st_ino, inode) // Idempotent control avoids another atomic write.
+        changed.name = ""
+        XCTAssertThrowsError(try store.save(changed, id: saved.id))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), before)
+        XCTAssertThrowsError(try store.save(camera("192.0.2.2"), id: saved.id))
+        XCTAssertThrowsError(try store.save(original, id: "../outside"))
+    }
+    func testStatusSeparatesIntentFromHealthAndStoreAvailability() {
+        for enabled in [false, true] { for started in [false, true] {
+            for receiving in [false, true] { for store in [false, true] {
+                var status = CameraStreamStatus(id: "test", name: "Test")
+                status.enabled = enabled; status.recordingStarted = started
+                status.state = receiving ? "streaming" : "retrying"
+                status.updateRecordingState(hasWritableStore: store)
+                XCTAssertEqual(status.mode == "record", enabled && started && receiving && store)
+                let expected = !enabled ? "disabled" : !started ? "stopped" : !receiving ? "waitingForStream" : !store ? "waitingForStore" : "recording"
+                XCTAssertEqual(status.recordingState, expected)
+            } }
+        } }
+    }
+    func testCameraControlPreservesHandWrittenExtensionFields() throws {
+        let store = CameraStore(directory: try temporary() + "/cameras")
+        let saved = try store.add(camera()), path = store.directory + "/" + saved.id + ".json"
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: CameraJSON.read(path, privateFile: true)) as? [String: Any])
+        document["Notes"] = "Keep this annotation"
+        var credentials = document["Credentials"] as! [String: Any]
+        credentials["Comment"] = "Keep this too"; document["Credentials"] = credentials
+        try SecureFiles.atomicWrite(JSONSerialization.data(withJSONObject: document), to: path, mode: 0o600)
+        var value = try store.configuration(id: saved.id); value.recordingStarted = false
+        _ = try store.save(value, id: saved.id)
+        let result = try XCTUnwrap(JSONSerialization.jsonObject(with: CameraJSON.read(path, privateFile: true)) as? [String: Any])
+        XCTAssertEqual(result["Notes"] as? String, "Keep this annotation")
+        XCTAssertEqual((result["Credentials"] as? [String: Any])?["Comment"] as? String, "Keep this too")
+        XCTAssertEqual(result["RecordingStarted"] as? Bool, false)
+    }
+    func testDisabledCameraNeverOpensOrRetriesAStream() {
+        let streams = StreamingCoordinator { _ in }
+        var value = camera(); value.enabled = false
+        streams.add(id: "fixture", camera: value)
+        XCTAssertEqual(streams.snapshot().first?.state, "disabled")
+        XCTAssertEqual(streams.snapshot().first?.recordingStarted, true)
+        value.recordingStarted = false
+        streams.add(id: "fixture", camera: value)
+        XCTAssertEqual(streams.snapshot().first?.state, "disabled")
+        XCTAssertEqual(streams.snapshot().first?.recordingStarted, false)
+        XCTAssertEqual(streams.snapshot().first?.frames, 0)
+        streams.stop()
+    }
     func testURLValidationAndOptionalMetadata() throws {
         XCTAssertEqual(try CameraConfiguration.streamURL("/live?channel=1", host: "::1", port: 8554), "rtsp://[::1]:8554/live?channel=1")
         XCTAssertNotNil(try CameraConfiguration.streamURL("rtsps://camera.local:8554/live", host: "camera.local", port: 8554))

@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 struct CameraCredentials: Codable, Equatable {
     var schemaVersion = 1
@@ -19,6 +20,8 @@ struct CameraCredentials: Codable, Equatable {
 struct CameraConfiguration: Codable, Equatable {
     var schemaVersion = 1
     var name: String
+    var enabled = true
+    var recordingStarted = true
     var provider = "RTSP"
     let ipAddress: String
     var onvifPort: UInt16? = nil
@@ -33,6 +36,7 @@ struct CameraConfiguration: Codable, Equatable {
         case rtspURL = "RTSPURL"
         case homebaseDeviceID = "HomebaseDeviceID"
         case videoProfile = "VideoProfile"
+        case enabled = "Enabled", recordingStarted = "RecordingStarted"
     }
     static func printable(_ text: String, limit: Int) -> Bool {
         !text.isEmpty && text.count <= limit && text.utf8.count <= limit * 4 &&
@@ -87,11 +91,64 @@ struct CameraConfiguration: Codable, Equatable {
     }
 }
 
-/// Shared options workflow for add and a future change command. Inputs are a
+extension CameraConfiguration {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try values.decode(Int.self, forKey: .schemaVersion)
+        name = try values.decode(String.self, forKey: .name)
+        enabled = try values.contains(.enabled) ? values.decode(Bool.self, forKey: .enabled) : true
+        recordingStarted = try values.contains(.recordingStarted) ? values.decode(Bool.self, forKey: .recordingStarted) : true
+        provider = try values.decode(String.self, forKey: .provider)
+        ipAddress = try values.decode(String.self, forKey: .ipAddress)
+        onvifPort = try values.decodeIfPresent(UInt16.self, forKey: .onvifPort)
+        rtspPort = try values.decode(UInt16.self, forKey: .rtspPort)
+        rtspURL = try values.decodeIfPresent(String.self, forKey: .rtspURL)
+        homebaseDeviceID = try values.decodeIfPresent(String.self, forKey: .homebaseDeviceID)
+        videoProfile = try values.decodeIfPresent(VideoProfile.self, forKey: .videoProfile)
+        credentials = try values.decodeIfPresent(CameraCredentials.self, forKey: .credentials)
+    }
+    var revision: String {
+        // An opaque edit-conflict token, not a configuration/credential response.
+        SHA256.hash(data: try! CameraJSON.encode(self)).map { String(format: "%02x", $0) }.joined()
+    }
+    func onvifClient() throws -> ONVIFClient {
+        guard let onvifPort, let credentials else { throw ServiceError("This camera has no configured ONVIF login; video profile selection is unavailable.") }
+        let endpoint = HomebaseImport.Endpoint(provider: provider, ipAddress: ipAddress, onvifPort: onvifPort,
+            rtspPort: rtspPort, credentialsPath: "", deviceID: homebaseDeviceID)
+        return ONVIFClient(endpoint: endpoint, credentials: credentials)
+    }
+}
+
+struct CameraEdit: Codable {
+    let name: String
+    let profileToken: String?
+    let revision: String
+}
+struct CameraEditableOptions: Codable {
+    let name: String
+    let selectedProfile: VideoProfile?
+    let profiles: [VideoProfile]?
+    let revision: String
+}
+
+/// Shared options workflow for add and change. Inputs are a
 /// configuration draft and current capabilities, not the import source.
 /// Discovery, camera selection, confirmation, and persistence belong to callers.
 /// This returns a validated draft; cancellation/errors never write configuration.
 enum CameraOptionsEditor {
+    static func select(name: String, profile: VideoProfile?, profiles: [VideoProfile]?,
+                       askName: (String) throws -> String,
+                       chooseProfile: ([VideoProfile], Int?) throws -> Int) throws -> (String, VideoProfile?) {
+        let name = try askName(name)
+        guard CameraConfiguration.printable(name, limit: 80), !name.trimmingCharacters(in: .whitespaces).isEmpty else { throw ServiceError("Camera name must contain 1...80 printable characters.") }
+        guard let profiles else { return (name, profile) }
+        guard !profiles.isEmpty else { throw ServiceError("No video profiles are available.") }
+        try profiles.forEach { try $0.validate() }
+        let defaultIndex = profile.map { saved in profiles.firstIndex { $0.token == saved.token } } ?? VideoProfile.preferredIndex(profiles)
+        let index = try chooseProfile(profiles, defaultIndex)
+        guard profiles.indices.contains(index) else { throw ServiceError(.invalidMessage, "Invalid video profile selection.") }
+        return (name, profiles[index])
+    }
     static func edit(
         _ current: CameraConfiguration,
         profiles: [VideoProfile]?,
@@ -99,24 +156,11 @@ enum CameraOptionsEditor {
         chooseProfile: ([VideoProfile], Int?) throws -> Int,
         resolveStream: (VideoProfile) throws -> String
     ) throws -> CameraConfiguration {
-        if let profiles {
-            guard !profiles.isEmpty else { throw ServiceError("No video profiles are available.") }
-            try profiles.forEach { try $0.validate() }
-        }
         var draft = current
-        draft.name = try askName(current.name)
-        if let profiles {
-            let defaultIndex: Int?
-            if let saved = current.videoProfile {
-                // Preserve the saved choice, not its position in a reordered list.
-                // If it disappeared, require an explicit replacement.
-                defaultIndex = profiles.firstIndex { $0.token == saved.token }
-            } else {
-                defaultIndex = VideoProfile.preferredIndex(profiles)
-            }
-            let index = try chooseProfile(profiles, defaultIndex)
-            guard profiles.indices.contains(index) else { throw ServiceError(.invalidMessage, "Invalid video profile selection.") }
-            let profile = profiles[index]
+        let (name, selection) = try select(name: current.name, profile: current.videoProfile, profiles: profiles,
+            askName: askName, chooseProfile: chooseProfile)
+        draft.name = name
+        if profiles != nil, let profile = selection {
             draft.rtspURL = try resolveStream(profile)
             draft.videoProfile = profile
         }
@@ -133,9 +177,13 @@ struct CameraSummary: Codable {
     let ipAddress: String
     let onvifPort: UInt16?
     let rtspPort: UInt16
+    let enabled: Bool
+    let recordingStarted: Bool
+    let videoProfile: VideoProfile?
     init(id: String, camera: CameraConfiguration) {
         self.id = id; name = camera.name; ipAddress = camera.ipAddress
         onvifPort = camera.onvifPort; rtspPort = camera.rtspPort
+        enabled = camera.enabled; recordingStarted = camera.recordingStarted; videoProfile = camera.videoProfile
     }
 }
 
@@ -192,6 +240,33 @@ struct CameraStore {
     }
     /// Private daemon input, never included in status or list replies.
     func configurations() throws -> [(String, CameraConfiguration)] { try entries() }
+    func configuration(id: String) throws -> CameraConfiguration {
+        guard UUID(uuidString: id) != nil else { throw ServiceError(.invalidMessage, "Invalid camera ID.") }
+        guard let camera = try entries().first(where: { $0.0 == id })?.1 else { throw ServiceError("Camera no longer exists.") }
+        return camera
+    }
+    func save(_ camera: CameraConfiguration, id: String) throws -> CameraSummary {
+        try camera.validate()
+        let old = try configuration(id: id)
+        var allowed = old
+        allowed.name = camera.name; allowed.enabled = camera.enabled; allowed.recordingStarted = camera.recordingStarted
+        allowed.videoProfile = camera.videoProfile; allowed.rtspURL = camera.rtspURL
+        guard allowed == camera else { throw ServiceError("Camera options cannot replace the endpoint, credentials, or discovery identity.") }
+        if old != camera {
+            let path = directory + "/" + id + ".json"
+            // Patch only owned options; retain hand-written extension fields and
+            // the original credential object, including unrecognized metadata.
+            guard var document = try JSONSerialization.jsonObject(with: CameraJSON.read(path, privateFile: true)) as? [String: Any],
+                  let updated = try JSONSerialization.jsonObject(with: CameraJSON.encode(camera)) as? [String: Any] else {
+                throw ServiceError("Camera JSON changed unexpectedly; stop the agent before manual edits.")
+            }
+            for key in ["Name", "Enabled", "RecordingStarted", "VideoProfile", "RTSPURL"] { document[key] = updated[key] }
+            let data = try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) + Data([10])
+            guard data.count <= 65536 else { throw ServiceError("Updated camera JSON exceeds 64 KiB; no changes were saved.") }
+            try SecureFiles.atomicWrite(data, to: path, mode: 0o600)
+        }
+        return CameraSummary(id: id, camera: camera)
+    }
     func add(_ camera: CameraConfiguration) throws -> CameraSummary {
         try camera.validate()
         let existing = try entries()

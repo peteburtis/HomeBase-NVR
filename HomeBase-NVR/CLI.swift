@@ -7,7 +7,7 @@ import os
 struct HBNVR: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "hbnvr", abstract: "Manage the HomeBase NVR service.", version: BuildInfo.version,
-        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Store.self, Agent.self])
+        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Camera.self, Store.self, Agent.self])
 }
 
 func command(_ work: () throws -> Void) throws {
@@ -68,6 +68,7 @@ struct Status: ParsableCommand {
                 print("hbnvr ready — version \(status.version), PID \(status.pid), uptime \(Int(status.uptimeSeconds))s")
                 for stream in status.streams ?? [] {
                     print("  \(stream.name): \(stream.state) — \(stream.frames) frames, \(String(format: "%.1f", stream.framesPerSecond)) fps, \(String(format: "%.1f", stream.receiveKbps)) kb/s (\(stream.mode))")
+                    print("    \(stream.enabled ? "enabled" : "disabled"), recording intent: \(stream.recordingStarted ? "started" : "stopped"); recording: \(stream.recordingState)")
                     if let error = stream.lastError { print("    \(error)") }
                 }
                 for store in status.stores ?? [] {

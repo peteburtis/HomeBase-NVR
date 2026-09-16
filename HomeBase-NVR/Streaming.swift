@@ -6,6 +6,9 @@ struct CameraStreamStatus: Codable {
     let name: String
     var state = "connecting"
     var mode = "discard"
+    var enabled = true
+    var recordingStarted = true
+    var recordingState = "waitingForStream"
     var codec: String?
     var receivedBytes: UInt64 = 0
     var rtpPackets: UInt64 = 0
@@ -16,12 +19,17 @@ struct CameraStreamStatus: Codable {
     var reconnects: UInt64 = 0
     var lastFrameAgeSeconds: Double?
     var lastError: String?
+    mutating func updateRecordingState(hasWritableStore: Bool) {
+        recordingState = !enabled ? "disabled" : !recordingStarted ? "stopped"
+            : state != "streaming" ? "waitingForStream" : !hasWritableStore ? "waitingForStore" : "recording"
+        mode = recordingState == "recording" ? "record" : "discard"
+    }
 }
 
 /// Owns independent camera sessions. All mutable state lives on `queue`; no video is retained.
 final class StreamingCoordinator: @unchecked Sendable {
     private final class Entry: @unchecked Sendable {
-        let camera: CameraConfiguration
+        var camera: CameraConfiguration
         var status: CameraStreamStatus
         var client: RTSPClient?
         var generation = UUID()
@@ -36,6 +44,7 @@ final class StreamingCoordinator: @unchecked Sendable {
         init(id: String, camera: CameraConfiguration) {
             self.camera = camera
             status = CameraStreamStatus(id: id, name: camera.name)
+            status.enabled = camera.enabled; status.recordingStarted = camera.recordingStarted
         }
     }
     private let queue = DispatchQueue(label: "com.graygoolabs.hbnvr.streams")
@@ -53,10 +62,23 @@ final class StreamingCoordinator: @unchecked Sendable {
     func add(id: String, camera: CameraConfiguration) {
         queue.sync {
             guard !stopped else { return }
+            if let entry = entries[id] {
+                if entry.camera == camera { return }
+                var changed = entry.camera
+                changed.recordingStarted = camera.recordingStarted
+                if changed == camera {
+                    // Recording control does not interrupt the receiver or reset counters.
+                    entry.camera = camera; entry.status.recordingStarted = camera.recordingStarted
+                    if !camera.recordingStarted { record(.end(camera: id)) }
+                    return
+                }
+                record(.end(camera: id))
+            }
             entries[id]?.client?.stop()
             let entry = Entry(id: id, camera: camera)
             entries[id] = entry
-            if camera.rtspURL == nil { entry.status.state = "unconfigured" }
+            if !camera.enabled { entry.status.state = "disabled" }
+            else if camera.rtspURL == nil { entry.status.state = "unconfigured" }
             else { connect(entry) }
             if timer == nil {
                 let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -98,7 +120,7 @@ final class StreamingCoordinator: @unchecked Sendable {
     }
 
     private func connect(_ entry: Entry) {
-        guard let text = entry.camera.rtspURL, let url = URL(string: text) else { return }
+        guard entry.camera.enabled, let text = entry.camera.rtspURL, let url = URL(string: text) else { return }
         entry.generation = UUID()
         let generation = entry.generation
         entry.began = now
@@ -128,7 +150,7 @@ final class StreamingCoordinator: @unchecked Sendable {
                     entry.status.frames &+= frames
                     entry.status.droppedFrames &+= dropped
                     if dropped > 0 { self.record(.end(camera: entry.status.id)) }
-                    if let media { self.record(.media(camera: entry.status.id, name: entry.status.name, media)) }
+                    if entry.camera.recordingStarted, let media { self.record(.media(camera: entry.status.id, name: entry.status.name, media)) }
                     if frames > 0 {
                         if entry.firstFrame == nil {
                             entry.firstFrame = self.now

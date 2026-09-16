@@ -256,6 +256,11 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         lock.unlock()
         return drained.wait(timeout: .now() + timeout) == .success
     }
+    func flush(timeout: TimeInterval) -> Bool {
+        let barrier = DispatchGroup(); barrier.enter()
+        queue.async { barrier.leave() }
+        return barrier.wait(timeout: .now() + timeout) == .success
+    }
     private func fail(_ error: Error) {
         let message = (error as? ServiceError)?.message ?? "Local recording failed; check destination access and free space."
         lock.lock(); accepting = false

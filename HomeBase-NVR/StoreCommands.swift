@@ -3,7 +3,7 @@ import Foundation
 import Darwin
 
 struct Store: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Configure recording stores. Enabled stores record all configured cameras automatically.", subcommands: [StoreAdd.self, StoreList.self, StoreChange.self, StoreEnable.self, StoreDisable.self, StoreRemove.self])
+    static let configuration = CommandConfiguration(abstract: "Configure recording stores. Enabled stores receive enabled cameras whose recording state is started.", subcommands: [StoreAdd.self, StoreList.self, StoreChange.self, StoreEnable.self, StoreDisable.self, StoreRemove.self])
 }
 struct StoreTarget: ParsableArguments {
     @Option(help: "Local agent runtime directory; omit for the installed service.") var runtimeDir: String?
@@ -11,12 +11,9 @@ struct StoreTarget: ParsableArguments {
     func selected() throws -> (CameraConnection, RecordingStoreConfiguration) {
         let connection = try CameraConnection(runtimeDir: runtimeDir)
         let stores = try StoreUI.list(connection)
-        let matches = selector.map { value in stores.filter { $0.id == value || $0.name == value } } ?? stores
-        guard !matches.isEmpty else { throw ServiceError("No matching recording stores.") }
-        if selector != nil, matches.count == 1 { return (connection, matches[0]) }
-        guard isatty(STDIN_FILENO) == 1 else { throw ServiceError("Specify an unambiguous store name or UUID when not using a terminal.") }
-        let index = try CameraPrompt.choose(matches.map { "\($0.name) [\($0.id)] — \($0.directory)" }, title: "Choose a store")
-        return (connection, matches[index])
+        let selected = try ResourceSelection.select(stores, selector: selector, id: { $0.id }, name: { $0.name },
+            label: { "\($0.name) [\($0.id)] — \($0.directory)" }, kind: "store")
+        return (connection, selected)
     }
 }
 enum StoreUI {
@@ -38,7 +35,7 @@ enum StoreUI {
         try draft.validate()
         print("\(draft.name) — \(draft.directory)")
         print("Shard: \(draft.shardDuration) (\(try IntervalText.seconds(draft.shardDuration)) seconds); retention: \(draft.retentionPeriod) (\(try IntervalText.seconds(draft.retentionPeriod)) seconds)")
-        if draft.enabled { print("All configured cameras will record to this store automatically.") }
+        if draft.enabled { print("Enabled cameras whose recording state is started will record to this store automatically.") }
         return draft
     }
     static func action(_ operation: String, target: StoreTarget) throws {
@@ -96,7 +93,7 @@ struct StoreChange: ParsableCommand {
     } }
 }
 struct StoreEnable: ParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "enable", abstract: "Persistently enable recording all cameras to a store.")
+    static let configuration = CommandConfiguration(commandName: "enable", abstract: "Persistently enable a store for cameras whose recording state is started.")
     @OptionGroup var target: StoreTarget
     func run() throws { try command { try StoreUI.action("enable", target: target) } }
 }

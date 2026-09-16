@@ -361,6 +361,30 @@ final class StoreTests: XCTestCase {
         manager.stop()
         withExtendedLifetime(original) {}
     }
+    func testCameraStopDrainsItsShardWithoutStoppingOtherCameras() async throws {
+        let configuration = try config(try temporary() + "/output")
+        let manager = RecordingStoreManager(); try manager.install(configuration)
+        defer { manager.stop() }
+        let first = UUID().uuidString, second = UUID().uuidString, frames = try Self.video(count: 90)
+        for frame in frames.prefix(45) {
+            manager.accept(.media(camera: first, name: "First", frame))
+            manager.accept(.media(camera: second, name: "Second", frame))
+        }
+        manager.accept(.end(camera: first))
+        try manager.drain()
+        XCTAssertEqual(manager.snapshot().first?.completedShards, 1)
+        XCTAssertEqual(manager.snapshot().first?.activeRecordings, 1)
+        let firstPath = configuration.directory + "/First"
+        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(atPath: firstPath).first { $0.hasSuffix(".mp4") })
+        let decoded = try await decodedFrames(firstPath + "/" + file)
+        XCTAssertEqual(decoded, 45)
+        for frame in frames.dropFirst(45) { manager.accept(.media(camera: second, name: "Second", frame)) }
+        manager.accept(.end(camera: second)); try manager.drain()
+        XCTAssertEqual(manager.snapshot().first?.completedShards, 2)
+        XCTAssertEqual(manager.snapshot().first?.activeRecordings, 0)
+        XCTAssertNil(manager.snapshot().first?.lastError)
+        XCTAssertTrue(manager.hasWritableStore)
+    }
     func testUnavailableDisabledStoreCanBeRemoved() throws {
         var configuration = try config(try temporary() + "/output")
         configuration.enabled = false; configuration.directory += "/missing"
