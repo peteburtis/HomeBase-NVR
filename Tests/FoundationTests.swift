@@ -46,6 +46,39 @@ final class FoundationTests: XCTestCase {
         XCTAssertThrowsError(try SecureFiles.ensureDirectory(path, owner: geteuid(), mode: 0o700))
         XCTAssertThrowsError(try SecureFiles.validateDirectory(path, owner: 0, mode: 0o755))
     }
+    func testDirectoryErrorReportsRequiredAndObservedOwnerAndMode() throws {
+        let path = temporary(); defer { try? FileManager.default.removeItem(atPath: path) }
+        try SecureFiles.ensureDirectory(path, owner: geteuid(), mode: 0o755)
+        XCTAssertThrowsError(try SecureFiles.validateDirectory(path, owner: geteuid(), mode: 0o700)) { error in
+            let failure = error as? ServiceError
+            XCTAssertEqual(failure?.code, .permission)
+            XCTAssertTrue(failure?.message.contains(path) == true)
+            XCTAssertTrue(failure?.message.contains("permissions 0700 (owner read/write/traverse; no group or other access)") == true)
+            XCTAssertTrue(failure?.message.contains("Found: directory, owner") == true)
+            XCTAssertTrue(failure?.message.contains("UID \(geteuid())") == true)
+            XCTAssertTrue(failure?.message.contains("permissions 0755") == true)
+        }
+        // Different expected UID, without needing privilege to chown the fixture.
+        XCTAssertThrowsError(try SecureFiles.validateDirectory(path, owner: geteuid() + 1, mode: 0o755)) { error in
+            let message = (error as? ServiceError)?.message ?? ""
+            XCTAssertTrue(message.contains("UID \(geteuid() + 1)")); XCTAssertTrue(message.contains("UID \(geteuid())"))
+        }
+        XCTAssertEqual(try XCTUnwrap(SecureFiles.info(path)).st_mode & 0o777, 0o755) // Diagnostics never repair silently.
+    }
+    func testDirectoryErrorDescribesMissingPathsFilesAndSymlinks() throws {
+        let path = temporary(); defer { try? FileManager.default.removeItem(atPath: path) }
+        try SecureFiles.ensureDirectory(path, owner: geteuid(), mode: 0o700)
+        try SecureFiles.atomicWrite(Data(), to: path + "/file", mode: 0o600)
+        try FileManager.default.createSymbolicLink(atPath: path + "/link", withDestinationPath: path)
+        for (leaf, description) in [("missing", "path does not exist"), ("file", "regular file"), ("link", "symbolic link")] {
+            XCTAssertThrowsError(try SecureFiles.validateDirectory(path + "/" + leaf, owner: geteuid(), mode: 0o700)) { error in
+                let message = (error as? ServiceError)?.message ?? ""
+                XCTAssertTrue(message.contains("Required: a directory (not a symbolic link)"))
+                XCTAssertTrue(message.contains("Found: " + description))
+                XCTAssertTrue(message.contains("permissions 0700"))
+            }
+        }
+    }
     func testOversizeSocketPathRejected() {
         XCTAssertThrowsError(try SocketIO.address("/" + String(repeating: "x", count: 120)) { _, _ in () })
     }

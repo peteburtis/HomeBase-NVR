@@ -393,7 +393,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     }
 }
 
-private final class MP4Shard {
+final class MP4Shard {
     // Only retains/releases the writer across its completion callback; no cross-queue mutation.
     private struct WriterLifetime: @unchecked Sendable { let writer: AVAssetWriter }
     let temporaryName: String

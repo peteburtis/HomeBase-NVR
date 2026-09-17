@@ -8,6 +8,6 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
-  <key>ExitTimeOut</key><integer>10</integer>
+  <key>ExitTimeOut</key><integer>60</integer>
   <key>Umask</key><integer>63</integer>
 </dict></plist>

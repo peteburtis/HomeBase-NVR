@@ -184,17 +184,303 @@ class Integration(unittest.TestCase):
     def camera_request(self, directory, operation, **fields):
         return self.request(directory, json.dumps(dict(protocolVersion=1, operation=operation, **fields)).encode() + b"\n")
 
+    def terminal_cli(self, arguments, prompts):
+        master, slave = pty.openpty()
+        def controlling_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        process = subprocess.Popen([BINARY, *map(str, arguments)], stdin=slave, stdout=slave,
+                                   stderr=slave, preexec_fn=controlling_terminal)
+        os.close(slave)
+        transcript, cursor = b"", 0
+        try:
+            for prompt, answer in prompts:
+                deadline = time.monotonic() + 8
+                while prompt not in transcript[cursor:]:
+                    self.assertLess(time.monotonic(), deadline, repr(transcript))
+                    if select.select([master], [], [], .1)[0]:
+                        transcript += os.read(master, 4096)
+                cursor = transcript.index(prompt, cursor) + len(prompt)
+                os.write(master, answer)
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if not select.select([master], [], [], .1)[0]:
+                    if process.poll() is not None:
+                        break
+                    continue
+                try:
+                    part = os.read(master, 4096)
+                except OSError:
+                    break
+                if not part:
+                    break
+                transcript += part
+            return process.wait(timeout=2), transcript
+        finally:
+            os.close(master)
+            if process.poll() is None:
+                process.kill(); process.wait(timeout=3)
+
+    def test_s3_optional_encryption_prompt_hidden_confirmed_and_cancellable(self):
+        directory, _ = self.agent()
+        for password, confirmation in [(b"", b""), (b"only-test-encryption", b"only-test-encryption"), (b"only-test-encryption", b"different-password")]:
+            prompts = [(b"Choose 1...2", b"2\n"), (b"Store name [S3 recordings]:", b"\n"),
+                       (b"Existing S3 bucket:", b"hbnvr-no-network-test\n"), (b"AWS region", b"\n"),
+                       (b"Object prefix", b"\n"), (b"Expected bucket owner", b"\n"),
+                       (b"Shard duration", b"\n"), (b"Retention period", b"\n"),
+                       (b"Choose 1...2", b"2\n"), (b"Enable recording", b"no\n"),
+                       (b"Access key ID:", b"AKIAUNITTEST000000000\n"),
+                       (b"Secret access key:", b"only-test-aws-secret\n"),
+                       (b"Encryption password (optional; blank for none):", password + b"\n")]
+            if password:
+                prompts += [(b"Confirm encryption password:", confirmation + b"\n")]
+            if password == confirmation:
+                prompts += [(b"Validate access and save this S3 store?", b"no\n")]
+            code, transcript = self.terminal_cli(["store", "add", "--runtime-dir", directory], prompts)
+            self.assertEqual(code, 0 if password == confirmation else 1, repr(transcript))
+            for secret in [b"only-test-encryption", b"only-test-aws-secret", b"different-password"]:
+                self.assertNotIn(secret, transcript)
+            self.assertFalse(list((directory / "stores").glob("*.json")))
+            # Cancelling before validation must never contact AWS.
+            self.assertNotIn(b"Validating S3 access", transcript)
+
+    def test_offline_decrypt_cli_hidden_password_and_no_overwrite(self):
+        encrypted = self.root / "download.mp4.hbnvr"
+        encrypted.write_bytes(base64.b64decode("SEJOVlJFMDEACSfAAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKisoturA7Czgie/kJ6LijBNu0L0hoXq28bZ3U0WDyuMJptqSwL4BlKlsNw9494LK8g=="))
+        output = self.root / "recovered.mp4"
+        for password, expected in [(b"incorrect-secret", 1), (b"independent test password", 0), (b"independent test password", 1)]:
+            code, transcript = self.terminal_cli(["decrypt", encrypted, output], [(b"Recording encryption password:", password + b"\n")])
+            self.assertEqual(code, expected, repr(transcript))
+            self.assertNotIn(password, transcript)
+            if password == b"incorrect-secret":
+                self.assertFalse(output.exists())
+            else:
+                self.assertEqual(output.read_bytes(), b"independent synthetic recording")
+                self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+    def test_encryption_aware_setup_refuses_legacy_agent(self):
+        directory = self.root / "legacy"
+        directory.mkdir(mode=0o700)
+        operations = []
+        config = dict(SchemaVersion=1, ID="AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", Name="Encrypted",
+                      Type="S3", Enabled=False, Directory="", ShardDuration="1m", RetentionPeriod="1w",
+                      OwnerUID=os.getuid(), OwnerUUID="BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+                      S3=dict(Bucket="hbnvr-unit-test", Region="us-west-2", Prefix="test/", Lifecycle="External",
+                              ClientEncryption=dict(Enabled=True)))
+        class LegacyHandler(socketserver.StreamRequestHandler):
+            def handle(self):
+                request = json.loads(self.rfile.readline())
+                operations.append(request["operation"])
+                reply = dict(protocolVersion=1)
+                if request["operation"] == "stores.list":
+                    reply["stores"] = [config]
+                else:
+                    reply.update(error="Unknown operation. Reinstall if the agent is older.", code=7)
+                self.wfile.write(json.dumps(reply).encode() + b"\n")
+        server = socketserver.UnixStreamServer(str(directory / "control.sock"), LegacyHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+        self.servers.append((server, thread))
+        result = self.cli("store", "enable", "Encrypted", "--runtime-dir", directory, input="yes\n")
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertIn("does not support this S3 setup protocol", result.stderr)
+        self.assertEqual(operations, ["stores.list", "stores.setup.start.v3"])
+
+    def seed_s3_controls(self):
+        directory = self.root / "run"
+        directory.mkdir(mode=0o700)
+        stores = directory / "stores"; stores.mkdir(mode=0o700)
+        identity = subprocess.check_output(["/usr/bin/dsmemberutil", "getuuid", "-u", str(os.getuid())], text=True)
+        owner_uuid = re.search(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}", identity).group(0)
+        store_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+        # No cameras, no backlog, External lifecycle; these tests never contact AWS.
+        config = dict(SchemaVersion=1, ID=store_id, Name="Cloud fixture", Type="S3", Enabled=False,
+                      Directory="", ShardDuration="1m", RetentionPeriod="1w", OwnerUID=os.getuid(), OwnerUUID=owner_uuid,
+                      S3=dict(Bucket="hbnvr-no-network-test", Region="us-west-2", Prefix="test/", Lifecycle="External",
+                              Credentials=dict(AccessKeyID="AKIAUNITTEST000000000", SecretAccessKey="private-fixture-secret-000000000000000000")))
+        path = stores / (store_id + ".json"); path.write_text(json.dumps(config)); path.chmod(0o600)
+        return directory, store_id, path
+
+    def await_store(self, directory, predicate):
+        deadline = time.monotonic() + 4
+        while True:
+            status = json.loads(self.cli("status", "--runtime-dir", directory, "--json").stdout)["status"]["stores"][0]
+            if predicate(status):
+                return status
+            self.assertLess(time.monotonic(), deadline, status); time.sleep(.02)
+
+    def test_spool_cli_picker_persistence_and_manual_release(self):
+        directory, store_id, path = self.seed_s3_controls()
+        _, process = self.agent()
+        code, transcript = self.terminal_cli(["store", "spool", "--on", "--runtime-dir", directory],
+                                             [(b"Choose a store", b""), (b"Choose 1...1", b"1\n")])
+        self.assertEqual(code, 0, transcript)
+        self.assertIn(b"Cloud fixture", transcript)
+        status = self.await_store(directory, lambda s: "manual" in s.get("s3", {}).get("reasons", []))
+        self.assertTrue(status["s3"]["spooling"]); self.assertNotIn("nextProbeSeconds", status["s3"])
+        config = json.loads(path.read_text()); self.assertTrue(config["S3"]["Advanced"]["ForceSpooling"])
+        self.assertEqual(config["SchemaVersion"], 4)
+        # A legacy client must not erase the hold while editing unrelated options.
+        legacy = json.loads(json.dumps(config)); legacy["SchemaVersion"] = 1
+        del legacy["S3"]["Advanced"]["ForceSpooling"]
+        rejected = self.camera_request(directory, "stores.setup.start.v2", store=legacy)
+        self.assertEqual(rejected["code"], 5)
+        self.assertTrue(json.loads(path.read_text())["S3"]["Advanced"]["ForceSpooling"])
+        process.terminate(); process.wait(timeout=5); self.agent()
+        self.await_store(directory, lambda s: "manual" in s.get("s3", {}).get("reasons", []))
+        code, transcript = self.terminal_cli(["store", "spool", "--off", "--runtime-dir", directory], [(b"Choose 1...1", b"1\n")])
+        self.assertEqual(code, 0, transcript)
+        self.await_store(directory, lambda s: "s3" in s and not s["s3"]["spooling"])
+        result = self.cli("store", "spool", store_id, "--off", "--runtime-dir", directory)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(path.read_text())["S3"]["Advanced"]["ForceSpooling"])
+        self.assertNotEqual(self.cli("store", "spool", store_id, "--runtime-dir", directory).returncode, 0)
+        self.assertNotEqual(self.cli("store", "spool", store_id, "--on", "--off", "--runtime-dir", directory).returncode, 0)
+
+    def test_advanced_store_editor_offline_validation_cancel_and_relocation(self):
+        directory, store_id, path = self.seed_s3_controls(); self.agent()
+        initial = json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout)[0]
+        target = self.root / "advanced-spool"; target.mkdir(mode=0o700)
+        advanced = ["3", "1", "3", "30", "30", "2m", "600", "10", "2", "120", "10737418240", "2147483648", str(target), "yes"]
+        def edit(values, confirm="yes"):
+            return self.cli("store", "change", store_id, "--advanced", "--runtime-dir", directory,
+                            input="\n".join([""] * 5 + values + ["no", confirm]) + "\n")
+        before = path.read_bytes()
+        cancelled = edit(advanced, "no"); self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
+        self.assertEqual(path.read_bytes(), before)
+        invalid = advanced.copy(); invalid[1] = "3"
+        self.assertNotEqual(edit(invalid).returncode, 0); self.assertEqual(path.read_bytes(), before)
+        saved = edit(advanced); self.assertEqual(saved.returncode, 0, saved.stderr)
+        self.assertNotIn("Validating S3", saved.stdout)
+        self.assertNotIn("private-fixture-secret", saved.stdout + saved.stderr)
+        config = json.loads(path.read_text())
+        self.assertEqual(config["S3"]["Advanced"]["ProbeIntervalSeconds"], 120)
+        # Configuration keeps the selected spelling; status reports its resolved path.
+        self.assertEqual(config["S3"]["Advanced"]["SpoolDirectory"], str(target))
+        self.assertTrue(config["S3"]["Advanced"]["ForceSpooling"])
+        self.assertIn("SecretAccessKey", config["S3"]["Credentials"])
+        self.assertFalse(config["Enabled"])
+        self.await_store(directory, lambda s: s.get("s3", {}).get("spoolDirectory") == str(target.resolve()))
+        current = json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout)[0]
+        self.assertNotIn("Credentials", current["S3"])
+        # Stale edits and common-option changes cannot bypass setup validation.
+        stale = self.camera_request(directory, "stores.advanced.change", store=current, storeOriginal=initial)
+        self.assertIn("error", stale)
+        edited = json.loads(json.dumps(current)); edited["Enabled"] = True
+        self.assertIn("error", self.camera_request(directory, "stores.advanced.change", store=edited, storeOriginal=current))
+        self.assertFalse(json.loads(path.read_text())["Enabled"])
+        self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+
+    def test_unreadable_spool_rechecks_repair_without_restart_or_upload(self):
+        directory, store_id, path = self.seed_s3_controls()
+        config = json.loads(path.read_text())
+        config["SchemaVersion"] = 4
+        # ForceSpooling prevents network dispatch throughout this synthetic test.
+        config["S3"]["Advanced"] = dict(ForceSpooling=True, ProbeIntervalSeconds=1)
+        path.write_text(json.dumps(config))
+        shard_id = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"
+        spool = directory / "spool"; spool.mkdir(mode=0o700)
+        store_spool = spool / store_id; store_spool.mkdir(mode=0o700)
+        entry = store_spool / shard_id; entry.mkdir(mode=0o700)
+        data = b"synthetic payload, never sent to AWS"
+        payload = entry / "video.mp4"; payload.write_bytes(data); payload.chmod(0o600)
+        marker = entry / "quarantined"
+        marker.write_text("Shard rejected; manual inspection required.\n"); marker.chmod(0o600)
+        manifest = entry / "metadata.json"; manifest.write_text("{"); manifest.chmod(0o600)
+        self.agent()
+        status = self.await_store(directory, lambda s: s.get("s3", {}).get("unreadableSpoolCount") == 1)
+        self.assertEqual(status["s3"]["quarantinedCount"], 0)  # Retired protocol-v1 compatibility field.
+        self.assertEqual(status["s3"]["active"], 0)
+        self.assertIn("nextReadRetrySeconds", status["s3"])
+        human = self.cli("status", "--runtime-dir", directory)
+        self.assertIn("unreadable: 1", human.stdout)
+        time.sleep(1.2)
+        self.assertEqual(payload.read_bytes(), data); self.assertTrue(marker.exists())
+        metadata = dict(schemaVersion=1, id=shard_id, storeID=store_id,
+                        cameraID="CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC", bucket=config["S3"]["Bucket"],
+                        region="us-west-2", prefix="test/", key="test/fixture.mp4", capturedAt=0,
+                        size=len(data), sha256=hashlib.sha256(data).hexdigest())
+        manifest.write_text(json.dumps(metadata))
+        status = self.await_store(directory, lambda s: s.get("s3", {}).get("unreadableSpoolCount") == 0
+                                  and s["s3"]["spoolCount"] == 1)
+        self.assertEqual(status["s3"]["active"], 0); self.assertEqual(status["s3"]["confirmedUploads"], 0)
+        self.assertTrue(marker.exists()); self.assertEqual(payload.read_bytes(), data)
+        current = json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout)[0]
+        target = self.root / "new-spool"; target.mkdir(mode=0o700)
+        edited = json.loads(json.dumps(current)); edited["S3"]["Advanced"]["SpoolDirectory"] = str(target)
+        rejected = self.camera_request(directory, "stores.advanced.change", store=edited, storeOriginal=current)
+        self.assertIn("Store is disabled", rejected["error"])
+        self.assertIn("1 spooled entries", rejected["error"])
+        self.assertTrue(payload.exists())
+
+    def test_custom_spool_permission_diagnostic_reaches_status(self):
+        directory, store_id, path = self.seed_s3_controls()
+        target = self.root / "insecure-spool"; target.mkdir(mode=0o755); target.chmod(0o755)
+        config = json.loads(path.read_text()); config["SchemaVersion"] = 3
+        config["S3"]["Advanced"] = dict(SpoolDirectory=str(target))
+        path.write_text(json.dumps(config))
+        self.agent()
+        status = self.await_store(directory, lambda s: s.get("lastError") is not None)
+        message = status["lastError"]
+        self.assertIn("Required: a directory (not a symbolic link)", message)
+        self.assertIn("UID " + str(os.getuid()), message)
+        self.assertIn("permissions 0700", message)
+        self.assertIn("Found: directory", message)
+        self.assertIn("permissions 0755", message)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+
+    def test_custom_spool_status_and_missing_drive_startup_never_falls_back(self):
+        directory, custom = self.root / "run", self.root / "custom-spool"
+        directory.mkdir(mode=0o700); custom.mkdir(mode=0o700)
+        stores = directory / "stores"; stores.mkdir(mode=0o700)
+        identity = subprocess.check_output(["/usr/bin/dsmemberutil", "getuuid", "-u", str(os.getuid())], text=True)
+        owner_uuid = re.search(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}", identity).group(0)
+        store_id = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+        # Disabled, empty, External lifecycle: opening this fixture cannot contact AWS.
+        config = dict(SchemaVersion=3, ID=store_id, Name="Custom spool", Type="S3", Enabled=False,
+                      Directory="", ShardDuration="1m", RetentionPeriod="1w", OwnerUID=os.getuid(), OwnerUUID=owner_uuid,
+                      S3=dict(Bucket="hbnvr-no-network-test", Region="us-west-2", Prefix="test/", Lifecycle="External",
+                              Advanced=dict(SpoolDirectory=str(custom))))
+        config_path = stores / (store_id + ".json")
+        config_path.write_text(json.dumps(config)); config_path.chmod(0o600)
+        _, process = self.agent()
+        deadline = time.monotonic() + 3
+        while True:
+            status = json.loads(self.cli("status", "--runtime-dir", directory, "--json").stdout)["status"]["stores"][0]
+            if "s3" in status:
+                break
+            self.assertLess(time.monotonic(), deadline, status); time.sleep(.02)
+        detail = status["s3"]
+        self.assertEqual(detail["spoolDirectory"], str(custom.resolve()))
+        self.assertGreater(detail["spoolVolumeCapacityBytes"], 0)
+        self.assertGreater(detail["spoolVolumeAvailableBytes"], 0)
+        self.assertEqual(detail["spoolLimitBytes"], 10 * 1024**3)
+        self.assertEqual(detail["spoolMinimumFreeBytes"], 2 * 1024**3)
+        self.assertFalse((directory / "spool" / store_id).exists())
+        self.assertTrue((custom / ".hbnvr-store.json").exists())
+        process.terminate(); process.wait(timeout=5)
+        detached = self.root / "detached"; custom.rename(detached)
+        _, process = self.agent()
+        status = json.loads(self.cli("status", "--runtime-dir", directory, "--json").stdout)["status"]["stores"][0]
+        self.assertEqual(status["state"], "error")
+        self.assertFalse(custom.exists()); self.assertFalse((directory / "spool" / store_id).exists())
+        self.assertTrue((detached / ".hbnvr-store.json").exists())
+        process.terminate(); process.wait(timeout=5)
+        detached.rename(custom)
+        _, process = self.agent()
+        status = json.loads(self.cli("status", "--runtime-dir", directory, "--json").stdout)["status"]["stores"][0]
+        self.assertNotEqual(status["state"], "error", status)
+
     def test_local_store_cli_permissions_lifecycle_and_persistence(self):
         directory, process = self.agent()
         output = self.root / "recordings"
         args = ("store", "add", "--runtime-dir", directory)
-        cancelled = self.cli(*args, input=f"\n{output}\n\n\n\nno\n")
+        cancelled = self.cli(*args, input=f"1\n\n{output}\n\n\n\nno\n")
         self.assertEqual(cancelled.returncode, 0, cancelled.stderr)
         self.assertFalse(output.exists())
         self.assertIn("[~/NVR]", cancelled.stderr)
         self.assertIn("[1m]", cancelled.stderr)
         self.assertIn("[1w]", cancelled.stderr)
-        added = self.cli(*args, input=f"Local test\n{output}\n1s\n1M\nyes\nyes\n")
+        added = self.cli(*args, input=f"1\nLocal test\n{output}\n1s\n1M\nyes\nyes\n")
         self.assertEqual(added.returncode, 0, added.stderr)
         self.assertEqual(output.stat().st_mode & 0o777, 0o700)
         stores = json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout)
@@ -205,6 +491,7 @@ class Integration(unittest.TestCase):
         self.assertEqual(store["RetentionPeriod"], "1M")
         self.assertTrue(store["Enabled"])
         store_id = store["ID"]
+        self.assertNotEqual(self.cli("store", "spool", store_id, "--on", "--runtime-dir", directory).returncode, 0)
         for action in ["disable", "disable", "enable", "enable"]:
             result = self.cli("store", action, store_id, "--runtime-dir", directory)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -226,11 +513,11 @@ class Integration(unittest.TestCase):
         directory, _ = self.agent()
         existing = self.root / "existing"
         existing.mkdir(mode=0o755)
-        result = self.cli("store", "add", "--runtime-dir", directory, input=f"Test\n{existing}\n1m\n1w\nyes\nyes\n")
+        result = self.cli("store", "add", "--runtime-dir", directory, input=f"1\nTest\n{existing}\n1m\n1w\nyes\nyes\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(existing.stat().st_mode & 0o777, 0o755)
         invalid = self.root / "invalid"
-        result = self.cli("store", "add", "--runtime-dir", directory, input=f"Test\n{invalid}\n0m\n1w\nyes\nyes\n")
+        result = self.cli("store", "add", "--runtime-dir", directory, input=f"1\nTest\n{invalid}\n0m\n1w\nyes\nyes\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(invalid.exists())
         self.assertEqual(json.loads(self.cli("store", "list", "--runtime-dir", directory, "--json").stdout), [])

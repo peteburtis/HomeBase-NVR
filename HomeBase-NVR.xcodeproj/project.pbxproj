@@ -7,6 +7,16 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		B70000000000000000000019 = {isa = PBXBuildFile; fileRef = B70000000000000000000018; };
+		B7000000000000000000000b = {isa = PBXBuildFile; fileRef = B7000000000000000000000a; };
+		B7000000000000000000000d = {isa = PBXBuildFile; fileRef = B7000000000000000000000c; };
+		B7000000000000000000000f = {isa = PBXBuildFile; fileRef = B7000000000000000000000e; };
+		B70000000000000000000011 = {isa = PBXBuildFile; fileRef = B70000000000000000000010; };
+		B70000000000000000000013 = {isa = PBXBuildFile; fileRef = B70000000000000000000012; };
+		B70000000000000000000015 = {isa = PBXBuildFile; fileRef = B70000000000000000000014; };
+		B70000000000000000000017 = {isa = PBXBuildFile; fileRef = B70000000000000000000016; };
+		B70000000000000000000003 = {isa = PBXBuildFile; productRef = B70000000000000000000002; };
+		B70000000000000000000004 = {isa = PBXBuildFile; productRef = B70000000000000000000002; };
 		A10000000000000000000003 /* ArgumentParser in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000002 /* ArgumentParser */; };
 		A10000000000000000000024 /* HomeBase-NVR/Support.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000020 /* HomeBase-NVR/Support.swift */; };
 		A10000000000000000000025 /* HomeBase-NVR/Accounts.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* HomeBase-NVR/Accounts.swift */; };
@@ -45,6 +55,14 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		B70000000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/RecordingEncryption.swift"; sourceTree = SOURCE_ROOT; };
+		B7000000000000000000000a = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Configuration.swift"; sourceTree = SOURCE_ROOT; };
+		B7000000000000000000000c = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Spool.swift"; sourceTree = SOURCE_ROOT; };
+		B7000000000000000000000e = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Transport.swift"; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/MemoryMP4Shard.swift"; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3UploadManager.swift"; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000014 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3RecordingStore.swift"; sourceTree = SOURCE_ROOT; };
+		B70000000000000000000016 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Setup.swift"; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000010 /* HBNVRTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = HBNVRTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000020 /* HomeBase-NVR/Support.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/Support.swift"; sourceTree = SOURCE_ROOT; };
 		A10000000000000000000021 /* HomeBase-NVR/Accounts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/Accounts.swift"; sourceTree = SOURCE_ROOT; };
@@ -79,6 +97,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B70000000000000000000004,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -87,6 +106,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000003 /* ArgumentParser in Frameworks */,
+				B70000000000000000000003,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -144,6 +164,7 @@
 				A10000000000000000000011 /* Tests */,
 			);
 			name = HBNVRTests;
+			packageProductDependencies = (B70000000000000000000002,);
 			productName = HBNVRTests;
 			productReference = A10000000000000000000010 /* HBNVRTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -166,6 +187,7 @@
 			name = "HomeBase-NVR";
 			packageProductDependencies = (
 				A10000000000000000000002 /* ArgumentParser */,
+				B70000000000000000000002,
 			);
 			productName = "HomeBase-NVR";
 			productReference = E2C3C6C5305B1BD900FAD4F6 /* hbnvr */;
@@ -197,6 +219,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				A10000000000000000000001 /* XCRemoteSwiftPackageReference "swift-argument-parser" */,
+				B70000000000000000000001,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = E2C3C6C6305B1BD900FAD4F6 /* Products */;
@@ -215,6 +238,14 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000024 /* HomeBase-NVR/Support.swift in Sources */,
+				B7000000000000000000000b,
+				B7000000000000000000000d,
+				B7000000000000000000000f,
+				B70000000000000000000011,
+				B70000000000000000000013,
+				B70000000000000000000015,
+				B70000000000000000000017,
+				B70000000000000000000019,
 				A10000000000000000000025 /* HomeBase-NVR/Accounts.swift in Sources */,
 				A10000000000000000000026 /* HomeBase-NVR/Installer.swift in Sources */,
 				A10000000000000000000027 /* HomeBase-NVR/IPC.swift in Sources */,
@@ -460,6 +491,7 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		B70000000000000000000001 = {isa = XCRemoteSwiftPackageReference; repositoryURL = "https://github.com/awslabs/aws-sdk-swift"; requirement = {kind = exactVersion; version = 1.7.78; }; };
 		A10000000000000000000001 /* XCRemoteSwiftPackageReference "swift-argument-parser" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/apple/swift-argument-parser";
@@ -471,6 +503,7 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		B70000000000000000000002 = {isa = XCSwiftPackageProductDependency; package = B70000000000000000000001; productName = AWSS3; };
 		A10000000000000000000002 /* ArgumentParser */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = A10000000000000000000001 /* XCRemoteSwiftPackageReference "swift-argument-parser" */;

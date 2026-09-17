@@ -14,12 +14,52 @@ recording root, with readable local start-time filenames.
 Version 0.6.0 adds `camera add/list/change/remove/enable/disable/start/stop`, with
 persistent streaming enablement and recording intent, shared name/profile editing,
 and separate stream-health and recording-state reporting.
-S3, recording triggers, pre-event buffering, and
-ongoing Homebase synchronization are not implemented yet.
+Version 0.7.0 adds independent RAM-first S3 stores, durable outage/shutdown spooling,
+write-only IAM setup, optional client-side password encryption with offline recovery,
+and managed or external bucket lifecycle expiration.
+Version 0.7.1 adds a configurable private S3 spool directory, including external-drive
+volume identity checks and capacity reporting. See [spool placement](S3-STORE.md#custom-spool-directory-and-external-drives).
+Version 0.7.2 adds persistent `store spool [NAME] --on/--off` controls and
+`store change [NAME] --advanced` for all operational tuning, including offline edits
+and disabled/drained spool relocation. Omit NAME for the usual picker.
+Version 0.7.3 removes permanent S3 quarantine: all failed uploads remain retryable,
+unreadable spool entries are retained and periodically rechecked, and repaired files
+resume automatically. Existing quarantine markers no longer exclude valid entries.
+Version 0.7.4 fixes S3 disk-replay HTTP framing (`MissingContentLength` / 411).
+File uploads use the SDK's incremental SHA-256 checksum trailer and matching chunked
+headers; RAM uploads are unchanged. Existing spool entries retry without migration.
+Version 0.7.5 makes directory validation errors show the required and observed owner,
+permissions, and directory type, identifies disabled volume ownership explicitly, and
+explains macOS privacy checks when spool directory reads fail with EPERM.
+Version 0.7.6 allows encrypted S3 spools on APFS/HFS+ volumes that ignore ownership,
+without requiring daemon ownership or exact private modes there. Plaintext spooling
+still requires private ownership-enforced storage. Metadata is not encrypted, and
+encryption does not prevent another local user from deleting or modifying spool files.
+Recording triggers, pre-event buffering, and ongoing Homebase synchronization remain future work.
 Requires macOS 26.1 and Xcode 26.1 or newer.
 
 See [the CLI roadmap](CLI-ROADMAP.md) for planned camera/store command families,
 streaming versus recording controls, and independent recording-store behavior.
+
+### S3 security model
+
+The S3 default manages expiration through
+Amazon S3 Lifecycle in an existing bucket, without object-read or direct object-delete
+permissions. **Lifecycle-management permission can nevertheless cause object deletion
+by changing expiration rules**, and applies to the whole bucket. Setup discloses
+this risk alongside the generated IAM policy; a dedicated bucket is recommended.
+An externally managed mode omits lifecycle permissions and API calls,
+leaving the user responsible for bucket expiration. Denied lifecycle access in
+managed mode warns without stopping working uploads or claiming retention was
+applied. See [S3 setup, configuration, and durability](S3-STORE.md) and the
+[opt-in AWS smoke procedure](S3-SMOKE.md).
+
+S3 setup always offers an optional encryption password (blank means none). Encryption
+uses macOS PBKDF2-HMAC-SHA256 and AES-256-GCM before upload or spooling; SSE-S3 remains
+enabled too. The unattended daemon retains the password in its private JSON. Back it
+up separately: losing it makes encrypted recordings unrecoverable. To recover a file
+downloaded using separate read credentials, run `hbnvr decrypt downloaded.mp4.hbnvr recovered.mp4`.
+The command prompts without echo, requires no daemon/AWS access, and never overwrites.
 
 ## Build and test
 
@@ -30,13 +70,15 @@ which the next agent recovers after obtaining its exclusive lock.
 ```sh
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 xcodebuild -project HomeBase-NVR.xcodeproj -scheme HomeBase-NVR \
-  -configuration Debug -derivedDataPath /tmp/hbnvr-build build
+  -configuration Debug -derivedDataPath /tmp/hbnvr-build -skipPackagePluginValidation build
 xcodebuild -project HomeBase-NVR.xcodeproj -scheme HomeBase-NVR \
-  -destination 'platform=macOS' -derivedDataPath /tmp/hbnvr-build test
+  -destination 'platform=macOS' -derivedDataPath /tmp/hbnvr-build -skipPackagePluginValidation test
 python3 scripts/integration.py /tmp/hbnvr-build/Build/Products/Debug/hbnvr
 ```
 
-Swift ArgumentParser is pinned to 1.8.2. All other dependencies are system frameworks.
+Swift ArgumentParser is pinned to 1.8.2; AWS SDK for Swift is pinned to 1.7.78.
+`Package.resolved` pins its transitive dependencies. Xcode needs approval to run the
+SDK's Smithy code-generation plug-in; the command above trusts that pinned plug-in.
 The test target compiles the shared implementation directly, avoiding a runtime
 framework dependency in the deployed executable.
 
@@ -351,11 +393,13 @@ hbnvr store remove "Local recordings"
 ```
 
 Add/change share an interactive options editor. Defaults are `~/NVR` (the requesting
-user's home), `1m` shards, `1w` retention, and enabled. There is only a local store
-type today; multiple independent instances are supported. Each command accepts
+user's home), `1m` shards, `1w` retention, and enabled. Add first selects Local or S3;
+multiple independent instances of either type are supported. Each command accepts
 `--runtime-dir PATH` for an isolated foreground agent. List/status support `--json`.
 Change/enable/disable/remove accept an exact name or UUID; omit it for a terminal
 picker. Ambiguous or missing selections are errors outside a terminal.
+S3 `store spool --on` / `--off` follows the same picker convention; see
+[manual spooling and advanced editing](S3-STORE.md#manual-spooling-and-advanced-editing).
 
 Every enabled store records **enabled cameras whose recording intent is started**,
 beginning at their next usable keyframe. Disabling one store finalizes its current shards without affecting other
@@ -442,8 +486,8 @@ change warns before confirmation.
 
 The camera receiver distributes encoded access units and codec/timing metadata.
 Each store owns its container and shard writer. The local implementation uses system
-AVFoundation to pass H.264/H.265 into MP4 without decoding/re-encoding. Future S3
-delivery/buffering will remain independent of local stores. No ffmpeg is required.
+AVFoundation to pass H.264/H.265 into MP4 without decoding/re-encoding. S3
+delivery/buffering remains independent of local stores. No ffmpeg is required.
 
 Shard duration is a **target**: files begin at a keyframe and rotate at the next
 keyframe at or after the target. Disconnect, damaged frames, codec changes, disable,

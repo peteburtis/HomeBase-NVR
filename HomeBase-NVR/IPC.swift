@@ -10,6 +10,9 @@ struct Request: Codable {
     var cameraEdit: CameraEdit? = nil
     var store: RecordingStoreConfiguration? = nil
     var storeID: String? = nil
+    var storeOriginal: RecordingStoreConfiguration? = nil
+    var setupID: String? = nil
+    var saveDisabled: Bool? = nil
 }
 struct AgentStatus: Codable {
     let ready: Bool
@@ -29,6 +32,7 @@ struct Reply: Codable {
     var cameraOptions: CameraEditableOptions? = nil
     var stores: [RecordingStoreConfiguration]? = nil
     var store: RecordingStoreConfiguration? = nil
+    var setup: S3SetupStatus? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
 }
 
@@ -176,7 +180,9 @@ enum AgentReadiness {
 }
 
 final class AgentServer {
-    private lazy var recordings = RecordingStoreManager(log: { [weak self] message in self?.log(message) })
+    private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, log: { [weak self] message in self?.log(message) })
+    private let setupJobs: S3SetupJobs
+    private let transportFactory: S3TransportFactory
     private lazy var streams = StreamingCoordinator(log: { [weak self] message in self?.log(message) }, record: { [weak self] event in self?.recordings.accept(event) })
     var stores: RecordingStoreRepository {
         RecordingStoreRepository(directory: system ? Paths.system.base + "/private/stores" : directory + "/stores")
@@ -189,8 +195,9 @@ final class AgentServer {
     }
     private let cancellation = Cancellation()
     private let logger = Logger(subsystem: "com.graygoolabs.hbnvr", category: "agent")
-    init(directory: String, authorization: Authorization, system: Bool) {
+    init(directory: String, authorization: Authorization, system: Bool, transportFactory: @escaping S3TransportFactory = AWSS3Transport.make) {
         self.directory = directory; self.authorization = authorization; self.system = system
+        self.transportFactory = transportFactory; setupJobs = S3SetupJobs(factory: transportFactory)
     }
     private func log(_ message: String) {
         if system { logger.notice("\(message, privacy: .public)") }
@@ -221,7 +228,8 @@ final class AgentServer {
             source.resume(); return source
         }
         defer { sources.forEach { $0.cancel() } }
-        defer { streams.stop(); recordings.stop() }
+        var cleanedUp = false
+        defer { if !cleanedUp { setupJobs.stop(); streams.stop(); recordings.stop() } }
         recordings.load(try stores.list())
         for (id, camera) in try cameras.configurations() { streams.add(id: id, camera: camera) }
         let started = ProcessInfo.processInfo.systemUptime
@@ -237,8 +245,13 @@ final class AgentServer {
             handle(client, started: started)
             close(client)
         }
+        setupJobs.stop()
+        let shutdownDeadline = ProcessInfo.processInfo.systemUptime + 45
+        recordings.beginShutdown()
         streams.stop()
-        recordings.stop()
+        let safe = recordings.stop(deadline: shutdownDeadline)
+        cleanedUp = true
+        guard safe else { throw ServiceError("Agent stopped with recording finalization/persistence errors; shutdown was not safe.") }
         log("hbnvr stopped")
     }
     func handle(_ fd: Int32, started: TimeInterval) {
@@ -257,7 +270,7 @@ final class AgentServer {
             case "status":
                 let storeStatus = recordings.snapshot()
                 var streamStatus = streams.snapshot()
-                let recording = storeStatus.contains { $0.enabled && $0.state != "error" && $0.state != "stopping" }
+                let recording = recordings.hasWritableStore
                 for index in streamStatus.indices { streamStatus[index].updateRecordingState(hasWritableStore: recording) }
                 let status = AgentStatus(ready: true, version: BuildInfo.version, pid: getpid(), uptimeSeconds: ProcessInfo.processInfo.systemUptime - started, streams: streamStatus, stores: storeStatus)
                 reply = Reply(protocolVersion: 1, status: status, error: nil, code: nil)
@@ -308,13 +321,69 @@ final class AgentServer {
                 reply.camera = try cameras.save(camera, id: id)
                 streams.add(id: id, camera: camera)
                 if !camera.enabled || !camera.recordingStarted { try recordings.drain() }
-            case "stores.list": reply.stores = try stores.list()
+            case "stores.list": reply.stores = try stores.list().map(\.summary)
+            case "stores.spool.on", "stores.spool.off", "stores.advanced.change":
+                let id = request.storeID ?? request.store?.id
+                guard let id, let old = try stores.list().first(where: { $0.id == id }), old.type == "S3" else { throw ServiceError("Select an S3 store for spooling or advanced settings.") }
+                guard uid == 0 || uid == old.ownerUID else { throw ServiceError(.permission, "Only the store owner or root may change these options.") }
+                var config = old
+                if request.operation == "stores.advanced.change" {
+                    guard let draft = request.store, request.storeOriginal == old.summary,
+                          draft.differsOnlyInAdvancedSettings(from: old.summary) else {
+                        throw ServiceError("Store changed while editing, or this edit requires S3 validation. Run store change again.")
+                    }
+                    config.s3?.tuning = draft.s3?.tuning
+                } else {
+                    var settings = config.s3!.settings
+                    settings.forceSpooling = request.operation == "stores.spool.on"
+                    config.s3?.tuning = settings
+                }
+                config.updateS3ReaderVersion()
+                try stores.save(config, replacing: true)
+                do { try recordings.install(config) }
+                catch { try? stores.save(old, replacing: true); throw error }
+                reply.store = config.summary
+            case "stores.setup.start", "stores.setup.start.v2", S3SetupJobs.startOperation:
+                guard var draft = request.store, draft.type == "S3", uid != 0 else { throw ServiceError(.permission, "Run S3 setup as the requesting user.") }
+                let configs = try stores.list(), old = configs.first { $0.id == draft.id }
+                guard request.operation == S3SetupJobs.startOperation ||
+                        ((old?.schemaVersion ?? 1) < 4 && draft.schemaVersion < 4 && draft.s3?.settings.forceSpooling != true) else {
+                    throw ServiceError(.incompatible, "This store uses manual-spooling-aware configuration; update the CLI before editing it.")
+                }
+                guard old != nil || configs.count < 16 else { throw ServiceError("The 16-store limit was reached.") }
+                if let old {
+                    guard old.type == "S3", old.ownerUID == uid, let previous = old.s3, let next = draft.s3,
+                          previous.sameDestination(as: next) else { throw ServiceError("S3 destination and owner are immutable; relocation requires remove/add.") }
+                    draft.s3?.preservePrivateSettings(from: previous)
+                }
+                draft.ownerUID = uid; draft.ownerUUID = try StoreDirectory.identity(uid)
+                draft.schemaVersion = max(draft.schemaVersion, old?.schemaVersion ?? 1)
+                draft.updateS3ReaderVersion()
+                guard !configs.contains(where: { $0.id != draft.id && RecordingStoreRepository.overlap($0, draft) }) else { throw ServiceError("S3 destination prefixes must not overlap.") }
+                reply.setup = try setupJobs.start(draft: draft, original: old, uid: uid)
+            case "stores.setup.poll", "stores.setup.cancel", "stores.setup.commit":
+                guard let id = request.setupID else { throw ServiceError("Setup job ID is required.") }
+                if request.operation == "stores.setup.cancel" { reply.setup = try setupJobs.cancel(id, uid: uid) }
+                else if request.operation == "stores.setup.poll" { reply.setup = try setupJobs.poll(id, uid: uid) }
+                else {
+                    let progress = try setupJobs.poll(id, uid: uid)
+                    let old = try stores.list().first { $0.id == progress.storeID }
+                    let config = try setupJobs.prepared(id, uid: uid, saveDisabled: request.saveDisabled == true, current: old)
+                    try stores.save(config, replacing: old != nil)
+                    do { try recordings.install(config) }
+                    catch {
+                        if let old { try? stores.save(old, replacing: true) } else { try? stores.remove(config.id) }
+                        throw error
+                    }
+                    try setupJobs.committed(id, uid: uid); reply.store = config.summary
+                }
             case "stores.add", "stores.change":
                 guard var config = request.store, uid != 0 else { throw ServiceError(.permission, "Run store setup as the requesting user, without sudo.") }
+                guard config.type == "Local" else { throw ServiceError("S3 setup uses asynchronous validation; use store add/change with hbnvr 0.7.0 or newer.") }
                 let old = try stores.list().first { $0.id == config.id }
                 if let old {
                     guard request.operation == "stores.change", old.ownerUID == uid else { throw ServiceError(.permission, "Only the requesting owner may change this store.") }
-                    guard old.directory == config.directory else { throw ServiceError("Directory changes require removing and adding a store; existing recordings are preserved.") }
+                    guard old.type == "Local", old.directory == config.directory else { throw ServiceError("Destination changes require removing and adding a store; existing recordings are preserved.") }
                 } else if request.operation == "stores.change" { throw ServiceError("Store no longer exists.") }
                 config.ownerUID = uid; config.ownerUUID = try StoreDirectory.identity(uid)
                 try config.validate()
@@ -327,7 +396,7 @@ final class AgentServer {
                     else { try? stores.remove(config.id) }
                     throw error
                 }
-                reply.store = config
+                reply.store = config.summary
             case "stores.enable", "stores.disable", "stores.remove":
                 guard let id = request.storeID, var config = try stores.list().first(where: { $0.id == id }) else { throw ServiceError("Unknown recording store.") }
                 if request.operation == "stores.remove" {
@@ -337,15 +406,16 @@ final class AgentServer {
                 } else {
                     let old = config
                     config.enabled = request.operation == "stores.enable"
+                    if config.type == "S3", config.enabled, !old.enabled { throw ServiceError("Enabling an S3 store requires asynchronous validation; use hbnvr 0.7.0 store enable.") }
                     if old.enabled == config.enabled, recordings.snapshot().contains(where: { $0.id == id && $0.state != "error" && $0.state != "stopping" }) {
-                        reply.store = config
+                        reply.store = config.summary
                         break
                     }
                     try stores.save(config, replacing: true)
                     do { try recordings.install(config) }
                     catch { try? stores.save(old, replacing: true); recordings.load([old]); throw error }
                 }
-                reply.store = config
+                reply.store = config.summary
             default:
                 throw ServiceError(.invalidMessage, "Unknown operation. Camera controls require hbnvr 0.6.0 or newer; reinstall if the agent is older.")
             }

@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 import MachO
 
-enum BuildInfo { static let version = "0.6.0" }
+enum BuildInfo { static let version = "0.7.6" }
 
 enum FailureCode: Int32, Codable {
     case failure = 1, unavailable = 3, permission = 4, incompatible = 5, timeout = 6, invalidMessage = 7
@@ -61,8 +61,33 @@ enum SecureFiles {
         throw ServiceError.posix("Inspect \(path)")
     }
     static func validateDirectory(_ path: String, owner: uid_t, mode: mode_t) throws {
-        guard let s = try info(path), s.st_mode & S_IFMT == S_IFDIR, s.st_uid == owner, s.st_mode & 0o777 == mode else {
-            throw ServiceError(.permission, "Unsafe ownership, permissions, or directory type at \(path).")
+        let observed = try info(path)
+        guard let s = observed, s.st_mode & S_IFMT == S_IFDIR, s.st_uid == owner, s.st_mode & 0o777 == mode else {
+            let expectedMode = String(format: "%04o", UInt32(mode))
+            let access = mode == 0o700 ? " (owner read/write/traverse; no group or other access)" : ""
+            let found: String
+            if let s = observed {
+                let type: String
+                switch s.st_mode & S_IFMT {
+                case S_IFDIR: type = "directory"
+                case S_IFLNK: type = "symbolic link"
+                case S_IFREG: type = "regular file"
+                default: type = "non-directory filesystem entry"
+                }
+                found = "\(type), owner \(ownerDescription(s.st_uid)), permissions \(String(format: "%04o", UInt32(s.st_mode & 0o777)))"
+            } else { found = "path does not exist" }
+            throw ServiceError(.permission, "Unsafe ownership, permissions, or directory type at \(path). Required: a directory (not a symbolic link), owner \(ownerDescription(owner)), permissions \(expectedMode)\(access). Found: \(found).")
+        }
+    }
+    private static func ownerDescription(_ uid: uid_t) -> String {
+        // Error reporting must also work for unknown UIDs. The reentrant lookup
+        // avoids sharing getpwuid's static storage across daemon worker queues.
+        var record = passwd(), result: UnsafeMutablePointer<passwd>?
+        var buffer = [CChar](repeating: 0, count: 16_384)
+        return buffer.withUnsafeMutableBufferPointer { storage in
+            guard getpwuid_r(uid, &record, storage.baseAddress!, storage.count, &result) == 0,
+                  let name = result?.pointee.pw_name else { return "UID \(uid)" }
+            return "\(String(cString: name)) (UID \(uid))"
         }
     }
     static func ensureDirectory(_ path: String, owner: uid_t, mode: mode_t, group: gid_t? = nil) throws {

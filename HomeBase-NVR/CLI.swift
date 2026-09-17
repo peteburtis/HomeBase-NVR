@@ -7,7 +7,7 @@ import os
 struct HBNVR: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "hbnvr", abstract: "Manage the HomeBase NVR service.", version: BuildInfo.version,
-        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Camera.self, Store.self, Agent.self])
+        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Camera.self, Store.self, Decrypt.self, Agent.self])
 }
 
 func command(_ work: () throws -> Void) throws {
@@ -74,10 +74,38 @@ struct Status: ParsableCommand {
                 for store in status.stores ?? [] {
                     print("  Store \(store.name): \(store.state) — \(store.activeRecordings) active, \(store.completedShards) completed shards, \(store.pendingBytes) queued bytes")
                     if let error = store.lastError { print("    \(error)") }
+                    if let s3 = store.s3 {
+                        print("    Client-side encryption: \(s3.clientEncrypted == true ? "enabled for new shards" : "off for new shards")")
+                        print("    S3: \(s3.acceptingRecording ? "accepting recording" : "not accepting recording"); \(s3.spooling ? "spooling (" + s3.reasons.joined(separator: ", ") + ")" : "immediate uploads")")
+                        print("    Uploads: \(s3.active) active, \(s3.queued) queued, \(s3.retrying) retrying, \(s3.confirmedUploads) confirmed")
+                        print("    RAM: \(s3.assemblingBytes) assembling + \(s3.residentBytes) finalized bytes; spool: \(s3.spoolCount) shards / \(s3.spoolBytes) bytes; unreadable: \(s3.unreadableSpoolCount ?? s3.quarantinedCount ?? 0)")
+                        if let path = s3.spoolDirectory {
+                            print("    Spool directory: \(path)")
+                            if let free = s3.spoolVolumeAvailableBytes, let capacity = s3.spoolVolumeCapacityBytes {
+                                print("    Spool volume: \(s3.spoolVolume ?? "unknown"); \(free) / \(capacity) bytes available; quota \(s3.spoolLimitBytes ?? 0), free-space reserve \(s3.spoolMinimumFreeBytes ?? 0) bytes")
+                            } else { print("    Spool volume: unavailable; no fallback disk") }
+                        }
+                        if let age = s3.oldestBacklogSeconds { print("    Oldest backlog: \(Int(age))s") }
+                        if let probe = s3.nextProbeSeconds { print("    Next recovery probe: \(Int(probe.rounded(.up)))s") }
+                        if let retry = s3.nextReadRetrySeconds { print("    Next spool read check: \(Int(retry.rounded(.up)))s") }
+                        print("    Retention: desired \(s3.desiredRetentionDays)d; \(s3.lifecycleState)\(s3.appliedRetentionDays.map { " (\($0)d)" } ?? "")")
+                        if let warning = s3.lifecycleWarning { print("    \(warning)") }
+                    }
                 }
             }
         }
     }
+}
+
+struct Decrypt: ParsableCommand {
+    static let configuration = CommandConfiguration(abstract: "Decrypt a downloaded .mp4.hbnvr recording locally. Prompts for its password; no AWS access or daemon required. Never overwrites output.")
+    @Argument(help: "Downloaded encrypted recording (one shard is held in RAM).") var input: String
+    @Argument(help: "New output MP4 path; the file is created with owner-only permissions.") var output: String
+    func run() throws { try command {
+        let password = try CameraPrompt.line("Recording encryption password", secret: true)
+        try RecordingEncryption.decryptFile(input: input, output: output, password: password)
+        print("Decrypted recording saved to \(output).")
+    } }
 }
 struct Agent: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Run in the foreground. Local mode requires no installation or sudo.")

@@ -64,7 +64,7 @@ struct Installer {
         defer { close(fd) }
         var s = stat()
         guard fstat(fd, &s) == 0, s.st_mode & S_IFMT == S_IFREG, s.st_nlink == 1 else { throw ServiceError("Invalid daemon lock.") }
-        let deadline = ProcessInfo.processInfo.systemUptime + 12
+        let deadline = ProcessInfo.processInfo.systemUptime + 75
         while flock(fd, LOCK_EX | LOCK_NB) != 0 {
             guard errno == EWOULDBLOCK || errno == EAGAIN else { throw ServiceError.posix("Check daemon lock") }
             guard ProcessInfo.processInfo.systemUptime < deadline else { throw ServiceError(.timeout, "Previous agent did not stop; refusing to replace its installation.") }
