@@ -296,6 +296,7 @@ final class RTSPClient: @unchecked Sendable {
     private let source: RTSPSource
     private let queue: DispatchQueue
     private let eventHandler: @Sendable (Event) -> Void
+    private let rtcpObserver: (@Sendable (Data) -> Void)?
     private var keepaliveInterval: TimeInterval
     private var connection: NWConnection?
     private var buffer = Data()
@@ -307,6 +308,8 @@ final class RTSPClient: @unchecked Sendable {
     private var aggregateURL: URL
     private var depacketizer: RTPFrameAssembler?
     private var videoDescription: RTSPVideoDescription?
+    private var cameraClock = RTPCameraClock(allowInterleavedChannelBinding: true)
+    private var recordingTimeline = RecordingTimeline()
     private var keepalive: DispatchSourceTimer?
     private var requestTimeout: DispatchWorkItem?
     private var connectTimeout: DispatchWorkItem?
@@ -320,12 +323,14 @@ final class RTSPClient: @unchecked Sendable {
     init(
         source: RTSPSource,
         keepaliveInterval: TimeInterval = 20,
+        rtcpObserver: (@Sendable (Data) -> Void)? = nil,
         eventHandler: @escaping @Sendable (Event) -> Void
     ) {
         self.source = source
         aggregateURL = source.streamURL
         self.keepaliveInterval = keepaliveInterval
         self.eventHandler = eventHandler
+        self.rtcpObserver = rtcpObserver
         queue = DispatchQueue(
             label: "com.graygoolabs.hbnvr.rtsp.\(source.cameraIdentifier)"
         )
@@ -667,9 +672,23 @@ final class RTSPClient: @unchecked Sendable {
                     if packet.payloadType == assembler.payloadType {
                         let before = assembler.droppedFrames
                         let complete = assembler.consume(packet)
-                        let media = complete.flatMap { frame in videoDescription.map { EncodedMedia(codec: $0.codec, clockRate: $0.clockRate, parameterSets: $0.parameterSets, frame: frame) } }
+                        var media: EncodedMedia?
+                        if let frame = complete, let description = videoDescription {
+                            let received = Date(), uptime = ProcessInfo.processInfo.systemUptime
+                            let clock = cameraClock.mapping(ssrc: packet.ssrc, timestamp: frame.timestamp, rate: description.clockRate, uptime: uptime)
+                            var value = EncodedMedia(codec: description.codec, clockRate: description.clockRate,
+                                parameterSets: description.parameterSets, frame: frame, receivedAt: received, receivedUptime: uptime,
+                                cameraUTC: clock?.utc, ssrc: packet.ssrc, cameraClock: clock?.evidence)
+                            // Invalid media timing is handled by each store as before;
+                            // never fail the camera connection just for a recording clock.
+                            value.time = try? recordingTimeline.observe(value)
+                            media = value
+                        }
                         eventHandler(.video(packets: 1, frames: complete == nil ? 0 : 1, dropped: assembler.droppedFrames - before, media: media))
                     }
+                } else if channel == 1 {
+                    rtcpObserver?(payload)
+                    cameraClock.receive(payload, at: Date(), uptime: ProcessInfo.processInfo.systemUptime)
                 }
                 continue
             }

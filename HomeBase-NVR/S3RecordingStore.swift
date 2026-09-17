@@ -24,6 +24,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         var writer: MemoryMP4Shard?
         var config: RecordingStoreConfiguration?
         var failed = false
+        var clock = LocalRecordingClock()
     }
     init(configuration: RecordingStoreConfiguration, spoolRoot: String, factory: @escaping S3TransportFactory = AWSS3Transport.make,
          volumeReader: @escaping (String) throws -> S3SpoolVolume = S3SpoolVolume.read, log: @escaping (String) -> Void) throws {
@@ -103,7 +104,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         guard !track.failed else { return }
         if track.name != name || track.codec != media.codec {
             try finish(track, camera: camera)
-            if track.codec != media.codec { track.sets.removeAll() }
+            if track.codec != media.codec { track.sets.removeAll(); track.clock = LocalRecordingClock() }
             track.name = name; track.codec = media.codec
         }
         let nals = try LocalRecordingStore.nals(media.frame.payload), required = media.codec == "H264" ? [7, 8] : [32, 33, 34]
@@ -116,10 +117,14 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         }
         if changed { try finish(track, camera: camera) }
         guard required.allSatisfy({ track.sets[$0] != nil }), nals.contains(where: { media.codec == "H264" ? (1...5).contains(Int($0[0] & 31)) : ($0[0] >> 1) & 63 < 32 }) else { return }
+        let observed = try track.clock.observe(media)
+        if observed.discontinuity { try finish(track, camera: camera) }
         if let writer = track.writer, media.frame.keyFrame, writer.elapsed(media.frame.timestamp) >= Double(try IntervalText.seconds(mediaConfiguration.shardDuration)) { try finish(track, camera: camera) }
         if track.writer == nil {
             guard media.frame.keyFrame, !upload.suspended else { return }
-            track.writer = try MemoryMP4Shard(codec: media.codec, sets: required.map { track.sets[$0]! }, clock: media.clockRate, timestamp: media.frame.timestamp)
+            let timing = ShardTimingMetadata(storeID: mediaConfiguration.id, cameraID: camera, media: media, time: observed.timing)
+            track.writer = try MemoryMP4Shard(codec: media.codec, sets: required.map { track.sets[$0]! }, clock: media.clockRate,
+                timestamp: media.frame.timestamp, capturedAt: observed.time, timing: timing)
             track.config = mediaConfiguration
         }
         try track.writer!.append(media.frame)
@@ -134,7 +139,8 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
             guard let password = config.s3?.clientEncryption?.password else { throw ServiceError("Encryption password unavailable; refusing plaintext recording.") }
             bytes = try RecordingEncryption.encrypt(bytes, password: password)
         }
-        let metadata = S3ShardMetadata.make(store: config, camera: camera, name: track.name, capturedAt: writer.capturedAt, data: bytes, encrypted: encrypted)
+        let metadata = S3ShardMetadata.make(store: config, camera: camera, name: track.name, capturedAt: writer.capturedAt,
+            data: bytes, encrypted: encrypted, id: writer.timing?.shardID ?? UUID().uuidString)
         upload.ready(metadata, data: bytes)
         lock.lock(); status.completedShards &+= 1; lock.unlock()
     }

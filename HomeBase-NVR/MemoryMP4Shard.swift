@@ -7,6 +7,7 @@ import UniformTypeIdentifiers
 /// writer per shard gives each result its own initialization segment.
 final class MemoryMP4Shard: NSObject, AVAssetWriterDelegate, @unchecked Sendable {
     let capturedAt: Date
+    let timing: ShardTimingMetadata?
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
     private let format: CMFormatDescription
@@ -22,11 +23,12 @@ final class MemoryMP4Shard: NSObject, AVAssetWriterDelegate, @unchecked Sendable
     private var outputBytes: Int64 = 0
     private var finished = false
     var residentBytes: Int64 { lock.lock(); defer { lock.unlock() }; return max(inputBytes, outputBytes) }
-    init(codec: String, sets: [Data], clock: UInt32, timestamp: UInt32, capturedAt: Date = Date()) throws {
+    init(codec: String, sets: [Data], clock: UInt32, timestamp: UInt32, capturedAt: Date = Date(), timing: ShardTimingMetadata? = nil) throws {
         guard clock > 0, clock <= Int32.max, ["H264", "H265"].contains(codec) else { throw ServiceError("Unsupported S3 video format.") }
-        self.capturedAt = capturedAt; self.clock = Int32(clock); last = timestamp; duration = max(1, Int64(clock) / 15)
+        self.capturedAt = capturedAt; self.timing = timing; self.clock = Int32(clock); last = timestamp; duration = max(1, Int64(clock) / 15)
         format = try MP4Shard.format(codec: codec, sets: sets)
         writer = AVAssetWriter(contentType: .mpeg4Movie)
+        writer.metadata = try timing?.assetMetadata() ?? []
         writer.outputFileTypeProfile = .mpeg4AppleHLS
         writer.preferredOutputSegmentInterval = .indefinite
         writer.initialSegmentStartTime = .zero

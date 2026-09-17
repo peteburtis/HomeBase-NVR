@@ -5,7 +5,16 @@ Triggers remain future work. No plugin loader is planned. The original S3 discus
 notes below are retained; the implemented decisions immediately below supersede their earlier
 examples and open questions.
 
-## Current baseline (0.7.6)
+## Current baseline (0.10.0)
+
+- RTCP sender-report mapping supplies optional camera wall-clock time. New local
+  and S3 MP4s embed camera, receipt-anchored, and canonical time, source choice,
+  actual first-frame receipt, stream epoch and recording identities (no transcoding).
+- Canonical policy: camera within ±2.5 seconds of actual reception, otherwise
+  received. Mapping changes are explicit shard/epoch boundaries. The initial local
+  SQLite schema requires the same timing metadata; camera time may be unavailable.
+- Self-describing new files make a future explicit index rebuild possible; no
+  automatic scan, backfill, or recovery command is added in this increment.
 
 - System lifecycle: `install`, `uninstall`, `start`, and `stop` require sudo.
 - `agent` supports both the system daemon and an unprivileged local instance.
@@ -25,11 +34,25 @@ examples and open questions.
   `yyyy-MM-dd_HH-mm-ss.mp4` shards (local start time, 24-hour clock). Hidden identity
   files scope ownership/retention; numeric suffixes resolve name/time collisions.
   Legacy layouts are preserved in place and continue to receive retention cleanup.
+- Local camera directories maintain a prospective `.hbnvr-manifest.sqlite` (0.10.0).
+  New shards record NVR receipt/media-time anchors, provisional/finalized state,
+  and file identity. Internal range queries return available intervals and gaps.
+  No filename/date reconstruction, backfill, keyframe/offset index, or playback
+  endpoint is included. Lost metadata cannot be reconstructed automatically.
+  See [local manifest design and failure semantics](LOCAL-MANIFEST.md).
 - `camera add/list/change/remove/enable/disable/start/stop` are implemented. Both
   streaming enablement and recording intent persist; new/legacy cameras default
   enabled and started. Stop leaves streaming intact; disable preserves recording intent.
 - Camera add/change use the same options editor:
   display name and video profile today, more camera options later.
+- Homebase's camera module discovers the installed NVR over authenticated Unix IPC.
+  Matching uses `HomebaseDeviceID`, never an alias, credential filename, or IP address.
+  `NVR.recording` reads/writes persistent start/stop intent. Once published, the control
+  stays present but invalid while disconnected, disabled, removed, or ambiguously matched.
+  Full snapshot subscriptions announce camera additions/removals/enablement/intent;
+  reconnecting observes current state without sending a write. No camera/store lifecycle,
+  credentials, or automatic configuration synchronization are exposed by this bridge.
+  See [Homebase integration](HOMEBASE-INTEGRATION.md).
 - S3 stores are implemented in 0.7.0 with generated IAM setup, asynchronous validation,
   RAM MP4s, controlled uploads, durable private spooling, and independent lifecycle
   warnings. See the settled 0.7.0 decisions and operational documentation below.

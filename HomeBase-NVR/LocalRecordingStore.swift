@@ -162,12 +162,17 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     private let retentionSeconds: Int64
     private var timer: DispatchSourceTimer?
     private var cameras: [String: Track] = [:]
+    private var manifests: [String: LocalRecordingManifest] = [:]
     private final class Track {
         var name = ""
         var directory: LocalRecordingLayout.Directory?
         var codec = ""
         var sets: [Int: Data] = [:]
         var writer: MP4Shard?
+        var manifest: LocalRecordingManifest?
+        var recordingID: String?
+        var clock = LocalRecordingClock()
+        var lastManifestCheckpoint: TimeInterval = 0
     }
 
     init(configuration: RecordingStoreConfiguration, log: @escaping (String) -> Void = { _ in }) throws {
@@ -247,6 +252,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             queue.async { [self] in
                 timer?.cancel(); timer = nil
                 finishTracks()
+                manifests.removeAll()
                 // Release before notifying a replacing instance, not at eventual deinit.
                 instanceLock = nil
                 legacyLock = nil
@@ -277,17 +283,41 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     private func finish(_ track: Track) throws {
         guard let writer = track.writer else { return }
         track.writer = nil
+        let recordingID = track.recordingID; track.recordingID = nil
         defer { lock.lock(); status.activeRecordings -= 1; lock.unlock() }
-        try writer.finish()
+        do {
+            try writer.finish()
+            if let recordingID, let manifest = track.manifest {
+                try manifest.complete(id: recordingID, filename: writer.finalName,
+                                      endTicks: writer.endTicks, frames: writer.sampleCount)
+            }
+        } catch {
+            if let recordingID { try? track.manifest?.interrupt(id: recordingID) }
+            throw error
+        }
         lock.lock(); status.completedShards &+= 1; lock.unlock()
+    }
+    private func manifest(for directory: LocalRecordingLayout.Directory,
+                          identity: LocalRecordingLayout.Identity, create: Bool) throws -> LocalRecordingManifest? {
+        if let existing = manifests[directory.path] { return existing }
+        if !create {
+            var info = stat()
+            if fstatat(directory.fd, LocalRecordingManifest.filename, &info, AT_SYMLINK_NOFOLLOW) != 0 {
+                if errno == ENOENT { return nil }
+                throw ServiceError.posix("Inspect local manifest")
+            }
+        }
+        let value = try LocalRecordingManifest(directory: directory, identity: identity, owner: configuration.ownerUID)
+        manifests[directory.path] = value
+        return value
     }
     private func consume(camera: String, name: String, media: EncodedMedia) throws {
         guard UUID(uuidString: camera) != nil else { throw ServiceError("Invalid recording camera ID.") }
         lock.lock(); let failed = status.state == "error"; lock.unlock()
         if failed { return }
         let track = cameras[camera] ?? Track(); cameras[camera] = track
-        if track.name != name { try finish(track); track.name = name; track.directory = nil }
-        if track.codec != media.codec { try finish(track); track.codec = media.codec; track.sets.removeAll() }
+        if track.name != name { try finish(track); track.name = name; track.directory = nil; track.manifest = nil }
+        if track.codec != media.codec { try finish(track); track.codec = media.codec; track.sets.removeAll(); track.clock = LocalRecordingClock() }
         let nals = try Self.nals(media.frame.payload)
         var changed = false
         // SDP initializes missing parameters; newer in-band parameters take precedence.
@@ -306,6 +336,8 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         guard required.allSatisfy({ track.sets[$0] != nil }), nals.contains(where: {
             media.codec == "H264" ? (1...5).contains(Int($0[0] & 31)) : ($0[0] >> 1) & 63 < 32
         }) else { return }
+        let observed = try track.clock.observe(media)
+        if observed.discontinuity { try finish(track) }
         if let writer = track.writer, media.frame.keyFrame, writer.elapsed(media.frame.timestamp) >= Double(shardSeconds) {
             try finish(track)
         }
@@ -319,12 +351,25 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             }
             let directory = track.directory!
             try LocalRecordingLayout.verify(path: directory.path, fd: directory.fd, owner: configuration.ownerUID)
+            track.manifest = try manifest(for: directory,
+                identity: .init(storeID: configuration.id, cameraID: camera), create: true)
+            let timing = ShardTimingMetadata(storeID: configuration.id, cameraID: camera, media: media, time: observed.timing)
             track.writer = try MP4Shard(directory: directory,
                                         codec: media.codec, sets: required.map { track.sets[$0]! }, clock: media.clockRate,
-                                        firstTimestamp: media.frame.timestamp)
+                                        firstTimestamp: media.frame.timestamp, capturedAt: observed.time, timing: timing)
             lock.lock(); status.activeRecordings += 1; lock.unlock()
+            let id = timing.shardID
+            try track.manifest!.begin(id: id, temporaryName: track.writer!.temporaryName, finalName: track.writer!.finalName,
+                                      start: observed.time, timescale: media.clockRate, sourceTimestamp: media.frame.timestamp, timing: timing)
+            track.recordingID = id
+            track.lastManifestCheckpoint = ProcessInfo.processInfo.systemUptime
         }
         try track.writer!.append(media.frame)
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - track.lastManifestCheckpoint >= 5, let id = track.recordingID, let writer = track.writer {
+            try track.manifest!.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount)
+            track.lastManifestCheckpoint = now
+        }
         lock.lock(); status.recordedFrames &+= 1; lock.unlock()
     }
     static func nals(_ data: Data) throws -> [Data] {
@@ -359,14 +404,17 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             guard info.st_mode & S_IFMT == S_IFDIR else { continue }
             let child = openat(directoryFD, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
             guard child >= 0 else { throw ServiceError.posix("Open retained recording directory") }
-            defer { close(child) }
+            let directory = LocalRecordingLayout.Directory(path: path + "/" + leaf, fd: child)
             let legacy = leaf == "hbnvr-" + configuration.id
-            guard try legacy || LocalRecordingLayout.identity(in: child)?.storeID == configuration.id else { continue }
+            let identity = try LocalRecordingLayout.identity(in: child)
+            guard legacy || identity?.storeID == configuration.id else { continue }
             try StoreDirectory.validate(child, owner: configuration.ownerUID, daemon: geteuid())
-            try expire(in: child, path: path + "/" + leaf, legacy: legacy, cutoff: cutoff)
+            let index = try identity.flatMap { try manifest(for: directory, identity: $0, create: false) }
+            try expire(in: child, path: directory.path, legacy: legacy, cutoff: cutoff, manifest: index)
+            withExtendedLifetime(directory) {}
         }
     }
-    private func expire(in fd: Int32, path: String, legacy: Bool, cutoff: Date) throws {
+    private func expire(in fd: Int32, path: String, legacy: Bool, cutoff: Date, manifest: LocalRecordingManifest?) throws {
         var active = Set<String>()
         // Compare pinned filesystem identity, not spelling: APFS may resolve a
         // case-only camera rename to an existing folder with different casing.
@@ -389,6 +437,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             let date = legacy ? Self.expirationDate(name)! : Date(timeIntervalSince1970: Double(timestamp.tv_sec) + Double(timestamp.tv_nsec) / 1e9)
             guard date < cutoff else { continue }
             guard unlinkat(fd, name, 0) == 0 else { throw ServiceError.posix("Expire retained recording") }
+            try manifest?.remove(filename: name)
         }
     }
 }
@@ -397,7 +446,7 @@ final class MP4Shard {
     // Only retains/releases the writer across its completion callback; no cross-queue mutation.
     private struct WriterLifetime: @unchecked Sendable { let writer: AVAssetWriter }
     let temporaryName: String
-    private let finalName: String
+    let finalName: String
     private let directory: LocalRecordingLayout.Directory
     private let directoryFD: Int32
     private let writer: AVAssetWriter
@@ -411,14 +460,17 @@ final class MP4Shard {
     private var syncFD: Int32 = -1
     private var lastSync: TimeInterval = 0
     private var finalization: DispatchGroup?
-    init(directory: LocalRecordingLayout.Directory, codec: String, sets: [Data], clock: UInt32, firstTimestamp: UInt32) throws {
+    var endTicks: Int64 { samples == 0 ? 0 : ticks + lastDuration }
+    var sampleCount: Int64 { Int64(samples) }
+    init(directory: LocalRecordingLayout.Directory, codec: String, sets: [Data], clock: UInt32, firstTimestamp: UInt32, capturedAt: Date = Date(), timing: ShardTimingMetadata? = nil) throws {
         guard clock > 0, clock <= Int32.max else { throw ServiceError("Unsupported video clock rate.") }
         self.clock = Int32(clock); last = firstTimestamp; directoryFD = directory.fd; self.directory = directory
         lastDuration = Int64(clock) / 15
         format = try Self.format(codec: codec, sets: sets)
-        finalName = try LocalRecordingLayout.availableStem(in: directory.fd) + ".mp4"
+        finalName = try LocalRecordingLayout.availableStem(in: directory.fd, at: capturedAt) + ".mp4"
         temporaryName = finalName + ".recording"
         writer = try AVAssetWriter(outputURL: URL(fileURLWithPath: directory.path + "/" + temporaryName), fileType: .mp4)
+        writer.metadata = try timing?.assetMetadata() ?? []
         // Stream into a visible file, with recoverable metadata throughout the shard.
         // This is independent of shard duration; never retain a whole shard in RAM.
         writer.movieFragmentInterval = CMTime(seconds: 5, preferredTimescale: 600)

@@ -1,0 +1,244 @@
+# Local recording manifests and shard timing (0.10.0)
+
+Each camera directory receives `.hbnvr-manifest.sqlite` when this version starts
+writing new footage there. This is a **prospectively maintained recording index**.
+New 0.10.0 MP4s embed their own authoritative timing and identity, making a future
+explicit rebuild possible; no rebuild operation exists yet. Existing MP4s and
+`.mp4.recording` files are never scanned,
+adopted, backfilled, or assigned capture times from filenames/filesystem dates.
+The pre-existing retention policy still ages those files normally.
+
+This increment implements the index and internal range queries only. It does not
+add a playback CLI, IPC operation, Homebase media relay, GUI, S3 manifest, or recent
+RAM buffer. No keyframe/byte-offset tables are maintained. A future media reader
+will open the selected MP4 and seek using its container information.
+
+## Location, permissions, and ownership
+
+```text
+<chosen local root>/Living Room Camera/
+    .hbnvr-camera.json
+    .hbnvr-manifest.sqlite
+    2026-09-17_12-00-00.mp4
+    2026-09-17_12-01-00.mp4.recording
+```
+
+The database is daemon-owned, mode `0600`, with the same inherited requester/daemon
+ACLs as recordings. The existing camera marker and an identity row in the database
+bind it to a particular camera and store. The store worker is its single writer.
+Homebase must eventually query NVR, not open this database directly.
+
+SQLite uses DELETE rollback-journal mode, FULL synchronous commits, and macOS
+fullfsync. A temporary `.hbnvr-manifest.sqlite-journal` can appear during writes or
+remain after a crash; do not delete it independently. No WAL/shared-memory file is
+normally created. Existing database/journal links, extra hard links, wrong owners,
+or broad POSIX modes are refused. The camera directory's private ACL policy remains
+in force. This is not protection against the authorized directory owner editing
+their own recordings or index.
+
+## Stored information and time semantics
+
+The initial schema (version 1) contains `identity` and `recordings` tables. Each recording stores:
+
+- A UUID, current relative filename, and intended finalized filename.
+- `start_utc`: canonical time at media zero, as Unix seconds in UTC.
+- Required `received_utc`, `canonical_source` (`camera` or `received`), and
+  `timing_json` containing the exact versioned MP4 metadata. `camera_utc` is NULL
+  only when no usable camera-clock mapping is available.
+- The camera media clock's `timescale`, first 32-bit RTP `source_timestamp`, and
+  `end_ticks` relative to the MP4's zero-based media origin.
+- Accepted frame count and `recording`, `complete`, or `interrupted` state.
+- Finalized file device/inode/byte size, used to reject missing/replaced/truncated
+  files when answering availability queries. File dates are not timeline inputs.
+
+Reception stamps each complete encoded frame before store queues and maps RTP to
+camera UTC using RTCP sender reports for the matching SSRC. Unknown/zero/relative,
+malformed and stale (over 120 seconds) mappings are not used. RTP wraps
+are handled with signed modular deltas; NTP era selection handles the 2036 rollover.
+The receiver retains a bounded set of at most eight source mappings. No ONVIF clock
+settings, camera clock changes, or camera reconfiguration are performed.
+
+The tested TP-Link cameras send consistent video RTP/NTP pairs but advertise a
+different SSRC in RTCP. For the single video track on explicitly negotiated TCP
+channels 0/1, HBNVR can associate by channel after two advancing reports received
+since the current RTP source began. There must be only one fresh report source;
+its RTP/NTP progression must agree within 100 ms, and both report age and the
+frame/report RTP offset must be within five seconds. Ambiguity fails closed to
+receipt time. The embedded `time.cameraClock` records method `ssrc` or
+`interleavedChannel` and the report SSRC; the outer `ssrc` records the video SSRC.
+This exception never associates across connections or negotiated tracks.
+These cameras also encode the fractional NTP word as nanoseconds. When standard
+NTP fractions fail the cadence check, three successive reports (two intervals)
+must agree with video-clock progression within 100 ms under the nanosecond
+interpretation, with every fractional value below one billion. Only then is that
+interpretation used. `time.cameraClock.fractionEncoding` records `ntp` or
+`nanoseconds`; ambiguous/inconsistent evidence remains unavailable.
+Once inferred, the fractional format is retained for that report source. An
+isolated inconsistent report does not replace the last validated channel mapping;
+that mapping still expires five seconds after its original report, not five
+seconds after each reuse. A changed RTP source or ambiguous report sources clear it.
+
+At a new timing epoch, use camera time as canonical if its absolute difference
+from actual complete-frame reception is **at most 2.5 seconds**, otherwise reception
+time. Keep camera evidence even when outside that tolerance. An unavailable camera
+clock is absent, not a fake zero timestamp. All stores share this decision before
+fan-out. This is a plausibility policy, not a claim about exposure-time accuracy.
+
+Within an epoch, all three timelines advance by unwrapped RTP media offsets, not
+per-frame network jitter or nominal FPS. Received time is therefore a **smooth
+receipt-anchored timeline**. `firstFrameReceivedUTC` separately preserves the actual
+arrival of each shard's first complete frame. The canonical source is frozen for
+an epoch. A source change, camera mapping appearing/disappearing, or a camera-clock
+correction exceeding 250 ms starts a new epoch at the next keyframe; no existing
+shard is retimed. These transitions may create real timeline overlaps or gaps;
+the index does not pretend the files are contiguous. Smaller clock corrections
+are tolerated until they accumulate past that boundary threshold.
+
+Explicit recording stops, connection ends, and known dropped-frame events finalize
+the current shard. Recording restarts on an existing live connection retain its
+shared timing epoch; a new connection establishes a new mapping. A source-time jump greater
+than `max(2 seconds, 8 × the preceding frame interval)` or a wall-clock step over
+one second relative to monotonic receipt time splits the shard and reanchors; new
+media waits for a keyframe. SSRC/clock-rate changes also start an epoch. Non-increasing RTP
+timestamps retain the existing no-B-frame rejection. These are observed recording
+boundaries, not continuity inferred from adjacent filenames. Small source cadence
+variations follow the encoded sample timing, not an assumed fixed frame rate.
+
+### Embedded MP4 metadata
+
+Both local MP4 and segment-output RAM/S3 writers set a UTF-8 description metadata
+item before writing samples. AVFoundation maps this to MP4's ISO user-data `dscp`
+field (it silently drops arbitrary QuickTime metadata keys for this output).
+The JSON identifies itself with `format: com.graygoolabs.hbnvr.timing`; readers
+recognize the payload rather than relying on AVFoundation's metadata-key alias.
+Its JSON schema 1 is:
+
+```json
+{
+  "format": "com.graygoolabs.hbnvr.timing",
+  "schemaVersion": 1,
+  "storeID": "<UUID>", "cameraID": "<UUID>", "shardID": "<UUID>",
+  "time": {
+    "cameraUTC": 1789680000.0,
+    "receivedUTC": 1789680000.2,
+    "canonicalUTC": 1789680000.0,
+    "canonicalSource": "camera", "epochID": "<UUID>",
+    "cameraClock": {
+      "method": "interleavedChannel", "reportSSRC": 12345,
+      "fractionEncoding": "nanoseconds"
+    }
+  },
+  "firstFrameReceivedUTC": 1789680000.2,
+  "timescale": 90000, "rtpTimestamp": 123456789, "ssrc": 42
+}
+```
+
+All dates are Unix seconds, independent of display timezone. For each timeline,
+add the MP4 presentation offset to its anchor to place a frame. A missing camera
+clock omits `cameraUTC`. No credentials are present. Encoded video samples are
+passed through unchanged. The S3 key/shard ID agrees with the embedded ID; client
+encryption covers the embedded metadata along with the MP4. Pending older shards
+remain untouched, including their destination, bytes and retry keys.
+
+Metadata is not cryptographic authenticity for an editable local file, and does
+not guarantee an unfinished container survived a power cut. Automatic manifest
+reconstruction and incomplete-video salvage remain separate future work.
+
+## Lifecycle and failure policy
+
+1. Before the first sample, commit a `recording` row with its actual time anchor.
+2. At most once per five seconds of active frame processing, commit accepted-frame
+   progress. No per-frame SQLite commits or idle heartbeat writes occur.
+3. Finalize/synchronize the MP4, rename the same file, and synchronize its directory.
+4. Commit the final filename, media end, frame count, file identity, and `complete`
+   state in one SQLite transaction.
+
+`recording` progress is provisional: AVAssetWriter can still buffer those samples.
+It is **not** advertised as readable/durable coverage. Only `complete` rows with a
+matching existing regular file are returned by the availability query. Recent
+in-memory/in-progress playback is a separate future layer.
+
+An interrupted process leaves `recording` rows that are marked `interrupted` when
+the writer next opens that manifest. Failed finalization also marks the row
+interrupted when possible. These entries are not playable availability, even if
+a final-named file exists: a crash between file publication and database commit
+may leave valid but unindexed footage. There is no automatic media salvage or
+reconstruction. SQLite's normal transaction-journal recovery still applies; that
+is database consistency recovery, not footage backfill.
+
+Retention unlinks a recording first, then removes its known row. If interrupted
+between those operations, a query excludes the missing file. User-deleted,
+replaced, or truncated indexed files are also excluded without inferring alternate
+paths or capture times. The byte-size/inode check is not a content-integrity hash.
+
+A manifest write/read failure stops the affected local store with an actionable
+status error; other stores and camera reception remain independent. Completed or
+unfinished video is preserved (subject to normal retention). Corrupt, foreign, or
+unsupported databases are never silently reset. If an operator deliberately
+removes a manifest **while the store is stopped**, the next new recording starts
+an empty one. Prior footage remains on disk but has no automatic timeline entry.
+Deleting/replacing a manifest while open is detected and requires stopping and
+restarting the store. Back up the manifest using SQLite's backup facilities, or
+copy it while the store is stopped; it is not disposable cache.
+
+## Query contract
+
+`LocalRecordingManifest.coverage(from:to:)` accepts finite, half-open UTC intervals
+`[start,end)` inside the daemon. It returns matching finalized recording records,
+merged available intervals clipped to the request, and their complement as gaps.
+Overlapping valid recordings are not double-counted. No adjacent files are assumed
+contiguous, and filesystem timestamps are never consulted for this calculation.
+
+"Gap" means **not available through this manifest**, not proof that recording
+never happened. Existing unindexed footage and footage whose manifest was lost are
+intentionally invisible to these queries.
+
+The eventual external API can express "now minus" ranges and reusable server time
+anchors; that conversion belongs in NVR above this internal UTC-based index. Frame
+streaming, keyframe preroll, and file demuxing remain outside the manifest.
+
+## Verification and inspection
+
+`LocalManifestTests` covers prospective creation, no backfill after deletion,
+gaps/overlaps, provisional and interrupted rows, safe paths/permissions,
+corruption/unsupported schema, blocked writes, timestamp wrap and clock changes,
+missing/replaced/truncated media, retention, and real synthetic-video shard timing.
+The existing H.264/H.265 local recording and power-interruption tests remain in use.
+`RecordingTimeTests` checks RTCP parsing, source matching, rollover/expiry, the
+2.5-second policy, jitter/clock transitions, and metadata round-tripping through
+both MP4 writers with byte-identical encoded samples and successful decoding.
+
+An explicitly opt-in live test reads Homebase camera configuration/credentials,
+discovers a stream, discards video, and prints only timing summaries. It makes no
+AWS calls and changes no installed configuration. After building tests:
+
+```sh
+HBNVR_LIVE_CLOCK_TEST=1 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun xctest -XCTest CameraClockLiveTests/testHomebaseCameraClockMapping \
+  /private/tmp/hbnvr-build/Build/Products/Debug/HBNVRTests.xctest
+```
+
+Also setting `HBNVR_LIVE_CLOCK_RECORD=1` writes short local test shards in a private
+temporary directory, compares each MP4's embedded timing to SQLite, checks playback,
+and removes that temporary footage at the end. It never configures an S3 store.
+
+Live verification on 2026-09-17 confirmed the two configured TP-Link cameras'
+channel-associated, nanosecond-fraction reports. Once validated, Living Room's
+camera time trailed complete-frame receipt by 0.34–0.43 seconds and Bedroom's by
+0.40–0.52 seconds in that sample (not a guaranteed latency bound). Both selected
+camera time as canonical after initial receipt-time fallback. Five playable test
+shards per camera had embedded metadata exactly matching their SQLite rows;
+temporary footage was removed and no AWS upload was performed.
+
+After separately installing the build and recording a new shard, inspect a camera
+directory with your normal account (substitute its actual path):
+
+```sh
+sqlite3 -readonly "$HOME/NVR/Living Room Camera/.hbnvr-manifest.sqlite" \
+  "SELECT filename, datetime(start_utc, 'unixepoch'), canonical_source, camera_utc, received_utc, end_ticks * 1.0 / timescale AS seconds, frames, state FROM recordings ORDER BY start_utc DESC LIMIT 10;"
+```
+
+This reads metadata only; no camera video or AWS access is needed. A short query is
+preferable to a long SQLite transaction that blocks the recording writer. Files
+predating installation are expected not to appear. New rows are provisional until
+the shard finalizes; no claims of active-shard playback are made in this release.

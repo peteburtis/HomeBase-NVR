@@ -13,6 +13,9 @@ struct Request: Codable {
     var storeOriginal: RecordingStoreConfiguration? = nil
     var setupID: String? = nil
     var saveDisabled: Bool? = nil
+    var recordingStarted: Bool? = nil
+    var homebaseDeviceID: String? = nil
+    var nvrInstanceID: String? = nil
 }
 struct AgentStatus: Codable {
     let ready: Bool
@@ -33,6 +36,7 @@ struct Reply: Codable {
     var stores: [RecordingStoreConfiguration]? = nil
     var store: RecordingStoreConfiguration? = nil
     var setup: S3SetupStatus? = nil
+    var cameraSnapshot: NVRCameraSnapshot? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
 }
 
@@ -180,6 +184,7 @@ enum AgentReadiness {
 }
 
 final class AgentServer {
+    private let cameraEvents = NVRCameraEvents()
     private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, log: { [weak self] message in self?.log(message) })
     private let setupJobs: S3SetupJobs
     private let transportFactory: S3TransportFactory
@@ -204,6 +209,7 @@ final class AgentServer {
         else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
     }
     func run() throws {
+        defer { cameraEvents.stop() }
         let path = SocketIO.path(directory)
         // Validate length before acquiring resources.
         try SocketIO.address(path) { _, _ in () }
@@ -231,7 +237,9 @@ final class AgentServer {
         var cleanedUp = false
         defer { if !cleanedUp { setupJobs.stop(); streams.stop(); recordings.stop() } }
         recordings.load(try stores.list())
-        for (id, camera) in try cameras.configurations() { streams.add(id: id, camera: camera) }
+        let initialCameras = try cameras.configurations()
+        try cameraEvents.replace(initialCameras)
+        for (id, camera) in initialCameras { streams.add(id: id, camera: camera) }
         let started = ProcessInfo.processInfo.systemUptime
         log("hbnvr ready (PID \(getpid())) at \(path)")
         // A bounded serial request loop: at most one active client, each with a five-second deadline.
@@ -242,9 +250,9 @@ final class AgentServer {
             let client = accept(fd, nil, nil)
             if client < 0 && (errno == EINTR || errno == EAGAIN) { continue }
             guard client >= 0 else { throw ServiceError.posix("Accept client") }
-            handle(client, started: started)
-            close(client)
+            if !handle(client, started: started) { close(client) }
         }
+        cameraEvents.stop()
         setupJobs.stop()
         let shutdownDeadline = ProcessInfo.processInfo.systemUptime + 45
         recordings.beginShutdown()
@@ -254,7 +262,8 @@ final class AgentServer {
         guard safe else { throw ServiceError("Agent stopped with recording finalization/persistence errors; shutdown was not safe.") }
         log("hbnvr stopped")
     }
-    func handle(_ fd: Int32, started: TimeInterval) {
+    /// True transfers the connected descriptor to a bounded event subscriber.
+    @discardableResult func handle(_ fd: Int32, started: TimeInterval) -> Bool {
         let deadline = ProcessInfo.processInfo.systemUptime + 5
         do {
             try SocketIO.configure(fd)
@@ -265,8 +274,39 @@ final class AgentServer {
             let data = try SocketIO.read(fd: fd, deadline: deadline, cancellation: cancellation)
             guard let request = try? JSONDecoder().decode(Request.self, from: data) else { throw ServiceError(.invalidMessage, "Malformed request.") }
             guard request.protocolVersion == 1 else { throw ServiceError(.incompatible, "Unsupported IPC protocol version.") }
+            // Publish even if a post-save finalization wait fails. Intent was
+            // durably accepted and observers must not retain the old value.
+            defer {
+                if request.operation.hasPrefix("cameras."), let values = try? cameras.configurations() {
+                    try? cameraEvents.replace(values)
+                }
+            }
             var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
             switch request.operation {
+            case "cameras.snapshot":
+                try cameraEvents.replace(cameras.configurations())
+                reply.cameraSnapshot = cameraEvents.snapshot
+            case "cameras.watch":
+                try cameraEvents.replace(cameras.configurations())
+                try cameraEvents.subscribe(fd)
+                return true
+            case "cameras.recording.set":
+                guard request.nvrInstanceID == cameraEvents.instanceID,
+                      let id = request.cameraID, let hardwareID = request.homebaseDeviceID,
+                      let started = request.recordingStarted else {
+                    throw ServiceError(.unavailable, "NVR session changed or recording request is incomplete; reconnect before writing.")
+                }
+                var camera = try cameras.configuration(id: id)
+                guard camera.enabled, camera.homebaseDeviceID == hardwareID else {
+                    throw ServiceError(.unavailable, "Camera is disabled, removed, or no longer matches this Homebase device.")
+                }
+                camera.recordingStarted = started
+                reply.camera = try cameras.save(camera, id: id)
+                streams.add(id: id, camera: camera)
+                try cameraEvents.replace(cameras.configurations())
+                reply.cameraSnapshot = cameraEvents.snapshot
+                // This acknowledges persistent intent. Finalization proceeds on
+                // each store's queue and is not an observation of disk health.
             case "status":
                 let storeStatus = recordings.snapshot()
                 var streamStatus = streams.snapshot()
@@ -427,6 +467,108 @@ final class AgentServer {
                 try? SocketIO.write(JSONEncoder().encode(Reply.failure(failure)), fd: fd, deadline: ProcessInfo.processInfo.systemUptime + 0.2, cancellation: cancellation)
                 log("IPC: \(failure.message)")
             }
+        }
+        return false
+    }
+}
+
+/// Small integration projection: no endpoints, names, credentials, or statistics.
+struct NVRCameraState: Codable, Equatable {
+    let id: String
+    let homebaseDeviceID: String?
+    let enabled: Bool
+    let recordingStarted: Bool
+}
+struct NVRCameraSnapshot: Codable, Equatable {
+    let instanceID: String
+    let revision: UInt64
+    let cameras: [NVRCameraState]
+}
+
+/// Called by the serial command loop; socket writes are independent. Each watcher
+/// keeps only the newest complete snapshot, so slow clients cannot grow a journal.
+final class NVRCameraEvents {
+    let instanceID = UUID().uuidString
+    private let lock = NSLock()
+    private var revision: UInt64 = 0
+    private var cameras: [NVRCameraState] = []
+    private var subscribers: [UUID: NVRCameraSubscriber] = [:]
+    var snapshot: NVRCameraSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        return NVRCameraSnapshot(instanceID: instanceID, revision: revision, cameras: cameras)
+    }
+    func replace(_ values: [(String, CameraConfiguration)]) throws {
+        let next = values.map { NVRCameraState(id: $0.0, homebaseDeviceID: $0.1.homebaseDeviceID,
+                                               enabled: $0.1.enabled, recordingStarted: $0.1.recordingStarted) }.sorted { $0.id < $1.id }
+        lock.lock(); defer { lock.unlock() }
+        guard next != cameras else { return }
+        let update = NVRCameraSnapshot(instanceID: instanceID, revision: revision + 1, cameras: next)
+        let data = try Self.encode(update)
+        cameras = next; revision = update.revision
+        for subscriber in subscribers.values { subscriber.offer(data) }
+    }
+    func subscribe(_ fd: Int32) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard subscribers.count < 8 else { throw ServiceError(.unavailable, "Camera subscription limit reached; retry later.") }
+        let id = UUID(), data = try Self.encode(NVRCameraSnapshot(instanceID: instanceID, revision: revision, cameras: cameras))
+        let subscriber = NVRCameraSubscriber(fd: fd, initial: data) { [weak self] in
+            guard let self else { return }; self.lock.lock(); self.subscribers[id] = nil; self.lock.unlock()
+        }
+        subscribers[id] = subscriber
+        subscriber.start()
+    }
+    func stop() {
+        lock.lock(); let values = Array(subscribers.values); subscribers.removeAll(); lock.unlock()
+        values.forEach { $0.stop() }
+    }
+    private static func encode(_ snapshot: NVRCameraSnapshot) throws -> Data {
+        var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
+        reply.cameraSnapshot = snapshot
+        let data = try JSONEncoder().encode(reply)
+        guard data.count <= SocketIO.limit else { throw ServiceError(.invalidMessage, "Camera snapshot exceeds 64 KiB.") }
+        return data
+    }
+}
+
+private final class NVRCameraSubscriber: @unchecked Sendable {
+    private let fd: Int32
+    private let condition = NSCondition()
+    private var pending: Data?
+    private var latest: Data
+    private var stopped = false
+    private var closed = false
+    private let ended: () -> Void
+    init(fd: Int32, initial: Data, ended: @escaping () -> Void) {
+        self.fd = fd; pending = initial; latest = initial; self.ended = ended
+    }
+    func offer(_ data: Data) {
+        condition.lock(); defer { condition.unlock() }
+        guard !stopped else { return }
+        pending = data; condition.signal()
+    }
+    func stop() {
+        condition.lock(); defer { condition.unlock() }
+        stopped = true
+        if !closed { _ = shutdown(fd, SHUT_RDWR) }
+        condition.signal()
+    }
+    func start() { DispatchQueue.global(qos: .utility).async { [self] in run() } }
+    private func run() {
+        defer {
+            condition.lock(); closed = true; close(fd); condition.unlock(); ended()
+        }
+        while true {
+            condition.lock()
+            let heartbeat = Date().addingTimeInterval(30)
+            while pending == nil && !stopped {
+                if !condition.wait(until: heartbeat) { break }
+            }
+            if stopped { condition.unlock(); return }
+            if let pending { latest = pending }; pending = nil
+            let data = latest
+            condition.unlock()
+            do { try SocketIO.write(data, fd: fd, deadline: ProcessInfo.processInfo.systemUptime + 5) }
+            catch { return }
         }
     }
 }

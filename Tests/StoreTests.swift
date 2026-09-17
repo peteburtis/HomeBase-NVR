@@ -156,6 +156,7 @@ final class StoreTests: XCTestCase {
         XCTAssertTrue(store.finish(timeout: 2))
         XCTAssertNil(store.snapshot().lastError)
         XCTAssertNil(try SecureFiles.info(partial))
+        XCTAssertNil(try SecureFiles.info(owned.path + "/" + LocalRecordingManifest.filename))
         for path in [unrelated, foreign, fresh, loose, hard, symbolic] { XCTAssertNotNil(try SecureFiles.info(path), path) }
     }
     func testPrivateDirectoryAndRefusalToAdoptPermissions() throws {
@@ -306,6 +307,13 @@ final class StoreTests: XCTestCase {
         let reopened = try LocalRecordingStore(configuration: configuration)
         XCTAssertTrue(reopened.finish(timeout: 3))
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), before)
+        let manifestDirectory = LocalRecordingLayout.Directory(path: folder, fd: try StoreDirectory.openDirectory(folder))
+        let identity = try XCTUnwrap(LocalRecordingLayout.identity(in: manifestDirectory.fd))
+        let manifest = try LocalRecordingManifest(directory: manifestDirectory, identity: identity, owner: geteuid())
+        XCTAssertEqual(try manifest.recordings().count, 1)
+        XCTAssertEqual(try manifest.recordings().first?.state, .interrupted)
+        XCTAssertTrue(try manifest.coverage(from: 0, to: Date().timeIntervalSince1970 + 60).available.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), before)
     }
     private func waitUntil(timeout: TimeInterval = 4, _ condition: () -> Bool) throws {
         let deadline = Date().addingTimeInterval(timeout)
@@ -426,6 +434,13 @@ final class StoreTests: XCTestCase {
         let directory = configuration.directory + "/Test Camera"
         let files = try FileManager.default.contentsOfDirectory(atPath: directory).filter { $0.hasSuffix(".mp4") }
         XCTAssertEqual(files.count, 3)
+        let manifestDirectory = LocalRecordingLayout.Directory(path: directory, fd: try StoreDirectory.openDirectory(directory))
+        let manifest = try LocalRecordingManifest(directory: manifestDirectory,
+            identity: .init(storeID: configuration.id, cameraID: camera), owner: geteuid(), readOnly: true)
+        let indexed = try manifest.recordings()
+        XCTAssertEqual(Set(indexed.map(\.filename)), Set(files))
+        XCTAssertEqual(indexed.reduce(Int64(0)) { $0 + $1.frames }, 45)
+        XCTAssertTrue(indexed.allSatisfy { $0.state == .complete && $0.endTicks == 90000 })
         var decoded = 0
         for file in files {
             XCTAssertTrue(LocalRecordingLayout.isShard(file), file)

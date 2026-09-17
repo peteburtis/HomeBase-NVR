@@ -101,6 +101,20 @@ struct EncodedMedia: Sendable {
     let clockRate: UInt32
     let parameterSets: [Data]
     let frame: EncodedVideoFrame
+    let receivedAt: Date
+    let receivedUptime: TimeInterval
+    let cameraUTC: Double?
+    let cameraClock: CameraClockEvidence?
+    let ssrc: UInt32?
+    var time: RecordingTime?
+    init(codec: String, clockRate: UInt32, parameterSets: [Data], frame: EncodedVideoFrame,
+         receivedAt: Date = Date(), receivedUptime: TimeInterval = ProcessInfo.processInfo.systemUptime,
+         cameraUTC: Double? = nil, ssrc: UInt32? = nil, time: RecordingTime? = nil, cameraClock: CameraClockEvidence? = nil) {
+        self.codec = codec; self.clockRate = clockRate; self.parameterSets = parameterSets; self.frame = frame
+        self.receivedAt = receivedAt; self.receivedUptime = receivedUptime
+        self.cameraUTC = cameraUTC; self.ssrc = ssrc; self.time = time
+        self.cameraClock = cameraClock
+    }
 }
 enum RecordingEvent: Sendable {
     case media(camera: String, name: String, EncodedMedia)

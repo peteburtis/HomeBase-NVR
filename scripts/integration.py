@@ -952,6 +952,83 @@ class Integration(unittest.TestCase):
         self.assertFalse((directory / "control.sock").exists())
         self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 3)
 
+    def test_camera_subscription_and_persistent_recording_commands(self):
+        directory, process = self.agent()
+        with self.connect(directory) as watch:
+            watch.sendall(b'{"protocolVersion":1,"operation":"cameras.watch"}\n')
+            with watch.makefile("rb") as frames:
+                def snapshot():
+                    reply = json.loads(frames.readline())
+                    self.assertNotIn("error", reply)
+                    return reply["cameraSnapshot"]
+                initial = snapshot()
+                self.assertEqual(initial["cameras"], [])
+                # A long-lived observer must never hold up the ordinary IPC loop.
+                self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+                camera = dict(SchemaVersion=1, Name="Arbitrary alias", Provider="RTSP", IPAddress="127.0.0.1",
+                              RTSPPort=554, HomebaseDeviceID="camera-fixture-serial",
+                              Credentials=dict(SchemaVersion=1, Username="viewer", Password="never-publish"))
+                added = self.camera_request(directory, "cameras.add", camera=camera)
+                self.assertNotIn("error", added, added)
+                camera_id = added["camera"]["id"]
+                current = snapshot()
+                self.assertGreater(current["revision"], initial["revision"])
+                self.assertEqual(current["cameras"], [dict(id=camera_id, homebaseDeviceID="camera-fixture-serial",
+                                                         enabled=True, recordingStarted=True)])
+                for secret in ["never-publish", "viewer", "127.0.0.1", "Arbitrary alias"]:
+                    self.assertNotIn(secret, json.dumps(current))
+                fields = dict(cameraID=camera_id, homebaseDeviceID="camera-fixture-serial",
+                              nvrInstanceID=current["instanceID"], recordingStarted=False)
+                result = self.camera_request(directory, "cameras.recording.set", **fields)
+                self.assertNotIn("error", result, result)
+                stopped = snapshot()
+                self.assertFalse(stopped["cameras"][0]["recordingStarted"])
+                self.assertEqual(result["cameraSnapshot"], stopped)
+                path = directory / "cameras" / (camera_id + ".json")
+                before = path.stat().st_ino
+                result = self.camera_request(directory, "cameras.recording.set", **fields)
+                self.assertEqual(result["cameraSnapshot"], stopped)
+                self.assertEqual(path.stat().st_ino, before)  # No extra write for an idempotent set.
+                self.assertFalse(json.loads(path.read_text())["RecordingStarted"])
+                for bad in [dict(nvrInstanceID="old-instance"), dict(homebaseDeviceID="camera-other-serial"),
+                            dict(recordingStarted=None)]:
+                    result = self.camera_request(directory, "cameras.recording.set", **(fields | bad))
+                    self.assertIn("error", result)
+                self.camera_request(directory, "cameras.disable", cameraID=camera_id)
+                disabled = snapshot()
+                self.assertFalse(disabled["cameras"][0]["enabled"])
+                self.assertIn("error", self.camera_request(directory, "cameras.recording.set", **fields))
+                self.camera_request(directory, "cameras.enable", cameraID=camera_id)
+                self.assertTrue(snapshot()["cameras"][0]["enabled"])
+                self.camera_request(directory, "cameras.start", cameraID=camera_id)
+                self.assertTrue(snapshot()["cameras"][0]["recordingStarted"])
+                self.camera_request(directory, "cameras.remove", cameraID=camera_id)
+                removed = snapshot()
+                self.assertEqual(removed["cameras"], [])
+                self.assertEqual(self.camera_request(directory, "cameras.snapshot")["cameraSnapshot"], removed)
+                process.terminate()
+                self.assertEqual(process.wait(timeout=3), 0)
+                self.assertEqual(frames.readline(), b"")
+
+    def test_camera_watch_limit_and_restart_epoch(self):
+        directory, process = self.agent()
+        watches = []
+        try:
+            for _ in range(8):
+                watch = self.connect(directory); watches.append(watch)
+                watch.sendall(b'{"protocolVersion":1,"operation":"cameras.watch"}\n')
+                reply = json.loads(watch.recv(65536))
+                self.assertIn("cameraSnapshot", reply)
+            epoch = reply["cameraSnapshot"]["instanceID"]
+            self.assertIn("error", self.camera_request(directory, "cameras.watch"))
+            self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+            process.terminate(); self.assertEqual(process.wait(timeout=3), 0)
+            directory, _ = self.agent()
+            self.assertNotEqual(self.camera_request(directory, "cameras.snapshot")["cameraSnapshot"]["instanceID"], epoch)
+        finally:
+            for watch in watches:
+                watch.close()
+
     def test_duplicate_and_independent_agents(self):
         directory, process = self.agent()
         duplicate = self.cli("agent", "--runtime-dir", directory)

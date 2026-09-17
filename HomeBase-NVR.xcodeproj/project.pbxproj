@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        CA0000000000000000000002 /* RecordingTime in Sources */ = {isa = PBXBuildFile; fileRef = CA0000000000000000000001; };
+		C90000000000000000000002 /* LocalRecordingManifest in Sources */ = {isa = PBXBuildFile; fileRef = C90000000000000000000001; };
 		B70000000000000000000019 = {isa = PBXBuildFile; fileRef = B70000000000000000000018; };
 		B7000000000000000000000b = {isa = PBXBuildFile; fileRef = B7000000000000000000000a; };
 		B7000000000000000000000d = {isa = PBXBuildFile; fileRef = B7000000000000000000000c; };
@@ -55,6 +57,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+        CA0000000000000000000001 /* RecordingTime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/RecordingTime.swift"; sourceTree = SOURCE_ROOT; };
+		C90000000000000000000001 /* LocalRecordingManifest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/LocalRecordingManifest.swift"; sourceTree = SOURCE_ROOT; };
 		B70000000000000000000018 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/RecordingEncryption.swift"; sourceTree = SOURCE_ROOT; };
 		B7000000000000000000000a = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Configuration.swift"; sourceTree = SOURCE_ROOT; };
 		B7000000000000000000000c = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Spool.swift"; sourceTree = SOURCE_ROOT; };
@@ -237,6 +241,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+		C90000000000000000000002 /* LocalRecordingManifest in Sources */,
+        CA0000000000000000000002 /* RecordingTime in Sources */,
 				A10000000000000000000024 /* HomeBase-NVR/Support.swift in Sources */,
 				B7000000000000000000000b,
 				B7000000000000000000000d,

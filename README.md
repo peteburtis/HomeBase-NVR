@@ -35,7 +35,20 @@ Version 0.7.6 allows encrypted S3 spools on APFS/HFS+ volumes that ignore owners
 without requiring daemon ownership or exact private modes there. Plaintext spooling
 still requires private ownership-enforced storage. Metadata is not encrypted, and
 encryption does not prevent another local user from deleting or modifying spool files.
-Recording triggers, pre-event buffering, and ongoing Homebase synchronization remain future work.
+Version 0.8.0 adds authenticated Homebase discovery and recording-intent control.
+Homebase publishes `NVR.recording` on matching cameras, retaining it as invalid when
+the NVR or camera becomes unavailable. See [the integration contract](HOMEBASE-INTEGRATION.md).
+Version 0.10.0 introduces a prospective `.hbnvr-manifest.sqlite` in each local camera
+directory, with recording-time anchors, finalized coverage/gap queries, and explicit
+interrupted state. Existing footage is not scanned or backfilled; losing the manifest
+loses its timeline metadata, not the media files. See [local manifests](LOCAL-MANIFEST.md).
+It also reads camera RTCP sender reports and embeds versioned timing metadata
+in both local and RAM/S3 MP4 shards without transcoding. Camera time is canonical
+when within 2.5 seconds of reception; otherwise the receipt-anchored timeline wins.
+The initial manifest schema requires timing metadata and the chosen canonical source;
+camera time is absent only when no usable mapping is available. Files are self-describing;
+automatic index rebuilding remains unimplemented. See [timing semantics](LOCAL-MANIFEST.md#stored-information-and-time-semantics).
+Pre-event buffering and automatic camera-configuration synchronization remain future work.
 Requires macOS 26.1 and Xcode 26.1 or newer.
 
 See [the CLI roadmap](CLI-ROADMAP.md) for planned camera/store command families,
@@ -630,8 +643,8 @@ network permissions on the deployment machine.
 
 ## IPC and diagnostics
 
-The stream socket is `control.sock` within the runtime directory. One JSON request
-and one JSON reply are exchanged per connection, terminated with a newline:
+The stream socket is `control.sock` within the runtime directory. Normally one JSON
+request and one JSON reply are exchanged per connection, terminated with a newline:
 
 ```json
 {"protocolVersion":1,"operation":"status"}
@@ -641,7 +654,10 @@ A successful response has `protocolVersion: 1` and a `status` object containing
 `ready`, `version`, `pid`, `uptimeSeconds`, `streams`, and `stores`. An error response has `error` and
 `code`. Messages are limited to 64 KiB (excluding the newline). Clients use a
 five-second total deadline; the serial server bounds each accepted connection to
-five seconds. It handles one active client at a time with a bounded listen backlog.
+five seconds. It handles one active ordinary request at a time with a bounded listen
+backlog. `cameras.watch` transfers an authenticated connection to a separate bounded
+subscription writer; it never occupies the ordinary request loop while watching.
+See [the subscription and write protocol](HOMEBASE-INTEGRATION.md#wire-contract).
 
 System clients can reach the socket (0666), but the daemon checks kernel-provided
 peer credentials **before reading requests**. Only root or the configured controller

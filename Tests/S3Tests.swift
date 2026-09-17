@@ -239,6 +239,12 @@ final class S3Tests: XCTestCase {
                 let file = path + "/" + attempt.metadata.id + ".mp4"
                 try SecureFiles.atomicWrite(mp4, to: file, mode: 0o600) // Test-only playback fixture.
                 let asset = AVURLAsset(url: URL(fileURLWithPath: file)), tracks = try await asset.loadTracks(withMediaType: .video)
+                let embedded = try await ShardTimingMetadata.read(from: asset)
+                let timing = try XCTUnwrap(embedded)
+                XCTAssertEqual(timing.shardID, attempt.metadata.id)
+                XCTAssertEqual(timing.storeID, c.id); XCTAssertEqual(timing.cameraID, camera)
+                XCTAssertEqual(timing.time.canonicalUTC, attempt.metadata.capturedAt.timeIntervalSince1970)
+                XCTAssertEqual(timing.time.canonicalSource, .received)
                 let reader = try AVAssetReader(asset: asset)
                 let output = AVAssetReaderTrackOutput(track: try XCTUnwrap(tracks.first), outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
                 reader.add(output); XCTAssertTrue(reader.startReading())
