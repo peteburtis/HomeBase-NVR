@@ -81,6 +81,19 @@ examples and open questions.
   stay in private daemon state. Metadata visibility and local deletion/tampering are
   accepted tradeoffs, not solved by encryption. Filesystem durability checks remain.
 
+## Deferred camera protocol hardening
+
+The September 19, 2026 audit identified session-cleanup, teardown authentication,
+SETUP/shutdown races, unnecessary reconnection on rename, cleanup-deadline, SDP
+control-URL, RTCP-feedback, and diagnostic follow-ups. These remain unimplemented;
+see [the camera protocol hardening backlog](RTSP-HARDENING.md) for evidence,
+reproduction scenarios, and acceptance criteria.
+
+Treat this as robustness work, not an established explanation for the camera outage:
+the NVR was largely static around those failures, whereas most confirmed defects
+require a transition. Recovery after stopping a stream would not prove it caused
+the original failure. Reproduce safely with isolated fake-camera instances.
+
 ## Command families
 
 The `store` family below is available for Local and S3 stores. The `camera` family and
