@@ -5,7 +5,40 @@ Triggers remain future work. No plugin loader is planned. The original S3 discus
 notes below are retained; the implemented decisions immediately below supersede their earlier
 examples and open questions.
 
-## Current baseline (0.10.0)
+## Current baseline (0.14.0)
+
+- Optional `supportsNeighbors` on `media.open` exposes nearest retained local
+  intervals before/after a requested range, across days and stores. It uses the
+  same identity-validated manifest/disk/RAM sources as frame reads, remains
+  metadata-only, and reports a missing direction only after a completed query.
+  Unreadable/offline stores and request bounds are errors, not archive ends.
+  Homebase can relay this for gap navigation; no playback CLI is added.
+
+- `playback.snapshot` / `playback.watch` expose a credential-free store/camera
+  catalog over authenticated control IPC before media availability requests.
+  Capabilities/reachability, recording intent, and indexed history are separate.
+  Local manifests preserve the last-recorded display name and Homebase hardware
+  binding, so camera removal does not hide retained history. Disabled stores remain
+  readable. Background scans discover membership/volume changes without probing
+  video or blocking control/recording queues. See the media protocol for the wire
+  contract, unknown/offline states, and subscription limits. No Homebase consumer
+  or new playback CLI is introduced.
+
+- Authenticated `media.open` upgrades a dedicated Unix connection to media protocol
+  v1. Reusable availability/frame requests read finalized indexed local recordings
+  and completed disk fragments of active `.mp4.recording` shards. A bounded bridge
+  of shared writer sample buffers exposes the newest accepted frames, even before
+  the first disk fragment. It retires to disk plus a keyframe-aligned overlap;
+  clients cannot pin whole histories, and playback pressure never stops recording.
+  Active coverage comes from actual samples/readable media, not provisional index
+  progress; requests racing retirement or finalization can be retried.
+  Requests operate in canonical/camera/received time, or relative to live/now. Binary encoded frames
+  include keyframe preroll and timing/codec headers; unavailable ranges are explicit.
+  No Homebase consumer, S3-only RAM/object playback, or playback CLI is
+  introduced here. See [the media protocol](MEDIA-PROTOCOL.md).
+- Future live-feed direction: Homebase normally relays NVR's feed, opening its own
+  camera connection only when NVR is unavailable. Stable frame references wait for
+  that shared-feed architecture; switching feeds starts a new stream identity.
 
 - RTCP sender-report mapping supplies optional camera wall-clock time. New local
   and S3 MP4s embed camera, receipt-anchored, and canonical time, source choice,
@@ -38,7 +71,7 @@ examples and open questions.
   New shards record NVR receipt/media-time anchors, provisional/finalized state,
   and file identity. Internal range queries return available intervals and gaps.
   No filename/date reconstruction, backfill, keyframe/offset index, or playback
-  endpoint is included. Lost metadata cannot be reconstructed automatically.
+  CLI is included. Range/frame IPC is described above. Lost metadata cannot be reconstructed automatically.
   See [local manifest design and failure semantics](LOCAL-MANIFEST.md).
 - `camera add/list/change/remove/enable/disable/start/stop` are implemented. Both
   streaming enablement and recording intent persist; new/legacy cameras default
@@ -764,6 +797,19 @@ file-free test consumer to verify the shared delivery contract has no file depen
 
 ## Remaining decisions for future recording/storage work
 
+Local recovery (0.13.1) is implemented: index/retention errors no longer stop media,
+camera write errors and overload retry fresh keyframes with capped backoff, and
+startup-unavailable roots are reopened automatically. Private rotating error logs
+live in the local recording root. No playback-index backfill or alternate-disk
+fallback is implied; see [failure policy](LOCAL-MANIFEST.md#lifecycle-and-failure-policy).
+
+Bounded in-process manifest completion retries (0.18.3): retain known shard metadata
+through finalization, then retry failed final index writes idempotently using fresh
+connections. Cap the metadata-only queue at 16 entries/store, expire entries after
+60 seconds with exponential backoff, and attempt at most one per maintenance tick.
+Log failures, successful recovery, and expiry/cap/shutdown discards without deleting
+video. This is not historical reconstruction or a fix for the underlying FD issue.
+
 - How trigger-driven recording combines with persistent manual recording intent,
   including overlapping triggers and any temporary overrides.
 - Acceptance/durability acknowledgements for future backends. Local media routing,
@@ -783,3 +829,87 @@ implemented**, not remaining design questions. The implementation separates
 `S3Transport`, `S3LifecycleCoordinator`, and `S3SetupJobs`.
 
 These are intentionally open, not implied by the command names above.
+## Timestamp thumbnail API — 0.15.0
+
+Implemented as optional `supportsThumbnails` on media v1: `thumbnail` accepts a
+timestamp using the existing canonical/camera/received and absolute/live/now
+selectors, plus an aspect-fit pixel size. Returns one JPEG with actual keyframe
+time and all available original anchors. Local RAM/open-file/closed-file playback
+sources are reused; no thumbnail disk cache or S3 retrieval. Homebase's thin relay
+negotiates support, so deploying it before HBNVR leaves ordinary playback intact.
+GUI timeline presentation remains separate work.
+
+## S3 playback manifests — 0.16.0
+
+Implemented: a private durable journal records confirmed S3 uploads before their
+last local upload bookkeeping is removed. A per-store publisher serializes
+encrypted (when configured) per-camera daily and monthly manifests plus a small
+catalog, using the existing write-only credentials. Monthly indexes exclude the
+current UTC day; late uploads revise the affected day and month. Clients discover
+support through optional `playbackManifestVersion: 1` metadata and can use
+GetObject-only credentials without bucket listing.
+
+There is no automatic retrospective indexing of older uploads. S3 thumbnail
+publication is added in 0.18.0 below. The journal survives shutdown/reinstallation, and manifest failures
+are reported separately from video upload failures. Indexes are not authoritative
+about bucket lifecycle expiration. See [S3-STORE.md](S3-STORE.md) for keys, journal
+durability, publication ordering, and reader compatibility.
+
+## Explicit S3 metadata repair — 0.17.0
+
+Implemented `store repair-metadata [NAME] [--dry-run] [--runtime-dir PATH]`.
+An authenticated background job lists only the selected store's prefix, previews
+candidates and download volume, and waits for confirmation. Permission denial offers
+temporary read/list credentials (with optional session token); saved recording keys
+remain unchanged and publish rebuilt manifests. No implicit AWS credential discovery.
+
+Only currently configured camera UUIDs and complete HBNVR shards with valid embedded
+timing qualify. Names identify candidates, never establish timing; sizes are download
+estimates, never durations. Old camera display names work because UUIDs identify cameras.
+Unexpected/legacy/unsupported objects are skipped untouched. Whole-file encrypted
+shards authenticate before inspection; an old password can be entered or those files
+skipped. Reading is sequential and RAM-only, bounded to 256 MiB per object.
+
+Recovered entries merge durably on the existing per-store publication queue alongside
+live uploads. Indexed/pending work wins, preventing repair from replacing recording
+metadata. A final republish covers journaled entries too. Store edits/removal are
+blocked until the job completes/cancels; recording continues. Cancellation preserves
+accepted entries. Jobs expire after 15 minutes without an authenticated client poll.
+No local-store repair, bucket mutation/deletion, or filename-only reconstruction.
+
+## S3 thumbnail publication and repair — 0.18.0
+
+Implemented midpoint previews at UTC :10/:30/:50: nearest preceding canonical keyframe,
+1280×720 bounding box, 80% JPEG, no upscaling, and whole-image encryption when configured.
+Stable camera-UUID/time keys and an encrypted-in-content caption describe the slot and
+actual frame time. JPEGs enter the existing store upload pool immediately, without waiting
+for shard finalization. `S3ObjectMetadata` generalizes the immutable upload unit; video and
+thumbnails share slots, retry policy, spool/quota/volume checks, manual holds, shutdown,
+and replay. Video has queued-live priority; repair images use background slots. No
+parallel thumbnail upload mechanism or extra disk cache. Mutable playback manifests
+retain their revision-serialized publisher, separate from immutable media objects.
+
+`store repair-metadata` also fills missing thumbnails, including for already indexed video,
+while preserving existing images and unknown objects. It uses each downloaded source for
+both inspection and preview generation. Synthetic tests cover H.264/H.265 selection,
+JPEG/encryption, shared slots and quota, stable-byte retry/replay, SDK request framing,
+and indexed repair with images appearing on later listing pages. The GUI's direct S3
+thumbnail retrieval is separate work; its existing video fallback is unaffected.
+
+## S3 repair download diagnostics — 0.18.1
+
+Separate HTTP 404/412, downloaded-size mismatches, and absent/different ETags in
+repair skip totals. Send up to three sanitized examples per reason to authenticated
+CLI progress and daemon logs, including counts and ETag fingerprints rather than
+raw headers or object paths. Report zero-recovery runs truthfully. Preserve the
+existing repair validation, RAM-only reads, and untouched-video behavior; diagnosing
+a failed run does not require extracting the daemon's saved credentials.
+
+## S3 listing key decoding — 0.18.2
+
+Repair decodes URL-encoded listing keys with space-as-plus support, exactly once;
+literal plus/percent names remain intact. Audit confirms raw keys stay raw in upload,
+multipart, spool, manifests, thumbnail keys, lifecycle/IAM prefixes, Homebase discovery,
+and GUI GET requests. Add offline SDK-boundary regressions for spaces, Unicode, plus,
+percent escapes, and opaque pagination. No AWS credential extraction, media downloads,
+object renaming, or GUI/Homebase deployment is required to apply this correction.

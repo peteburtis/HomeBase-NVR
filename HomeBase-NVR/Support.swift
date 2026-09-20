@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 import MachO
 
-enum BuildInfo { static let version = "0.10.0" }
+enum BuildInfo { static let version = "0.18.3" }
 
 enum FailureCode: Int32, Codable {
     case failure = 1, unavailable = 3, permission = 4, incompatible = 5, timeout = 6, invalidMessage = 7

@@ -1,5 +1,10 @@
 # HomeBase-NVR / hbnvr
 
+Version **0.18.3** adds bounded retries for local recording manifest failures:
+known finalized-shard metadata retries for up to one minute, with a 16-entry
+per-store cap and explicit failure/recovery/discard logging. No historical scan
+or video deletion is introduced; see [the retry policy](LOCAL-MANIFEST.md#lifecycle-and-failure-policy).
+
 The foundation of an independent macOS NVR: a headless system LaunchDaemon,
 authenticated Unix-socket control, and an unprivileged foreground development mode.
 Interactive camera setup, direct ONVIF discovery, and one-time Homebase imports
@@ -49,6 +54,33 @@ The initial manifest schema requires timing metadata and the chosen canonical so
 camera time is absent only when no usable mapping is available. Files are self-describing;
 automatic index rebuilding remains unimplemented. See [timing semantics](LOCAL-MANIFEST.md#stored-information-and-time-semantics).
 Pre-event buffering and automatic camera-configuration synchronization remain future work.
+Version 0.12.0 provides authenticated, reusable media IPC sessions for availability and
+encoded-frame requests across the local writer's shared resident samples, growing
+MP4 fragments, and finalized recordings. A bounded RAM bridge reaches the latest
+accepted frame and releases history as disk becomes readable, without a second
+payload copy or changing recording durability. Absolute canonical/camera/
+received ranges and live-/now-relative ranges are supported, with explicit gaps
+and keyframe preroll. Homebase consumption, S3-only playback, continuous live
+forwarding, and frame-reference requests remain future work. See the
+[media wire contract](MEDIA-PROTOCOL.md).
+Version 0.13.0 adds `playback.snapshot` / `playback.watch` over the authenticated
+control IPC: discover stores, frame-reading capability, camera membership, and
+source reachability before asking for time ranges. Local manifests retain each
+camera's last-recorded name and Homebase hardware identity after camera removal.
+Disabled stores remain discoverable/readable; recording intent is separate from
+history. Scans run off the command/recording queues and never read video samples.
+See [playback discovery](MEDIA-PROTOCOL.md#playback-discovery). Homebase consumption
+is not part of this release.
+Version 0.13.1 removes fail-stop behavior from local recording. Manifest errors
+warn without stopping video writes; failed media shards are preserved and fresh
+ones retry automatically at keyframes with capped backoff. Retention errors and
+queue overload no longer permanently disable recording. A private, rotating
+`.hbnvr-errors.log` in each local recording root records write/index failures.
+Version 0.13.2 adds negotiated, authenticated media-session keepalives for an
+already-open playback screen. They do not read recordings. The media reader also
+tolerates one source-clock tick of MP4 end-time rounding while clipping returned
+coverage to the exact indexed boundary; this prevents a valid shard's last frame
+from failing an otherwise valid history request.
 Requires macOS 26.1 and Xcode 26.1 or newer.
 
 See [the CLI roadmap](CLI-ROADMAP.md) for planned camera/store command families,
@@ -74,7 +106,71 @@ up separately: losing it makes encrypted recordings unrecoverable. To recover a 
 downloaded using separate read credentials, run `hbnvr decrypt downloaded.mp4.hbnvr recovered.mp4`.
 The command prompts without echo, requires no daemon/AWS access, and never overwrites.
 
+Local playback also offers a `neighbors` query (0.14.0) for previous/next retained
+video across recording gaps, including active disk/RAM data. It is read-only and
+does not require an actively configured camera or change recording behavior.
+See [MEDIA-PROTOCOL.md](MEDIA-PROTOCOL.md) for capability negotiation and bounds.
+
+## S3 playback indexes (0.16.0)
+
+Newly confirmed S3 recordings now publish encrypted (when configured), predictable
+per-camera daily and monthly playback manifests plus a small day catalog. Homebase
+advertises the optional `playbackManifestVersion: 1` capability; older NVRs and local
+playback remain compatible. Reader credentials still need only prefix-scoped
+`s3:GetObject`, not bucket listing. The private metadata journal survives restart,
+external spool moves, and uninstall. Existing uploaded footage is not automatically backfilled.
+See [the S3 playback contract and durability limits](S3-STORE.md#playback-manifests-0160).
+
+## S3 thumbnails and metadata repair (0.18.0)
+
+S3 recording now publishes a JPEG at each 20-minute tile midpoint (UTC :10, :30,
+and :50), as soon as the selected keyframe is available. Images fit within 1280×720
+without upscaling, use 80% JPEG quality, and follow the store's encryption setting.
+Video and thumbnails share the same upload slots, retries, manual-spooling switch,
+chosen spool volume/quota, and durable shutdown/replay path. Thumbnail object keys
+are predictable and require no extra IAM permissions. This is the NVR publication
+side; the GUI's S3 thumbnail reader is separate from its existing video fallback.
+
+`hbnvr store repair-metadata [NAME] [--dry-run]` explicitly repairs missing S3
+playback manifests and missing thumbnails for currently configured cameras. Omit NAME for a picker.
+The command lists candidates, previews download bytes, and asks before fetching
+recordings. It tries saved keys first and prints a narrowly scoped read/list IAM
+policy if temporary reader credentials are needed; those keys are never saved.
+Valid embedded shard timing is required. Unknown objects, legacy recordings without
+timing, and damaged files are skipped, never changed or deleted. A dry run only
+lists; it does not prove candidates are recoverable. The installed agent and CLI
+must both support 0.18.0 for thumbnail repair. Indexed videos are read again only
+when a midpoint thumbnail is missing; existing images are not overwritten.
+See [repair details and limits](S3-STORE.md#explicit-metadata-repair-0180).
+
+Version **0.18.1** adds bounded repair-download diagnostics to CLI progress and daemon
+logs: HTTP 404/412, byte-count mismatches, and missing/different ETags are reported
+separately. Examples show sizes and ETag fingerprints, never raw headers, object
+paths, credentials, or video data. A scan with no recovered metadata or thumbnails
+now says so explicitly. Install the matching CLI and agent for these diagnostics.
+
+Version **0.18.2** fixes repair of object keys containing spaces: S3's URL-encoded
+listing can represent a space as `+`. Repair now decodes that representation once,
+without changing literal plus signs or percent escapes in the original key. Install
+the updated agent and rerun `hbnvr store repair-metadata`; no object renaming or
+GUI/Homebase update is needed for this fix.
+
 ## Build and test
+
+Version **0.15.1** adds secret-free S3 destination metadata to playback discovery.
+Homebase can use it to offer client-owned reader credential setup. No S3 reads or
+AWS credential disclosure are introduced. Local frame, availability, neighbor,
+and thumbnail requests now use only the first discovered local store (existing
+ID ordering), matching Homebase's one-local-store advertisement; they no longer
+fill missing ranges from additional local stores.
+
+Version **0.15.0** adds timestamp JPEG thumbnails over media IPC. Requests support
+the same canonical/camera/received timelines and live/now anchors as frame reads,
+plus a required pixel bounding box. Images use a preceding keyframe and report its
+actual time. RAM tails, open shards, and finalized recordings are supported without
+thumbnail files or recording changes. See [the thumbnail wire API](MEDIA-PROTOCOL.md#timestamp-thumbnails-0150).
+Homebase may be upgraded first: it negotiates this optional capability and keeps
+ordinary frame playback working with older NVR builds. Install HBNVR separately.
 
 Open `HomeBase-NVR.xcodeproj` and select the shared `HomeBase-NVR` scheme.
 Run launches a local foreground agent; Stop in Xcode may leave a stale socket,
@@ -557,13 +653,40 @@ deadline: an operation that cannot drain within its existing three-second budget
 returns a pending-work error and can be retried after the work finishes. The queue
 limits still apply during a stall. An actual writer failure is reported immediately,
 with framework/underlying error codes but no error-userInfo secrets. Status preserves
-the first failure; secondary cleanup errors remain in the logs.
-A stalled/full/unavailable destination reports an error and
-stops accepting new media without blocking other stores or camera reception. There
-is no local-store disk-full fallback or automatic error recovery yet: fix the cause
-and run enable again (or disable/enable). Pending RAM is not durable; checkpoints
-reduce the open shard's recovery risk but do not eliminate it. A disabled store whose directory is unavailable
-still remains disabled, with a retention warning.
+the current recording failure; secondary cleanup errors remain in the logs.
+Video-write errors end only the affected camera's shard, preserve the existing file
+(subject to normal retention), and retry fresh shards on keyframes after 1, 2, 4,
+8, 16, then at most 30 seconds. Successful full shards reset the backoff. A full or
+unavailable disk is not a permanent stop: attempts continue until the cause clears.
+There is no alternate-disk fallback or unbounded RAM buffering; frames during an
+outage can be lost. Startup-unavailable destinations are also reopened automatically,
+with permissions and exclusive locks revalidated. Explicit disable/stop still wins.
+Queue overload drains/finalizes the accepted prefix and automatically resumes at
+new keyframes instead of appending across known dropped frames. Other stores and
+camera reception remain independent.
+
+Manifest errors do **not** stop MP4 writing. The writer retains the current shard's
+known metadata and tries its complete index entry after successful finalization.
+Failed final updates enter a metadata-only RAM queue capped at **16 entries per
+store**, retried on fresh SQLite connections with exponential backoff for **60
+seconds**, at most one queued attempt per second. Updates are idempotent, and retry
+does not interrupt newer active shards. Failures, recovery, and discarded updates
+are logged. Queue overflow, expiry, shutdown, or a crash can leave footage unindexed;
+discarding an update never deletes its video. No automatic historical backfill
+or replacement of a corrupt/foreign database is performed. Retention warnings are
+separate and retried every 30 seconds, without stopping recording or cleanup of
+other accessible files. Pending RAM is not durable; checkpoints reduce the open
+shard's recovery risk but do not eliminate it.
+
+Write, finalization, index, queue-overload, and retention errors also go to
+`<local root>/.hbnvr-errors.log`: UTC timestamps, camera IDs when applicable, and
+SQLite operation/primary/extended codes and OS errno when available. It inherits
+the root's private controller/daemon ACLs, with daemon ownership and mode `0600`.
+At approximately 1 MiB it rotates to `.hbnvr-errors.log.1`, replacing the prior
+rotated log. Both files are excluded from video retention. Logging is best-effort,
+not fsynced for every entry; failure to write it is reported via the normal agent
+log and status and never stops recording retries. Neither log contains SQL values,
+camera credentials, or raw framework error user-info.
 
 `status` reports each store's configured enablement, state, active recordings,
 completed shards, pending bytes, and last error. JSON also has `recordedFrames`
@@ -572,6 +695,13 @@ on agent restart or store reconfiguration, including disable/enable. Camera mode
 `record` means media is routed to at least one healthy enabled store; check store
 activity/completed shards to confirm actual recording. Agent readiness alone is
 not a guarantee of camera or storage health.
+Local `retrying` means no active writer is currently available; `degraded` permits
+ongoing recording while another camera or index/retention/logging needs attention.
+The JSON `local` object reports destination/camera retries, dropped queue events,
+and separate manifest, retention, and diagnostic-log warnings. A subsequent
+successful indexed shard/retry clears that camera's current manifest warning when
+no other updates remain pending; the log retains failures and discarded gaps.
+Earlier unindexed footage is not implicitly repaired.
 
 Tests generate both H.264 and H.265 video, shard it, and decode every output frame.
 They also cover permissions/ACL validation, duration parsing, retention scoping,
@@ -587,6 +717,11 @@ After reinstalling, verify an installed store can write as `_hbnvr` and the requ
 user can play/delete a completed MP4; local tests do not prove cross-account access.
 
 ## Continuous receiving
+
+Known protocol/lifecycle follow-ups are tracked in the
+[camera protocol hardening backlog](RTSP-HARDENING.md), with audit evidence and
+regression criteria. They are not established causes of the September 2026 camera
+outage, and the documented fixes are not yet implemented.
 
 Every running agent—system or local—opens **all enabled camera streams**. Adding
 a camera starts its receiver immediately; removing it closes the connection. Startup
@@ -612,7 +747,8 @@ deadlines are ten seconds; no complete video for fifteen seconds triggers a
 reconnect. Retry delays increase from 1 to 30 seconds and reset after 30 seconds of
 healthy video. Session keepalives honor the advertised timeout. A broken camera
 does not prevent other streams or IPC from working. Shutdown closes connections
-within a bounded interval, attempting TEARDOWN first.
+within a bounded interval. Normal shutdown attempts TEARDOWN, but some error/race
+paths currently close without acknowledged cleanup; see the hardening backlog above.
 
 ```sh
 hbnvr status
@@ -658,6 +794,10 @@ five seconds. It handles one active ordinary request at a time with a bounded li
 backlog. `cameras.watch` transfers an authenticated connection to a separate bounded
 subscription writer; it never occupies the ordinary request loop while watching.
 See [the subscription and write protocol](HOMEBASE-INTEGRATION.md#wire-contract).
+`media.open` similarly transfers a dedicated authenticated connection to a bounded
+media worker, switching to length-prefixed JSON/binary records for reusable range
+requests. Its deadlines and video framing are separate from ordinary command IPC;
+see [media protocol v1](MEDIA-PROTOCOL.md).
 
 System clients can reach the socket (0666), but the daemon checks kernel-provided
 peer credentials **before reading requests**. Only root or the configured controller
