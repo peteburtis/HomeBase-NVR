@@ -236,6 +236,10 @@ struct S3StoreStatus: Codable {
     var appliedRetentionDays: Int?
     var lifecycleState = "unverified"
     var lifecycleWarning: String?
+    var playbackWarning: String?
+    var pendingPlaybackManifests: Int?
+    var pendingThumbnails: Int?
+    var thumbnailWarning: String?
 }
 
 enum S3FailureKind: String, Codable, Sendable { case transient, network, destination, localRead }

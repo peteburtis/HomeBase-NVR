@@ -84,10 +84,10 @@ struct Status: ParsableCommand {
                         if let warning = local.errorLogWarning { print("    \(warning)") }
                     }
                     if let s3 = store.s3 {
-                        print("    Client-side encryption: \(s3.clientEncrypted == true ? "enabled for new shards" : "off for new shards")")
+                        print("    Client-side encryption: \(s3.clientEncrypted == true ? "enabled for new objects" : "off for new objects")")
                         print("    S3: \(s3.acceptingRecording ? "accepting recording" : "not accepting recording"); \(s3.spooling ? "spooling (" + s3.reasons.joined(separator: ", ") + ")" : "immediate uploads")")
                         print("    Uploads: \(s3.active) active, \(s3.queued) queued, \(s3.retrying) retrying, \(s3.confirmedUploads) confirmed")
-                        print("    RAM: \(s3.assemblingBytes) assembling + \(s3.residentBytes) finalized bytes; spool: \(s3.spoolCount) shards / \(s3.spoolBytes) bytes; unreadable: \(s3.unreadableSpoolCount ?? s3.quarantinedCount ?? 0)")
+                        print("    RAM: \(s3.assemblingBytes) assembling + \(s3.residentBytes) finalized bytes; spool: \(s3.spoolCount) objects / \(s3.spoolBytes) bytes; unreadable: \(s3.unreadableSpoolCount ?? s3.quarantinedCount ?? 0)")
                         if let path = s3.spoolDirectory {
                             print("    Spool directory: \(path)")
                             if let free = s3.spoolVolumeAvailableBytes, let capacity = s3.spoolVolumeCapacityBytes {
@@ -99,6 +99,10 @@ struct Status: ParsableCommand {
                         if let retry = s3.nextReadRetrySeconds { print("    Next spool read check: \(Int(retry.rounded(.up)))s") }
                         print("    Retention: desired \(s3.desiredRetentionDays)d; \(s3.lifecycleState)\(s3.appliedRetentionDays.map { " (\($0)d)" } ?? "")")
                         if let warning = s3.lifecycleWarning { print("    \(warning)") }
+                        if let pending = s3.pendingPlaybackManifests, pending > 0 { print("    Playback manifests: \(pending) pending publication") }
+                        if let warning = s3.playbackWarning { print("    \(warning)") }
+                        if let pending = s3.pendingThumbnails, pending > 0 { print("    Thumbnails: \(pending) rendering or awaiting upload") }
+                        if let warning = s3.thumbnailWarning { print("    \(warning)") }
                     }
                 }
             }
@@ -107,13 +111,13 @@ struct Status: ParsableCommand {
 }
 
 struct Decrypt: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Decrypt a downloaded .mp4.hbnvr recording locally. Prompts for its password; no AWS access or daemon required. Never overwrites output.")
-    @Argument(help: "Downloaded encrypted recording (one shard is held in RAM).") var input: String
-    @Argument(help: "New output MP4 path; the file is created with owner-only permissions.") var output: String
+    static let configuration = CommandConfiguration(abstract: "Decrypt a downloaded HBNVR-encrypted recording, thumbnail, or manifest locally. Prompts for its password; no AWS access or daemon required. Never overwrites output.")
+    @Argument(help: "Downloaded encrypted object (one complete object is held in RAM).") var input: String
+    @Argument(help: "New output path (MP4, JPEG, or JSON); created with owner-only permissions.") var output: String
     func run() throws { try command {
         let password = try CameraPrompt.line("Recording encryption password", secret: true)
         try RecordingEncryption.decryptFile(input: input, output: output, password: password)
-        print("Decrypted recording saved to \(output).")
+        print("Decrypted object saved to \(output).")
     } }
 }
 struct Agent: ParsableCommand {

@@ -1,4 +1,4 @@
-# S3 stores (0.7.6)
+# S3 stores (0.18.0)
 
 Use `hbnvr store add`, choose **S3**, and follow the same name/options/confirmation
 workflow as a local store. `change`, `list`, `enable`, `disable`, and `remove` accept
@@ -54,7 +54,8 @@ V1 supports existing, never-versioned general-purpose AWS S3 buckets, with
 bucket-default SSE-S3 (AES256) and S3 Standard uploads. Generated IAM ARNs follow
 the selected commercial, China, or GovCloud partition. A bucket with
 versioning Suspended is not a never-versioned bucket. No bucket creation, S3 Express,
-KMS, object retrieval, audio expansion, or local-store backfill is implemented.
+KMS, general-purpose object retrieval, audio expansion, or local-store backfill is implemented.
+The optional metadata-repair command below reads objects to rebuild S3 indexes and missing previews.
 
 Setup asks for name, bucket, region, visible/editable prefix, optional 12-digit expected
 owner account ID, shard duration (`1m`), retention (`1w`), and Managed/External
@@ -106,7 +107,7 @@ implement a password-derivation or cipher algorithm ourselves. See
 [AWS's supported client languages](https://docs.aws.amazon.com/amazon-s3-encryption-client/latest/developerguide/programming-languages.html)
 and [OWASP's PBKDF2 work-factor guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#pbkdf2).
 
-Complete MP4s are encrypted in RAM **before** entering the upload manager. Upload hashes,
+Complete MP4s and thumbnails are encrypted in RAM **before** entering the upload manager. Upload hashes,
 checksums, retries, and spool contents refer to the exact ciphertext. No plaintext media
 file is created by the S3 store. Encryption temporarily requires extra RAM for plaintext
 and ciphertext; shard sizing must allow for this overhead. Local stores are unaffected
@@ -156,7 +157,7 @@ spool manifest, object key, or original Mac. The binary format is:
 | 8–11 | Unsigned big-endian PBKDF2 iteration count, exactly 600000 in v1 |
 | 12–43 | 32-byte random PBKDF2 salt |
 | 44–55 | 12-byte AES-GCM nonce |
-| 56 through length−17 | Encrypted MP4 bytes |
+| 56 through length−17 | Encrypted content bytes (MP4, JPEG, or playback JSON) |
 | Final 16 bytes | AES-GCM authentication tag |
 
 Derive 32 bytes with PBKDF2-HMAC-SHA256 from the exact UTF-8 password (no normalization
@@ -167,6 +168,131 @@ derivation. The v1 AES-GCM plaintext limit is 2^36−32 bytes per shard. This do
 application envelope has interoperability tests against OpenSSL, not an external security
 audit or AWS Encryption Client compatibility. Retain the format specification and a
 working decrypt binary with long-term backups.
+
+## S3 thumbnails (0.18.0)
+
+Record one preview per camera at the **midpoint** of each UTC-aligned 20-minute tile:
+`:10`, `:30`, and `:50`. Select the closest available keyframe at or before that point,
+at most 120 seconds earlier. A recording that starts after the midpoint does not invent
+a preview for it. Selection uses canonical recording time, not wall-clock arrival or
+filename timestamps. Stream-epoch changes reset selection. Rendering runs off the
+recording queue, retaining only the latest compressed keyframe and a bounded render
+queue; there is no additional multi-minute buffer or normal-path image file.
+
+JPEGs fit within **1280×720**, preserve aspect ratio, never upscale, and use **80% quality**.
+The predictable key below the configured store prefix is:
+
+```
+.hbnvr/playback/v1/<lowercase camera UUID>/thumbnails/YYYY-MM-DD/HH-mm.jpg.hbnvr
+```
+
+Dates/minutes are UTC canonical midpoint times. Unencrypted stores use `.jpg` instead.
+The image's IPTC caption contains JSON: `format: "hbnvr-s3-thumbnail"`, `version: 1`,
+`storeID`, `cameraID`, `slot` (midpoint Unix seconds), and `timestamp` (actual keyframe
+Unix seconds). For encrypted stores the **whole JPEG**, caption included, uses the same
+authenticated HBNVR-PBE envelope and password as new recordings. Object existence,
+keys, size, and timing remain visible. Old images retain their original encryption;
+repair does not replace an existing plaintext or encrypted thumbnail name.
+
+A ready JPEG immediately enters the **same frozen-object upload pool as video shards**;
+it never waits for the containing shard to close or upload. Both kinds share concurrency,
+checksums, serial error retries, spooling policy, manual hold, target-volume free-space
+reserve, quota, restart replay, and confirmed-delivery-only deletion. Pending live video
+gets scheduling priority. Repair images use background slots, preserving the live slot.
+There is no second upload loop, cache directory, or thumbnail spool. Unconfirmed images
+are durably spooled on graceful shutdown. Quota exhaustion preserves accepted work and
+suspends new recording to that S3 store, just as for video. Failed image *generation*
+warns without stopping video; explicit repair can regenerate the missing preview.
+
+Upload/spool counters include both object kinds; completed **shards** still counts video.
+Status separately reports `pendingThumbnails` and `thumbnailWarning`. Spool metadata
+schema 2 identifies `thumbnail.jpg[.hbnvr]`; existing schema-1 video spool entries retain
+their format. Drain thumbnail work before downgrading to an older agent, which cannot
+replay schema-2 entries. Thumbnails do not create video manifest coverage. An image can
+exist before its video uploads, or after that video expires; it is not proof of playable
+footage. Lifecycle covers this same prefix and expires images by upload age, including
+late repair uploads. The normal writer IAM policy is unchanged; readers need only
+GetObject on the prefix. GUI retrieval of these objects is a separate client change.
+
+## Playback manifests (0.16.0)
+
+Normal recording maintains a **prospective index** of confirmed uploads. Previously
+uploaded objects are never automatically enumerated or guessed from their names.
+Version 0.18.0 extends the explicit repair workflow above to missing thumbnails as well.
+Normal recording still needs neither `ListBucket` nor `GetObject`; phone playback
+needs `GetObject` but no listing. Repair does not add deletion permissions.
+
+The authenticated NVR catalog adds optional `playbackManifestVersion: 1` to its S3
+destination, forwarded unchanged by Homebase. Old servers omit it. The stable keys
+below the store's exact configured prefix are:
+
+```
+.hbnvr/playback/v1/<lowercase camera UUID>/catalog.json
+.hbnvr/playback/v1/<lowercase camera UUID>/days/YYYY-MM-DD.json
+.hbnvr/playback/v1/<lowercase camera UUID>/months/YYYY-MM.json
+```
+
+Dates/periods use UTC, not the camera's display time zone. `.json` remains the suffix
+even for encrypted objects: inspect the `HBNVRE01` envelope magic. If store encryption
+is enabled, the complete JSON is protected by the same `hbnvr-pbe-v1` envelope as
+video. A password change republishes retained indexes under the new password; old
+video remains encrypted under its original password. Retain those old passwords.
+
+Every JSON document has `format: "hbnvr-s3-playback"`, `schemaVersion: 1`, `storeID`,
+`cameraID`, and `generatedAt` (Unix seconds). A catalog has `days`, each containing
+`day`, `start`, and `end`; bounds are the canonical union's outer limits for that
+day, **not a promise of continuous video**. A day/month document has `period` and
+`shards`. Each shard contains:
+
+- `id`, exact object `key`, uploaded `size`, lowercase hexadecimal `sha256`;
+- optional `encryption` (`hbnvr-pbe-v1`), describing the frozen object itself;
+- `timing`, the same versioned `ShardTimingMetadata` embedded in its MP4;
+- `endTicks`, the exclusive sample-zero-relative end at `timing.timescale`.
+
+For a selected timeline, frame time is that timeline's anchor plus sample ticks
+divided by the timescale. Object hashes cover ciphertext when encrypted. Each shard
+is listed in **every canonical UTC day it intersects**; readers deduplicate by shard
+ID. Monthly manifests contain full entries for closed UTC days, excluding today.
+Today uses its daily manifest. Late recovery updates its affected capture day(s),
+calendar month(s), and camera catalog; it does not rewrite intervening months.
+An ordinary shard affects one day/month; a boundary-crossing shard can affect both.
+Midnight closes the prior day even if no new shard arrives. Camera renaming changes
+future video keys but never index keys or pending entries' frozen video keys.
+
+The upload manager journals timing/key/hash metadata durably **before dropping the
+last local metadata copy of a confirmed upload**. The journal is daemon-private,
+0700 directories and 0600 records, at
+`/Library/Application Support/HomeBase-NVR/private/playback/<store UUID>` in system
+mode or `<runtime-dir>/playback/<store UUID>` locally. It is deliberately independent
+of the configurable external spool. No media or AWS/encryption secrets live in it.
+Metadata records are retained; they are not an object-expiration authority.
+
+One serialized manifest publisher per store snapshots a finite round of revisions,
+uploads period objects first, then the matching catalog. Incoming completions join
+the next round, preventing a busy recorder from starving catalog publication. Old
+acknowledgments cannot clear newer dirty revisions. Retries use a 60-second delay;
+they never read cloud indexes or interfere with recording/upload-error spooling.
+Restart reconstructs dirty indexes from the durable journal and republishes them.
+This renews **manifest object** age under S3 lifecycle, not recording object age.
+
+Manifest cloud failures report `playbackWarning` separately from upload and retention
+warnings; recording continues. A journal read/write/sync failure retains the completed
+recording in RAM or spool and retries persistence, rather than losing its only index
+information. Corrupt metadata is preserved and blocks rewriting an incomplete cloud
+index. RAM-only unjournaled work does not count as safe shutdown. Disabled stores drain
+indexes; removal refuses while publications remain pending. Shutdown does not wait
+for manifest network success because journal records already support restart replay.
+Uninstall preserves this private state. Deleting it loses searchable earlier cloud
+history; deleting video objects does not repair or rewrite the metadata automatically.
+
+Manifests can refer to expired or manually removed objects: expiration is asynchronous
+and controlled only by S3. A reader must handle missing/unreadable recordings explicitly.
+Without `ListBucket`, S3 can return 403 for a missing key; it is not proof of bad keys or
+proof of no video. No automatic cloud deletion or index reconstruction is introduced.
+Full monthly documents can reach tens of MiB with continuous minute shards. The GUI
+reader's bounded fetch limit applies to unusually dense/large indexes; shorter shard
+durations may exceed that limit. S3 thumbnail publication is described above; it does
+not alter these video manifests or local thumbnail IPC.
 
 ## Retention authority
 

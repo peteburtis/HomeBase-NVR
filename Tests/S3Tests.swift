@@ -20,6 +20,7 @@ actor FakeS3: S3Transport {
         try await withCheckedThrowingContinuation { pending[metadata.id] = $0 }
     }
     func reconcile(_ configuration: RecordingStoreConfiguration) async throws { lifecycleCalls += 1; if let lifecycleFailure { throw lifecycleFailure } }
+    func publishManifest(key: String, data: Data, storeID: String, cameraID: String) async throws {}
     func resolve(_ id: String, error: S3Failure? = nil) {
         guard let continuation = pending.removeValue(forKey: id) else { return }
         if let error { continuation.resume(throwing: error) } else { continuation.resume() }

@@ -5,7 +5,7 @@ import Foundation
 final class S3UploadManager: @unchecked Sendable {
     enum Lane { case live, replay, retry }
     final class Work {
-        let metadata: S3ShardMetadata
+        let metadata: S3ObjectMetadata
         var payload: S3Payload
         var lane: Lane
         let readyAt: Double
@@ -18,8 +18,9 @@ final class S3UploadManager: @unchecked Sendable {
         var uploadError: String?
         var persistenceError: String?
         var confirmedDelivery = false
+        var indexedDelivery = false
         var cleanupAt = 0.0
-        init(_ metadata: S3ShardMetadata, payload: S3Payload, lane: Lane, now: Double) {
+        init(_ metadata: S3ObjectMetadata, payload: S3Payload, lane: Lane, now: Double) {
             self.metadata = metadata; self.payload = payload; self.lane = lane; readyAt = now
         }
     }
@@ -31,14 +32,17 @@ final class S3UploadManager: @unchecked Sendable {
     private let date: () -> Date
     private let jitter: () -> Double
     private let changed: () -> Void
+    private let playback: S3PlaybackPublisher?
     private var work: [String: Work] = [:]
+    var pendingRepairKeys: Set<String> { Set(work.values.map { $0.metadata.key }) }
+    func hasPendingShard(_ id: String) -> Bool { work[id] != nil }
     private(set) var policy: S3UploadPolicy
     private(set) var suspended = false
     var lastError: String? {
         if let storageError { return storageError }
         if let scanError { return scanError }
         for item in work.values.sorted(by: { $0.metadata.capturedAt < $1.metadata.capturedAt }) {
-            if let error = item.persistenceError ?? item.uploadError { return "Shard \(item.metadata.id): \(error)" }
+            if let error = item.persistenceError ?? item.uploadError { return "\(item.metadata.thumbnail == nil ? "Shard" : "Thumbnail") \(item.metadata.id): \(error)" }
         }
         if let leaf = spool.damaged.first { return "Spool entry \(leaf): \(spool.readErrors[leaf]!). Retained; will retry reading." }
         return nil
@@ -58,20 +62,22 @@ final class S3UploadManager: @unchecked Sendable {
     var cameraCount = 0
     init(configuration: RecordingStoreConfiguration, spool: S3Spool, queue: DispatchQueue,
          factory: @escaping S3TransportFactory = AWSS3Transport.make,
+         playback: S3PlaybackPublisher? = nil,
          now: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }, date: @escaping () -> Date = Date.init,
          jitter: @escaping () -> Double = { Double.random(in: 0...1) }, changed: @escaping () -> Void = {}) {
         self.configuration = configuration; self.spool = spool; self.queue = queue; self.factory = factory
-        self.now = now; self.date = date; self.jitter = jitter; self.changed = changed
+        self.now = now; self.date = date; self.jitter = jitter; self.changed = changed; self.playback = playback
         policy = S3UploadPolicy(settings: configuration.s3!.settings)
         nextSpoolCheck = now() + configuration.s3!.settings.probeInterval
         volumeStatus = spool.mountedVolume
         for entry in spool.entries.values { work[entry.metadata.id] = Work(entry.metadata, payload: entry.payload, lane: .replay, now: now()) }
     }
     var outstanding: Bool { !work.isEmpty || !spool.damaged.isEmpty }
-    var safeToExit: Bool { work.values.allSatisfy { if $0.confirmedDelivery { return true }; if case .file = $0.payload { return true }; return false } }
+    var safeToExit: Bool { work.values.allSatisfy { if $0.confirmedDelivery && $0.indexedDelivery { return true }; if case .file = $0.payload { return true }; return false } }
     func update(_ config: RecordingStoreConfiguration) {
         let previous = configuration
         configuration = config; policy.settings = config.s3!.settings; spool.settings = policy.settings
+        playback?.update(config)
         if previous.s3?.credentials != config.s3?.credentials || previous.s3?.settings.requestTimeout != config.s3?.settings.requestTimeout { transportTask = nil }
         if previous.retentionPeriod != config.retentionPeriod || previous.s3?.lifecycle != config.s3?.lifecycle || previous.s3?.credentials != config.s3?.credentials {
             lifecycleTask?.cancel(); lifecycleTask = nil; lifecycleGeneration = UUID(); lifecycleDue = 0; appliedDays = nil
@@ -81,11 +87,13 @@ final class S3UploadManager: @unchecked Sendable {
         if policy.spooling { policy.nextProbe = now() }
         tick()
     }
-    func ready(_ metadata: S3ShardMetadata, data: Data) {
+    func ready(_ metadata: S3ObjectMetadata, data: Data, background: Bool = false) {
         guard work[metadata.id] == nil else { return }
-        work[metadata.id] = Work(metadata, payload: .memory(data), lane: .live, now: now())
+        work[metadata.id] = Work(metadata, payload: .memory(data), lane: background ? .replay : .live, now: now())
         tick()
     }
+    func containsObject(_ id: String) -> Bool { work[id] != nil }
+    var thumbnailKeys: Set<String> { Set(work.values.filter { $0.metadata.thumbnail != nil }.map { $0.metadata.key }) }
     func memoryPressure(_ warning: Bool) { policy.memoryPressure = warning; tick() }
     func tick() {
         let clock = now()
@@ -140,6 +148,7 @@ final class S3UploadManager: @unchecked Sendable {
         // replay. In-flight requests may finish; accepted bytes remain owned.
         guard !shutdown, !policy.settings.forceSpooling else { changed(); return }
         reconcileIfDue()
+        playback?.tick()
         let active = work.values.filter { $0.token != nil }
         if policy.spooling {
             if clock >= policy.nextProbe, !active.contains(where: { $0.probe }), active.count < policy.settings.concurrentUploads {
@@ -157,7 +166,8 @@ final class S3UploadManager: @unchecked Sendable {
         } else {
             while work.values.filter({ $0.token != nil }).count < policy.settings.concurrentUploads {
                 let queued = work.values.filter(eligible).sorted { $0.metadata.capturedAt < $1.metadata.capturedAt }
-                if let live = queued.first(where: { $0.lane == .live }) { dispatch(live); continue }
+                if let live = queued.first(where: { $0.lane == .live && $0.metadata.thumbnail == nil })
+                    ?? queued.first(where: { $0.lane == .live }) { dispatch(live); continue }
                 let running = work.values.filter { $0.token != nil }
                 guard running.filter({ $0.lane != .live }).count < policy.settings.concurrentUploads - policy.settings.reservedLiveSlots else { break }
                 if clock >= policy.retryAt, !running.contains(where: { $0.lane == .retry }), let retry = queued.filter({ $0.lane == .retry }).sorted(by: retryOrder).first { dispatch(retry); continue }
@@ -215,6 +225,10 @@ final class S3UploadManager: @unchecked Sendable {
     }
     private func cleanup(_ item: Work) {
         do {
+            if !item.indexedDelivery {
+                try playback?.record(item.metadata)
+                item.indexedDelivery = true
+            }
             // A previously failed publication may have left staging while the
             // retained RAM upload succeeded. Finish our own publication before
             // cleaning it, rather than abandoning those files after confirmation.
@@ -225,9 +239,12 @@ final class S3UploadManager: @unchecked Sendable {
             try spool.delivered(item.metadata.id); work[item.metadata.id] = nil
         }
         catch {
+            // A confirmed upload is not a replacement for the only durable
+            // copy of its index metadata. Persist RAM while journal writes retry.
+            if !item.indexedDelivery { persist(item) }
             item.lane = .retry; item.cleanupAt = now() + policy.settings.probeInterval
             item.uploadError = "S3 confirmed delivery; local cleanup will retry: " + ((error as? ServiceError)?.message ?? "filesystem failure")
-            spool.noteReadFailure(item.metadata.id, item.uploadError!)
+            if item.indexedDelivery { spool.noteReadFailure(item.metadata.id, item.uploadError!) }
         }
     }
     private func persist(_ item: Work) {
@@ -239,7 +256,7 @@ final class S3UploadManager: @unchecked Sendable {
             if item.lane == .live { item.lane = .replay }
         } catch {
             suspended = true
-            item.persistenceError = (error as? ServiceError)?.message ?? "Could not durably spool completed video; RAM-only work remains volatile."
+            item.persistenceError = (error as? ServiceError)?.message ?? "Could not durably spool completed upload object; RAM-only work remains volatile."
         }
     }
     private func persistRAM() {
@@ -248,6 +265,7 @@ final class S3UploadManager: @unchecked Sendable {
     func stopDispatch() {
         shutdown = true; policy.reasons.insert("shutdown")
         lifecycleTask?.cancel(); lifecycleTask = nil
+        playback?.stop()
         transportTask?.cancel()
         for item in work.values { item.task?.cancel() }
         persistRAM(); changed()
@@ -302,6 +320,8 @@ final class S3UploadManager: @unchecked Sendable {
         result.desiredRetentionDays = configuration.retentionDays; result.appliedRetentionDays = appliedDays
         result.lifecycleState = configuration.s3?.lifecycle == "External" ? "external/unverified" : (appliedDays == nil ? "unverified" : "applied")
         result.lifecycleWarning = lifecycleWarning
+        result.playbackWarning = playback?.warning
+        result.pendingPlaybackManifests = playback?.pendingPublications
         return result
     }
 }

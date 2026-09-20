@@ -22,6 +22,7 @@ final class MemoryMP4Shard: NSObject, AVAssetWriterDelegate, @unchecked Sendable
     private var initialization = false
     private var outputBytes: Int64 = 0
     private var finished = false
+    var endTicks: Int64 { ticks + duration }
     var residentBytes: Int64 { lock.lock(); defer { lock.unlock() }; return max(inputBytes, outputBytes) }
     init(codec: String, sets: [Data], clock: UInt32, timestamp: UInt32, capturedAt: Date = Date(), timing: ShardTimingMetadata? = nil) throws {
         guard clock > 0, clock <= Int32.max, ["H264", "H265"].contains(codec) else { throw ServiceError("Unsupported S3 video format.") }

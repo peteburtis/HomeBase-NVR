@@ -15,6 +15,11 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var pressure: DispatchSourceMemoryPressure?
     private var upload: S3UploadManager!
+    private var playback: S3PlaybackPublisher!
+    private let thumbnailQueue = DispatchQueue(label: "hbnvr.s3.thumbnail-render", qos: .utility)
+    private let thumbnailWork = DispatchGroup()
+    private var renderingThumbnails = Set<String>()
+    private var thumbnailWarning: String?
     private let log: (String) -> Void
     private var tracks: [String: Track] = [:]
     private var mediaConfiguration: RecordingStoreConfiguration
@@ -25,6 +30,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         var config: RecordingStoreConfiguration?
         var failed = false
         var clock = LocalRecordingClock()
+        var thumbnail = S3ThumbnailSelection()
     }
     init(configuration: RecordingStoreConfiguration, spoolRoot: String, factory: @escaping S3TransportFactory = AWSS3Transport.make,
          volumeReader: @escaping (String) throws -> S3SpoolVolume = S3SpoolVolume.read, log: @escaping (String) -> Void) throws {
@@ -34,7 +40,11 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         status = RecordingStoreStatus(id: configuration.id, name: configuration.name, enabled: configuration.enabled, state: configuration.enabled ? "recording" : "disabled")
         let spool = try S3Spool.open(storeID: configuration.id, defaultRoot: spoolRoot, settings: configuration.s3!.settings,
                                      clientEncrypted: configuration.s3?.clientEncryption?.enabled == true, volumeReader: volumeReader)
-        upload = S3UploadManager(configuration: configuration, spool: spool, queue: queue, factory: factory, changed: { [weak self] in self?.publishStatus() })
+        let indexPath = URL(fileURLWithPath: spoolRoot).deletingLastPathComponent().path + "/playback/" + configuration.id
+        let publisher = S3PlaybackPublisher(configuration: configuration, path: indexPath, queue: queue, factory: factory,
+            changed: { [weak self] in self?.publishStatus() })
+        playback = publisher
+        upload = S3UploadManager(configuration: configuration, spool: spool, queue: queue, factory: factory, playback: publisher, changed: { [weak self] in self?.publishStatus() })
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: 1, leeway: .milliseconds(100)); timer.setEventHandler { [weak self] in self?.upload.tick() }; timer.resume(); self.timer = timer
         let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical], queue: queue)
@@ -128,7 +138,30 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
             track.config = mediaConfiguration
         }
         try track.writer!.append(media.frame)
+        if let (frame, slot) = track.thumbnail.observe(media, sets: required.map { track.sets[$0]! }, time: observed.timing) {
+            makeThumbnail(frame, camera: camera, slot: slot, configuration: mediaConfiguration)
+        }
         lock.lock(); status.recordedFrames &+= 1; lock.unlock()
+    }
+    private func makeThumbnail(_ frame: S3ThumbnailSelection.Frame, camera: String, slot: Double, configuration: RecordingStoreConfiguration) {
+        let id = S3Thumbnail.id(store: configuration.id, camera: camera, slot: slot)
+        guard !renderingThumbnails.contains(id), !upload.containsObject(id) else { return }
+        guard renderingThumbnails.count < 32 else { thumbnailWarning = "Thumbnail render queue is full; video recording continues. Repair can fill the missing preview."; return }
+        renderingThumbnails.insert(id); thumbnailWork.enter()
+        thumbnailQueue.async { [self] in
+            let result = Result {
+                let sample = try S3Thumbnail.sample(frame.media, sets: frame.sets)
+                return try S3Thumbnail.render(sample, info: .init(storeID: configuration.id, cameraID: camera,
+                    slot: slot, timestamp: frame.time.canonicalUTC), store: configuration)
+            }
+            queue.async { [self] in
+                defer { renderingThumbnails.remove(id); thumbnailWork.leave(); publishStatus() }
+                switch result {
+                case .success(let (metadata, bytes)): upload.ready(metadata, data: bytes); thumbnailWarning = nil
+                case .failure: thumbnailWarning = "Thumbnail generation failed; video recording continues. Repair can retry the missing preview."
+                }
+            }
+        }
     }
     private func finish(_ track: Track, camera: String) throws {
         guard let writer = track.writer, let config = track.config else { return }
@@ -139,8 +172,9 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
             guard let password = config.s3?.clientEncryption?.password else { throw ServiceError("Encryption password unavailable; refusing plaintext recording.") }
             bytes = try RecordingEncryption.encrypt(bytes, password: password)
         }
-        let metadata = S3ShardMetadata.make(store: config, camera: camera, name: track.name, capturedAt: writer.capturedAt,
+        var metadata = S3ShardMetadata.make(store: config, camera: camera, name: track.name, capturedAt: writer.capturedAt,
             data: bytes, encrypted: encrypted, id: writer.timing?.shardID ?? UUID().uuidString)
+        metadata.timing = writer.timing; metadata.endTicks = writer.endTicks
         upload.ready(metadata, data: bytes)
         lock.lock(); status.completedShards &+= 1; lock.unlock()
     }
@@ -159,6 +193,8 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         upload.cameraCount = tracks.values.filter { $0.writer != nil }.count
         var detail = upload.snapshot(assemblingBytes: tracks.values.reduce(0) { $0 + ($1.writer?.residentBytes ?? 0) })
         detail.clientEncrypted = mediaConfiguration.s3?.clientEncryption?.enabled == true
+        detail.thumbnailWarning = thumbnailWarning
+        detail.pendingThumbnails = renderingThumbnails.count + upload.thumbnailKeys.count
         lock.lock(); defer { lock.unlock() }
         var next = RecordingStoreStatus(id: config.id, name: config.name, enabled: config.enabled,
             state: shuttingDown ? "stopping" : (upload.suspended ? "suspended" : (config.enabled ? (detail.spooling ? "spooling" : "recording") : "disabled")))
@@ -176,6 +212,10 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         guard flush(timeout: 0.1) else { return "Store is disabled but still finishing work; check status and retry." }
         let current = snapshot()
         guard let detail = current.s3 else { return "Store status is not yet ready; retry shortly." }
+        if (detail.pendingPlaybackManifests ?? 0) > 0 {
+            return "Playback manifests are still awaiting publication. Keep the disabled store configured until its cloud index drains; recording objects are already preserved."
+        }
+        if (detail.pendingThumbnails ?? 0) > 0 { return "Thumbnails are still rendering or awaiting delivery; keep this store configured until its upload pool drains." }
         let unreadable = detail.unreadableSpoolCount ?? 0
         guard detail.active == 0, detail.queued == 0, detail.volatileShards == 0, detail.spoolCount == 0,
               unreadable == 0, current.activeRecordings == 0 else {
@@ -193,8 +233,11 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
             shuttingDown = true; done.enter()
             queue.async { [self] in
                 timer?.cancel(); pressure?.cancel(); upload.stopDispatch(); finishTracks(); upload.stopDispatch()
-                lock.lock(); shutdownSafe = shutdownSafe && upload.safeToExit; lock.unlock()
-                publishStatus(); done.leave()
+                thumbnailWork.notify(queue: queue) { [self] in
+                    upload.stopDispatch()
+                    lock.lock(); shutdownSafe = shutdownSafe && upload.safeToExit; lock.unlock()
+                    publishStatus(); done.leave()
+                }
             }
         }
         lock.unlock()

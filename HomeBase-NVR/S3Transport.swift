@@ -13,8 +13,14 @@ import struct AwsCommonRuntimeKit.CRTError
 
 protocol S3Transport: Sendable {
     func validate(_ configuration: S3Configuration) async throws
-    func upload(_ metadata: S3ShardMetadata, payload: S3Payload) async throws
+    func upload(_ metadata: S3ObjectMetadata, payload: S3Payload) async throws
     func reconcile(_ configuration: RecordingStoreConfiguration) async throws
+    func publishManifest(key: String, data: Data, storeID: String, cameraID: String) async throws
+}
+extension S3Transport {
+    func publishManifest(key: String, data: Data, storeID: String, cameraID: String) async throws {
+        throw ServiceError("This transport does not support playback manifests.")
+    }
 }
 typealias S3TransportFactory = @Sendable (S3Configuration) async throws -> any S3Transport
 
@@ -91,6 +97,14 @@ private struct S3GuardedHTTP: HTTPClient {
 struct AWSS3Transport: S3Transport {
     let client: S3Client
     let configuration: S3Configuration
+    func publishManifest(key: String, data: Data, storeID: String, cameraID: String) async throws {
+        let encrypted = data.starts(with: RecordingEncryption.magic)
+        let metadata = S3ShardMetadata(id: UUID().uuidString, storeID: storeID, cameraID: cameraID,
+            bucket: configuration.bucket, region: configuration.region, expectedOwner: configuration.expectedOwner,
+            prefix: configuration.prefix, key: key, capturedAt: Date(), size: Int64(data.count),
+            sha256: S3ShardMetadata.hash(data), encryption: encrypted ? RecordingEncryption.format : nil)
+        try await upload(metadata, payload: .memory(data))
+    }
     static let make: S3TransportFactory = {
         do { return try await AWSS3Transport(configuration: $0) }
         catch { throw S3Failure(kind: .destination, message: "Cannot initialize the S3 client; check the stored destination and credentials.") }
@@ -120,9 +134,10 @@ struct AWSS3Transport: S3Transport {
         } catch { throw Self.classify(error) }
     }
     static func partSize(_ size: Int64) -> Int { Int(max(16 * 1024 * 1024, (size + 9999) / 10000)) }
-    func upload(_ m: S3ShardMetadata, payload: S3Payload) async throws {
+    func upload(_ m: S3ObjectMetadata, payload: S3Payload) async throws {
+        try m.validateKind()
         guard m.bucket == configuration.bucket, m.region == configuration.region, m.expectedOwner == configuration.expectedOwner,
-              m.prefix == configuration.prefix, m.key.hasPrefix(configuration.prefix), m.size == payload.size else { throw S3Failure(kind: .localRead, message: "Frozen shard destination or size does not match this store; retained for retry after repair.") }
+              m.prefix == configuration.prefix, m.key.hasPrefix(configuration.prefix), m.size == payload.size else { throw S3Failure(kind: .localRead, message: "Frozen upload destination or size does not match this store; retained for retry after repair.") }
         do {
             if m.size < 64 * 1024 * 1024 {
                 let body: ByteStream

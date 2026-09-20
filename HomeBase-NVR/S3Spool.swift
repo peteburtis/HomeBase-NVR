@@ -71,7 +71,9 @@ struct S3SpoolFileIdentity: Sendable {
     func matches(_ info: stat) -> Bool { device == info.st_dev && inode == info.st_ino }
 }
 
-struct S3ShardMetadata: Codable, Equatable, Sendable {
+/// A frozen upload object. Video-specific timing is optional; all object kinds
+/// share the same queues, checksums, retries, and durable spool.
+struct S3ObjectMetadata: Codable, Equatable, Sendable {
     var schemaVersion = 1
     let id: String
     let storeID: String
@@ -85,8 +87,25 @@ struct S3ShardMetadata: Codable, Equatable, Sendable {
     let size: Int64
     let sha256: String
     var encryption: String?
-    var payloadFileName: String { encryption == nil ? "video.mp4" : "video.mp4.hbnvr" }
-    var contentType: String { encryption != nil ? "application/octet-stream" : (key.hasSuffix(".mp4") ? "video/mp4" : "text/plain") }
+    // Frozen alongside the object bytes, so delayed replay can index the exact
+    // original media timeline without decoding or decrypting old recordings.
+    var timing: ShardTimingMetadata? = nil
+    var endTicks: Int64? = nil
+    var thumbnail: S3ThumbnailInfo? = nil
+    var payloadFileName: String { (thumbnail == nil ? "video.mp4" : "thumbnail.jpg") + (encryption == nil ? "" : ".hbnvr") }
+    var contentType: String { encryption != nil ? "application/octet-stream" : (thumbnail != nil ? "image/jpeg" : (key.hasSuffix(".mp4") ? "video/mp4" : (key.hasSuffix(".json") ? "application/json" : "text/plain"))) }
+    func validateKind() throws {
+        if let thumbnail {
+            try thumbnail.validate()
+            guard schemaVersion == 2, timing == nil, endTicks == nil, thumbnail.storeID == storeID, thumbnail.cameraID == cameraID,
+                  capturedAt.timeIntervalSince1970 == thumbnail.slot, size > 0,
+                  encryption == nil || encryption == RecordingEncryption.format,
+                  id == S3Thumbnail.id(store: storeID, camera: cameraID, slot: thumbnail.slot), size <= S3Thumbnail.maximumBytes + RecordingEncryption.overhead,
+                  key == S3Thumbnail.key(prefix: prefix, camera: cameraID, slot: thumbnail.slot, encrypted: encryption != nil) else {
+                throw ServiceError("Invalid frozen thumbnail object.")
+            }
+        } else if schemaVersion != 1 { throw ServiceError("Unsupported upload object kind.") }
+    }
     static func make(store: RecordingStoreConfiguration, camera: String, name: String, capturedAt: Date, data: Data, encrypted: Bool = false, id: String = UUID().uuidString) -> Self {
         let s3 = store.s3!
         let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.timeZone = TimeZone(secondsFromGMT: 0)
@@ -98,6 +117,8 @@ struct S3ShardMetadata: Codable, Equatable, Sendable {
     }
     static func hash(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 }
+// Existing recording call sites and schema-1 journals retain source/wire compatibility.
+typealias S3ShardMetadata = S3ObjectMetadata
 
 enum S3Payload: Sendable {
     case memory(Data)
@@ -124,7 +145,7 @@ enum S3Payload: Sendable {
 }
 
 struct S3SpoolEntry: Sendable {
-    let metadata: S3ShardMetadata
+    let metadata: S3ObjectMetadata
     let directory: String
     let fileIdentity: S3SpoolFileIdentity
     var payload: S3Payload { .file(directory + "/" + metadata.payloadFileName, metadata.size, identity: fileIdentity) }
@@ -372,9 +393,11 @@ final class S3Spool {
                 guard fstat(manifestFD, &manifestInfo) == 0, manifestInfo.st_size <= 65536 else { throw ServiceError("Invalid spool metadata size.") }
                 let manifest = try FileHandle(fileDescriptor: manifestFD, closeOnDealloc: false).read(upToCount: 65537) ?? Data()
                 guard manifest.count <= 65536 else { throw ServiceError("Oversized spool metadata.") }
-                let metadata = try JSONDecoder().decode(S3ShardMetadata.self, from: manifest)
+                let metadata = try JSONDecoder().decode(S3ObjectMetadata.self, from: manifest)
                 try S3Configuration(bucket: metadata.bucket, region: metadata.region, prefix: metadata.prefix, expectedOwner: metadata.expectedOwner).validate()
-                guard metadata.schemaVersion == 1, metadata.storeID == storeID, metadata.id == id,
+                try metadata.validateKind()
+                guard metadata.storeID == storeID, metadata.id == id,
+                      (metadata.timing == nil) == (metadata.endTicks == nil),
                       metadata.encryption == nil || metadata.encryption == RecordingEncryption.format,
                       UUID(uuidString: metadata.cameraID) != nil, metadata.size > 0,
                       metadata.key.hasPrefix(metadata.prefix), metadata.key.utf8.count <= 1024, metadata.sha256.count == 64,
@@ -418,7 +441,8 @@ final class S3Spool {
         }
         try refreshUsage()
     }
-    func publish(_ metadata: S3ShardMetadata, data: Data) throws -> S3SpoolEntry {
+    func publish(_ metadata: S3ObjectMetadata, data: Data) throws -> S3SpoolEntry {
+        try metadata.validateKind()
         try validateLocation()
         if requiresEncryption {
             guard metadata.encryption == RecordingEncryption.format else { throw ServiceError("Refusing to spool plaintext on an ignore-ownership volume; completed shard retained in RAM.") }
