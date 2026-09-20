@@ -13,6 +13,12 @@ struct Request: Codable {
     var storeOriginal: RecordingStoreConfiguration? = nil
     var setupID: String? = nil
     var saveDisabled: Bool? = nil
+    var repairID: String? = nil
+    var repairCredentials: S3RepairCredentials? = nil
+    var repairPassword: String? = nil
+    var repairSkipEncrypted: Bool? = nil
+    var repairBegin: Bool? = nil
+    var repairDryRun: Bool? = nil
     var recordingStarted: Bool? = nil
     var homebaseDeviceID: String? = nil
     var nvrInstanceID: String? = nil
@@ -37,6 +43,7 @@ struct Reply: Codable {
     var stores: [RecordingStoreConfiguration]? = nil
     var store: RecordingStoreConfiguration? = nil
     var setup: S3SetupStatus? = nil
+    var repair: S3RepairStatus? = nil
     var cameraSnapshot: NVRCameraSnapshot? = nil
     var mediaSession: MediaSessionInfo? = nil
     var playbackSnapshot: PlaybackSnapshot? = nil
@@ -197,6 +204,7 @@ final class AgentServer {
         authorize: { [weak self] uid in self?.authorization.permits(uid: uid) ?? false })
     private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, log: { [weak self] message in self?.log(message) })
     private let setupJobs: S3SetupJobs
+    private let repairJobs: S3RepairJobs
     private let transportFactory: S3TransportFactory
     private lazy var streams = StreamingCoordinator(log: { [weak self] message in self?.log(message) }, record: { [weak self] event in self?.recordings.accept(event) })
     var stores: RecordingStoreRepository {
@@ -210,9 +218,15 @@ final class AgentServer {
     }
     private let cancellation = Cancellation()
     private let logger = Logger(subsystem: "com.graygoolabs.hbnvr", category: "agent")
-    init(directory: String, authorization: Authorization, system: Bool, transportFactory: @escaping S3TransportFactory = AWSS3Transport.make) {
+    init(directory: String, authorization: Authorization, system: Bool, transportFactory: @escaping S3TransportFactory = AWSS3Transport.make,
+         repairFactory: @escaping S3RepairReaderFactory = AWSS3RepairReader.make) {
         self.directory = directory; self.authorization = authorization; self.system = system
         self.transportFactory = transportFactory; setupJobs = S3SetupJobs(factory: transportFactory)
+        let repairLogger = Logger(subsystem: "com.graygoolabs.hbnvr", category: "repair")
+        repairJobs = S3RepairJobs(factory: repairFactory, log: { message in
+            if system { repairLogger.notice("\(message, privacy: .public)") }
+            else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
+        })
     }
     private func log(_ message: String) {
         if system { logger.notice("\(message, privacy: .public)") }
@@ -245,7 +259,7 @@ final class AgentServer {
         }
         defer { sources.forEach { $0.cancel() } }
         var cleanedUp = false
-        defer { if !cleanedUp { setupJobs.stop(); streams.stop(); recordings.stop() } }
+        defer { if !cleanedUp { setupJobs.stop(); repairJobs.stop(); streams.stop(); recordings.stop() } }
         let initialStores = try stores.list()
         recordings.load(initialStores)
         let initialCameras = try cameras.configurations()
@@ -269,6 +283,7 @@ final class AgentServer {
         playbackCatalog.stop()
         mediaSessions.stop()
         setupJobs.stop()
+        repairJobs.stop()
         let shutdownDeadline = ProcessInfo.processInfo.systemUptime + 45
         recordings.beginShutdown()
         streams.stop()
@@ -295,7 +310,7 @@ final class AgentServer {
                 if request.operation.hasPrefix("cameras."), let values = try? cameras.configurations() {
                     try? cameraEvents.replace(values)
                 }
-                if request.operation.hasPrefix("cameras.") || request.operation.hasPrefix("stores."),
+                if request.operation.hasPrefix("cameras.") || (request.operation.hasPrefix("stores.") && !request.operation.hasPrefix("stores.repair.")),
                    let values = try? cameras.configurations(), let configs = try? stores.list() {
                     playbackCatalog.replace(stores: configs, cameras: values)
                 }
@@ -389,9 +404,25 @@ final class AgentServer {
                 streams.add(id: id, camera: camera)
                 if !camera.enabled || !camera.recordingStarted { try recordings.drain() }
             case "stores.list": reply.stores = try stores.list().map(\.summary)
+            case "stores.repair.start.v1", "stores.repair.start.v2":
+                guard let id = request.storeID, let config = try stores.list().first(where: { $0.id == id }), config.type == "S3" else {
+                    throw ServiceError("Select an existing S3 store for metadata repair.")
+                }
+                let cameraStore = cameras, ids = Set(try cameraStore.configurations().map(\.0))
+                let sink = try recordings.repairSink(config: config, cameras: ids, cameraStillExists: { id in
+                    try cameraStore.configurations().contains { $0.0 == id }
+                })
+                reply.repair = try repairJobs.start(config: config, cameras: ids, sink: sink, uid: uid, dryRun: request.repairDryRun == true)
+            case "stores.repair.poll", "stores.repair.cancel", "stores.repair.resume":
+                guard let id = request.repairID else { throw ServiceError("Repair job ID is required.") }
+                if request.operation == "stores.repair.poll" { reply.repair = try repairJobs.poll(id, uid: uid) }
+                else if request.operation == "stores.repair.cancel" { reply.repair = try repairJobs.cancel(id, uid: uid) }
+                else { reply.repair = try repairJobs.resume(id, uid: uid, credentials: request.repairCredentials,
+                    password: request.repairPassword, skipEncrypted: request.repairSkipEncrypted == true, begin: request.repairBegin == true) }
             case "stores.spool.on", "stores.spool.off", "stores.advanced.change":
                 let id = request.storeID ?? request.store?.id
                 guard let id, let old = try stores.list().first(where: { $0.id == id }), old.type == "S3" else { throw ServiceError("Select an S3 store for spooling or advanced settings.") }
+                try repairJobs.requireIdle(id)
                 guard uid == 0 || uid == old.ownerUID else { throw ServiceError(.permission, "Only the store owner or root may change these options.") }
                 var config = old
                 if request.operation == "stores.advanced.change" {
@@ -413,6 +444,7 @@ final class AgentServer {
             case "stores.setup.start", "stores.setup.start.v2", S3SetupJobs.startOperation:
                 guard var draft = request.store, draft.type == "S3", uid != 0 else { throw ServiceError(.permission, "Run S3 setup as the requesting user.") }
                 let configs = try stores.list(), old = configs.first { $0.id == draft.id }
+                try repairJobs.requireIdle(draft.id)
                 guard request.operation == S3SetupJobs.startOperation ||
                         ((old?.schemaVersion ?? 1) < 4 && draft.schemaVersion < 4 && draft.s3?.settings.forceSpooling != true) else {
                     throw ServiceError(.incompatible, "This store uses manual-spooling-aware configuration; update the CLI before editing it.")
@@ -434,6 +466,7 @@ final class AgentServer {
                 else if request.operation == "stores.setup.poll" { reply.setup = try setupJobs.poll(id, uid: uid) }
                 else {
                     let progress = try setupJobs.poll(id, uid: uid)
+                    try repairJobs.requireIdle(progress.storeID)
                     let old = try stores.list().first { $0.id == progress.storeID }
                     let config = try setupJobs.prepared(id, uid: uid, saveDisabled: request.saveDisabled == true, current: old)
                     try stores.save(config, replacing: old != nil)
@@ -466,6 +499,7 @@ final class AgentServer {
                 reply.store = config.summary
             case "stores.enable", "stores.disable", "stores.remove":
                 guard let id = request.storeID, var config = try stores.list().first(where: { $0.id == id }) else { throw ServiceError("Unknown recording store.") }
+                try repairJobs.requireIdle(id)
                 if request.operation == "stores.remove" {
                     try recordings.remove(id)
                     do { try stores.remove(id) }

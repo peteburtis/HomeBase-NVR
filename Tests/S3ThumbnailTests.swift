@@ -2,6 +2,27 @@ import XCTest
 import AVFoundation
 import ImageIO
 
+private actor ThumbnailRepairReader: S3RepairReading {
+    let object: S3RepairObject
+    let data: Data
+    var extras: [S3RepairObject] = []
+    var reads = 0
+    init(_ metadata: S3ObjectMetadata, _ data: Data) {
+        object = .init(key: metadata.key, size: metadata.size, etag: "test")
+        self.data = data
+    }
+    func add(_ key: String) { extras.append(.init(key: key, size: 100, etag: "existing")) }
+    func list(after: String?) -> S3RepairPage {
+        // Put previews on a LATER page to prove filtering waits for all pages.
+        after == nil ? .init(objects: [object], next: "page2") : .init(objects: extras, next: nil)
+    }
+    func read(_ object: S3RepairObject) -> Data { reads += 1; return data }
+}
+private actor ThumbnailRepairSink {
+    var images: [(S3ObjectMetadata, Data)] = []
+    func accept(_ metadata: S3ObjectMetadata, _ data: Data) -> Bool { images.append((metadata, data)); return true }
+}
+
 final class S3ThumbnailTests: XCTestCase {
     let slot = 1_789_733_400.0
     func fixture(_ c: RecordingStoreConfiguration, camera: String, count: Int = 45, codec: CMVideoCodecType = kCMVideoCodecType_H264) throws -> [EncodedMedia] {
@@ -190,5 +211,67 @@ final class S3ThumbnailTests: XCTestCase {
             XCTAssertEqual(Array(types.suffix(2)), [object.contentType, object.contentType])
             XCTAssertEqual(paths.suffix(2).first, paths.last) // Stable key with SDK SHA-256 framing checked by fixture.
         }
+    }
+    func testRepairFillsThumbnailForAlreadyIndexedVideoButDoesNotTouchExistingThumbnail() async throws {
+        for existing in [false, true] {
+            let helper = S3Tests(), c = try helper.config(), camera = UUID().uuidString
+            let samples = try fixture(c, camera: camera, codec: kCMVideoCodecType_HEVC), first = samples.first!
+            let timing = ShardTimingMetadata(storeID: c.id, cameraID: camera, media: first, time: first.time!)
+            let writer = try MemoryMP4Shard(codec: first.codec, sets: first.parameterSets, clock: first.clockRate, timestamp: first.frame.timestamp, timing: timing)
+            for sample in samples { try writer.append(sample.frame) }
+            let bytes = try writer.finish()
+            var metadata = S3ObjectMetadata.make(store: c, camera: camera, name: "Old name", capturedAt: first.receivedAt, data: bytes, id: timing.shardID)
+            metadata.timing = timing; metadata.endTicks = writer.endTicks
+            let shard = S3PlaybackShard(id: metadata.id, key: metadata.key, size: metadata.size, sha256: metadata.sha256, encryption: nil, timing: timing, endTicks: writer.endTicks)
+            let reader = ThumbnailRepairReader(metadata, bytes), images = ThumbnailRepairSink()
+            if existing { await reader.add(S3Thumbnail.key(prefix: c.s3!.prefix, camera: camera, slot: slot, encrypted: false)) }
+            let key = metadata.key
+            let sink = S3RepairSink(knownKeys: { [key] }, merge: { _, _ in false }, publish: { _ in },
+                indexedShards: { [key: shard] }, thumbnail: { object, data, _ in await images.accept(object, data) })
+            let jobs = S3RepairJobs(factory: { _, _ in reader }); defer { jobs.stop() }
+            let job = try jobs.start(config: c, cameras: [camera], sink: sink, uid: geteuid(), dryRun: false)
+            let preview = try await S3RepairTests().wait(jobs, job.id, for: "ready")
+            XCTAssertEqual(preview.candidates, existing ? 0 : 1)
+            try S3RepairTests().begin(jobs, job.id)
+            let done = try await S3RepairTests().wait(jobs, job.id, for: "completed")
+            XCTAssertEqual(done.thumbnailsQueued, existing ? 0 : 1)
+            let reads = await reader.reads, generated = await images.images
+            XCTAssertEqual(reads, existing ? 0 : 1); XCTAssertEqual(generated.count, existing ? 0 : 1)
+        }
+    }
+    func testRepairOldCiphertextCreatesThumbnailWithCurrentPasswordAndHonorsCancellation() async throws {
+        var c = try S3Tests().config(); c.s3?.clientEncryption = .init(password: "current-password")
+        let camera = UUID().uuidString, samples = try fixture(c, camera: camera), first = samples[0]
+        let timing = ShardTimingMetadata(storeID: c.id, cameraID: camera, media: first, time: first.time!)
+        let writer = try MemoryMP4Shard(codec: first.codec, sets: first.parameterSets, clock: first.clockRate,
+            timestamp: first.frame.timestamp, timing: timing)
+        for sample in samples { try writer.append(sample.frame) }
+        let bytes = try RecordingEncryption.encrypt(writer.finish(), password: "old-password")
+        var metadata = S3ObjectMetadata.make(store: c, camera: camera, name: "Camera", capturedAt: first.receivedAt,
+            data: bytes, encrypted: true, id: timing.shardID)
+        metadata.timing = timing; metadata.endTicks = writer.endTicks
+        let candidate = try XCTUnwrap(S3RepairCandidate.parse(.init(key: metadata.key, size: metadata.size, etag: "test"),
+            prefix: c.s3!.prefix, cameras: [camera]))
+        let cancellation = Cancellation(), sink = ThumbnailRepairSink()
+        try await S3RepairMedia.thumbnails(bytes, candidate: candidate, store: c, passwords: ["old-password"],
+            metadata: metadata, slots: [slot], cancellation: cancellation) { object, image in
+                _ = await sink.accept(object, image)
+            }
+        let images = await sink.images
+        XCTAssertEqual(images.count, 1)
+        XCTAssertTrue(images[0].0.key.hasSuffix(".jpg.hbnvr"))
+        let jpeg = try RecordingEncryption.decrypt(images[0].1, password: "current-password")
+        XCTAssertNotNil(CGImageSourceCreateWithData(jpeg as CFData, nil))
+        XCTAssertThrowsError(try RecordingEncryption.decrypt(images[0].1, password: "old-password"))
+        cancellation.stop()
+        do {
+            try await S3RepairMedia.thumbnails(bytes, candidate: candidate, store: c, passwords: ["old-password"],
+                metadata: metadata, slots: [slot], cancellation: cancellation) { _, _ in XCTFail("Cancelled repair accepted a thumbnail") }
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {} // No output from the cancelled attempt.
+        let publisher = S3PlaybackPublisher(configuration: c, path: "/private/tmp/unused-thumbnail-journal-" + UUID().uuidString,
+            queue: DispatchQueue(label: "thumbnail-index-exclusion"), factory: { _ in FakeS3() })
+        try publisher.record(images[0].0)
+        XCTAssertTrue(publisher.entries.isEmpty); XCTAssertEqual(publisher.pendingPublications, 0)
     }
 }

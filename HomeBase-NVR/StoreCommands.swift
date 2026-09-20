@@ -3,7 +3,7 @@ import Foundation
 import Darwin
 
 struct Store: ParsableCommand {
-    static let configuration = CommandConfiguration(abstract: "Configure recording stores. Enabled stores receive enabled cameras whose recording state is started.", subcommands: [StoreAdd.self, StoreList.self, StoreChange.self, StoreEnable.self, StoreDisable.self, StoreRemove.self, StoreSpool.self])
+    static let configuration = CommandConfiguration(abstract: "Configure recording stores. Enabled stores receive enabled cameras whose recording state is started.", subcommands: [StoreAdd.self, StoreList.self, StoreChange.self, StoreEnable.self, StoreDisable.self, StoreRemove.self, StoreSpool.self, StoreRepairMetadata.self])
 }
 struct StoreTarget: ParsableArguments {
     @Option(help: "Local agent runtime directory; omit for the installed service.") var runtimeDir: String?

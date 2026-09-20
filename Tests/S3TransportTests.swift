@@ -10,6 +10,7 @@ import Smithy
 /// only its HTTP engine. It cannot contact AWS or any other network destination.
 actor S3HTTPFixture: HTTPClient {
     var calls: [(String, String)] = []
+    var requestPaths: [String] = []
     var failureCode: String?
     var failureStatus: HTTPStatusCode = .forbidden
     var failPart = false
@@ -35,6 +36,7 @@ actor S3HTTPFixture: HTTPClient {
         if delay > 0 { try await Task.sleep(for: .seconds(delay)) }
         let query = request.queryItems?.map(\.name).sorted().joined(separator: ",") ?? ""
         calls.append((request.method.rawValue, query))
+        requestPaths.append(request.destination.path)
         ownerHeaders.append(request.headers.value(for: "x-amz-expected-bucket-owner"))
         if request.method == .put, !query.contains("lifecycle"), !query.contains("partNumber") {
             // Pull like a real HTTP engine, then validate framing before acting
@@ -133,6 +135,27 @@ final class S3TransportTests: XCTestCase {
         }
     }
     func config() throws -> RecordingStoreConfiguration { var c = try S3Tests().config(); c.s3?.expectedOwner = "123456789012"; return c }
+    func testSDKPreservesRawKeysAcrossUploadReplayAndManifestPublication() async throws {
+        var c = try config(); c.s3?.prefix = "Entrée + %20 &/"
+        let engine = S3HTTPFixture(), transport = try await AWSS3Transport(configuration: c.s3!, httpClient: engine)
+        let bytes = Data("synthetic encoded-key fixture".utf8), camera = UUID().uuidString
+        let m = S3ShardMetadata.make(store: c, camera: camera, name: "Room + %2B #?", capturedAt: Date(), data: bytes)
+        let root = "/private/tmp/hbnvr-key-spool-" + UUID().uuidString
+        try SecureFiles.ensureDirectory(root, owner: geteuid(), mode: 0o700)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let spool = try S3Spool(path: root + "/spool", storeID: c.id, settings: c.s3!.settings)
+        _ = try spool.publish(m, data: bytes)
+        let restarted = try S3Spool(path: root + "/spool", storeID: c.id, settings: c.s3!.settings)
+        let recovered = try XCTUnwrap(restarted.entries[m.id])
+        XCTAssertEqual(recovered.metadata.key, m.key)
+        try await transport.upload(m, payload: .memory(bytes))
+        try await transport.upload(recovered.metadata, payload: recovered.payload)
+        let key = S3PlaybackPublisher.root(prefix: c.s3!.prefix, camera: camera) + "catalog.json"
+        try await transport.publishManifest(key: key, data: Data("{}".utf8), storeID: c.id, cameraID: camera)
+        let paths = await engine.requestPaths
+        XCTAssertEqual(paths, [m.key, m.key, key].map { "/" + S3RepairHTTP.encoded($0) })
+        XCTAssertTrue(m.key.contains("Room + %2B #?"))
+    }
     func testSDKUploadsFrozenCiphertextAndChecksumFromRAMAndDisk() async throws {
         // Current settings have no password: replay of an older encrypted shard
         // must still deliver its original body without decoding/re-encrypting it.
@@ -186,20 +209,30 @@ final class S3TransportTests: XCTestCase {
         let c = try config(), engine = S3HTTPFixture(), transport = try await AWSS3Transport(configuration: c.s3!, httpClient: engine)
         await engine.setFailPart(true)
         let data = Data(repeating: 0, count: 64 * 1024 * 1024)
-        let m = S3ShardMetadata.make(store: c, camera: UUID().uuidString, name: "Test", capturedAt: Date(), data: data)
+        let m = S3ShardMetadata.make(store: c, camera: UUID().uuidString, name: "Entrée + %20", capturedAt: Date(), data: data)
         do { try await transport.upload(m, payload: .memory(data)); XCTFail("Failure was swallowed") } catch { XCTAssertEqual(AWSS3Transport.classify(error).kind, .transient) }
         for _ in 0..<100 { if await engine.calls.count >= 3 { break }; try await Task.sleep(for: .milliseconds(10)) }
         let calls = await engine.calls
         XCTAssertEqual(calls.count, 3)
         XCTAssertEqual(calls[0].1, "uploads"); XCTAssertTrue(calls[1].1.contains("partNumber")); XCTAssertEqual(calls[2].0, "DELETE")
+        let abortedPaths = await engine.requestPaths
+        XCTAssertEqual(abortedPaths, Array(repeating: "/" + S3RepairHTTP.encoded(m.key), count: 3))
+        await engine.setFailPart(false)
+        try await transport.upload(m, payload: .memory(data))
+        let completedPaths = await engine.requestPaths, completedCalls = await engine.calls
+        XCTAssertTrue(completedPaths.allSatisfy { $0 == "/" + S3RepairHTTP.encoded(m.key) })
+        XCTAssertEqual(completedCalls.last?.0, "POST"); XCTAssertEqual(completedCalls.last?.1, "uploadId")
     }
     func testSDKLifecyclePreservesUnrelatedRuleAndVerifies() async throws {
-        var c = try config(); c.s3?.lifecycle = "Managed"
+        var c = try config(); c.s3?.lifecycle = "Managed"; c.s3?.prefix = "Entrée + %20 &/"
         let engine = S3HTTPFixture(), transport = try await AWSS3Transport(configuration: c.s3!, httpClient: engine)
         try await transport.reconcile(c)
         let xml = await engine.lifecycle
         XCTAssertTrue(xml.contains("unrelated")); XCTAssertTrue(xml.contains("other/")); XCTAssertTrue(xml.contains("<Days>90</Days>"))
         XCTAssertTrue(xml.contains("<Days>7</Days>")); XCTAssertTrue(xml.contains("<DaysAfterInitiation>1</DaysAfterInitiation>"))
+        let document = try XMLDocument(xmlString: xml)
+        let prefixes = try document.nodes(forXPath: "//*[local-name()='Prefix']").compactMap(\.stringValue)
+        XCTAssertTrue(prefixes.contains(c.s3!.prefix), "Lifecycle XML must preserve the raw prefix, not URL/form-decode it")
         let puts = await engine.lifecyclePuts; XCTAssertEqual(puts, 1)
         try await transport.reconcile(c)
         let putsAgain = await engine.lifecyclePuts; XCTAssertEqual(putsAgain, 1)

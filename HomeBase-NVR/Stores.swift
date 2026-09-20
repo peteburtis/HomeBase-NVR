@@ -215,6 +215,12 @@ final class RecordingStoreManager: @unchecked Sendable {
             }
         }
     }
+    func repairSink(config: RecordingStoreConfiguration, cameras: Set<String>,
+                    cameraStillExists: @escaping @Sendable (String) throws -> Bool) throws -> S3RepairSink {
+        lock.lock(); let store = destinations[config.id] as? S3RecordingStore; lock.unlock()
+        guard let store else { throw ServiceError("The S3 store is unavailable. Resolve its startup/storage error before repairing metadata.") }
+        return store.repairSink(expected: config, cameras: cameras, cameraStillExists: cameraStillExists)
+    }
     func accept(_ event: RecordingEvent) {
         lock.lock(); let values = Array(destinations.values); lock.unlock()
         for store in values where store.configuration.enabled { store.accept(event) }

@@ -59,6 +59,70 @@ checksums with the separate administrator. Never-versioned buckets plus same-key
 mean an ambiguous upload can overwrite identical bytes. Multipart parts abandoned by a
 crash are cleaned asynchronously by lifecycle, not reconstructed by HBNVR.
 
+## Opt-in thumbnails and metadata repair smoke (0.18.0)
+
+For download failures, install matching 0.18.2 (or newer) CLI/agent builds and rerun the same
+repair command. Capture the `Download diagnostic [...]` lines and final skip totals.
+Up to three examples per reason are printed and logged; they contain byte counts
+and hashed ETag summaries, not credentials, footage, or raw object paths. HTTP
+404/412 and HTTP-200 size/ETag failures are distinct. A zero-recovery scan must say
+that no new metadata or thumbnails were recovered, not claim a successful merge.
+Version 0.18.2 also fixes false 404 skips when listings encode spaces as `+`.
+For an isolated key-encoding smoke, use camera names containing spaces, literal `+`,
+literal `%20`, and Unicode; repair must request the exact original objects and leave
+their names untouched. Do not rename existing footage to work around this bug.
+
+Before repair, keep the isolated synthetic/test camera recording across a canonical
+UTC :10, :30, or :50 midpoint. With separate reader credentials, retrieve
+`<prefix>.hbnvr/playback/v1/<camera UUID lowercase>/thumbnails/YYYY-MM-DD/HH-mm.jpg.hbnvr`
+(or `.jpg` without encryption). Decrypt with `hbnvr decrypt INPUT OUTPUT.jpg` and
+verify a valid JPEG no larger than 1280×720, original aspect, no upscaling, and a
+caption containing the midpoint plus actual preceding keyframe time. Use a long
+shard for this check: the thumbnail should upload before that shard closes.
+
+Force spooling before another midpoint. Verify both `thumbnail.jpg.hbnvr` and
+`video.mp4.hbnvr` entries live under the SAME selected spool directory, share its
+quota/free-space reporting, and resume through bounded replay after `spool --off`.
+Restart while held to check both kinds survive; no normal-path JPEG cache should exist.
+Use separate reader/admin keys to compare the exact frozen ciphertext before/after
+replay. Never give recorder keys object reads to perform this check.
+
+Use only the isolated agent and explicitly designated test destination above. Do not
+delete production metadata to test repair. Keep the cameras configured.
+
+1. With the test store disabled and drained, stop its agent. Back up and move aside
+   **only** its `<runtime-dir>/playback/<test-store UUID>` journal, retaining the backup
+   outside the runtime directory. Restart the isolated agent. The original MP4 objects
+   remain on S3. This simulates missing metadata without deleting video.
+2. Run `hbnvr store repair-metadata "Test S3 store" --dry-run --runtime-dir PATH`.
+   The recorder's write-only keys should be denied listing. Use a separate temporary
+   reader principal with precisely the printed ListBucket/GetObject policy.
+   Verify the count/download estimate, no GETs of video, no manifest PUTs from repair,
+   and that saved store credentials are unchanged.
+3. Run without `--dry-run`, supply temporary reader keys again, and confirm. Check
+   independent reader/admin credentials can retrieve the resulting daily/monthly
+   manifests and play recovered full/short and encrypted/plain shards.
+   Verify sample-derived start/end times and canonical source; no video ETag should change.
+4. Put a harmless unrelated test object and a legacy MP4 without embedded timing in the
+   designated test prefix. Rerun: both must remain byte-for-byte unchanged and unindexed.
+   Unknown cameras are similarly ignored. Camera display-name changes must not block
+   files whose embedded camera UUID still matches.
+5. Repeat repair: indexed objects with their expected thumbnails present should not
+   be downloaded again. For a synthetic recording covering a midpoint but lacking its
+   thumbnail, retain the video journal and verify repair downloads only that needed
+   source and adds a preview through the shared pool. Compare all preexisting image
+   ETags: no existing thumbnail may be overwritten. A rerun should skip this source
+   once its image is pending or listed. Test a wrong old
+   password and choose skip; the original ciphertext remains. Cancel during a read:
+   previously merged entries remain, later candidates do not merge, and IPC status
+   remains responsive. Resume recording during another repair to exercise shared
+   publication without dropping live entries.
+
+No deletion permission is needed by either recorder or temporary repair reader. Cloud
+publication still uses the saved write-only credentials; the temporary principal must
+not gain PutObject. Read/transfer charges apply. Do not restore an old journal over a
+running agent; preserve the test backup until results have been checked.
+
 For a controlled manual-spooling test (no network-disconnect required):
 
 ```sh

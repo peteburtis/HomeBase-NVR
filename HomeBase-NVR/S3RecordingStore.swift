@@ -204,6 +204,59 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         next.lastError = upload.lastError ?? mediaError; next.s3 = detail; status = next
     }
     func snapshot() -> RecordingStoreStatus { lock.lock(); defer { lock.unlock() }; return status }
+    func repairSink(expected: RecordingStoreConfiguration, cameras: Set<String>,
+                    cameraStillExists: @escaping @Sendable (String) throws -> Bool) -> S3RepairSink {
+        S3RepairSink(knownKeys: { [self] in
+            try await repairOperation(expected: expected) {
+                try self.playback.repairKnownKeys().union(self.upload.pendingRepairKeys)
+            }
+        }, merge: { [self] metadata, cancellation in
+            try await repairOperation(expected: expected, cancellation: cancellation) {
+                guard cameras.contains(metadata.cameraID), try cameraStillExists(metadata.cameraID) else { throw S3RepairSkip.identityMismatch }
+                // An ambiguously acknowledged live upload can already be on S3.
+                // Its own frozen timing must win over reconstructed container ticks.
+                if self.upload.hasPendingShard(metadata.id) { return false }
+                if let existing = self.playback.entries[metadata.id] {
+                    guard existing.shard.key == metadata.key, existing.shard.sha256 == metadata.sha256 else { throw S3RepairSkip.conflict }
+                    return false
+                }
+                try self.playback.record(metadata); self.playback.tick(); self.publishStatus(); return true
+            }
+        }, publish: { [self] cancellation in
+            try await repairOperation(expected: expected, cancellation: cancellation) {
+                try self.playback.repairRepublish(cameras: cameras); self.publishStatus()
+            }
+        }, indexedShards: { [self] in
+            try await repairOperation(expected: expected) {
+                _ = try self.playback.repairKnownKeys()
+                return Dictionary(uniqueKeysWithValues: self.playback.entries.values.map { ($0.shard.key, $0.shard) })
+            }
+        }, thumbnailKeys: { [self] in
+            try await repairOperation(expected: expected) { self.upload.thumbnailKeys }
+        }, thumbnail: { [self] metadata, bytes, cancellation in
+            try await repairOperation(expected: expected, cancellation: cancellation) {
+                guard try cameraStillExists(metadata.cameraID) else { throw S3RepairSkip.identityMismatch }
+                guard !self.upload.suspended else { throw ServiceError("S3 storage is suspended; repair paused before accepting more thumbnails. Resolve its spool error and rerun.") }
+                guard !self.upload.containsObject(metadata.id) else { return false }
+                try metadata.validateKind()
+                self.upload.ready(metadata, data: bytes, background: true); self.publishStatus(); return true
+            }
+        })
+    }
+    private func repairOperation<T>(expected: RecordingStoreConfiguration, cancellation: Cancellation? = nil,
+                                    _ operation: @escaping () throws -> T) async throws -> T {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                do {
+                    lock.lock(); let stopping = shuttingDown; lock.unlock()
+                    guard !stopping, cancellation?.isStopped != true else { throw CancellationError() }
+                    guard configuration == expected else { throw ServiceError("Store changed during repair; restart repair with its current configuration.") }
+                    continuation.resume(returning: try operation())
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
     func removable() -> Bool {
         drainBlocker() == nil
     }

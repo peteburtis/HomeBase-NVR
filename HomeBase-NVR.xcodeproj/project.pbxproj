@@ -8,6 +8,9 @@
 
 /* Begin PBXBuildFile section */
         D00000000000000000000002 = {isa = PBXBuildFile; fileRef = D00000000000000000000001; };
+        CF0000000000000000000002 = {isa = PBXBuildFile; fileRef = CF0000000000000000000001; };
+        CF0000000000000000000004 = {isa = PBXBuildFile; fileRef = CF0000000000000000000003; };
+        CF0000000000000000000006 = {isa = PBXBuildFile; fileRef = CF0000000000000000000005; };
         CE0000000000000000000002 = {isa = PBXBuildFile; fileRef = CE0000000000000000000001; };
         CD0000000000000000000002 = {isa = PBXBuildFile; fileRef = CD0000000000000000000001; };
         CC0000000000000000000002 = {isa = PBXBuildFile; fileRef = CC0000000000000000000001; };
@@ -67,6 +70,9 @@
 
 /* Begin PBXFileReference section */
         D00000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Thumbnail.swift"; sourceTree = SOURCE_ROOT; };
+        CF0000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Repair.swift"; sourceTree = SOURCE_ROOT; };
+        CF0000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3RepairMedia.swift"; sourceTree = SOURCE_ROOT; };
+        CF0000000000000000000005 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3RepairTransport.swift"; sourceTree = SOURCE_ROOT; };
         CE0000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3PlaybackManifest.swift"; sourceTree = SOURCE_ROOT; };
         CD0000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/MediaThumbnail.swift"; sourceTree = SOURCE_ROOT; };
         CC0000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/PlaybackCatalog.swift"; sourceTree = SOURCE_ROOT; };
@@ -260,6 +266,9 @@
 			buildActionMask = 2147483647;
 			files = (
         D00000000000000000000002,
+        CF0000000000000000000002,
+        CF0000000000000000000004,
+        CF0000000000000000000006,
         CE0000000000000000000002,
         CC0000000000000000000002,
         CD0000000000000000000002,

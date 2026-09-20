@@ -85,6 +85,7 @@ final class S3PlaybackManifestTests: XCTestCase {
         let decoded = try JSONDecoder().decode(S3PlaybackDocument.self, from: JSONEncoder().encode(doc))
         XCTAssertEqual(decoded.shards?.first?.key, m.key)
         XCTAssertTrue(m.key.contains("Room + %2B"))
+        XCTAssertNotNil(S3RepairCandidate.parse(.init(key: m.key, size: 3, etag: "example"), prefix: c.s3!.prefix, cameras: [camera]))
         let thumbnailKey = S3Thumbnail.key(prefix: c.s3!.prefix, camera: camera, slot: S3Thumbnail.firstSlot(atOrAfter: at), encrypted: true)
         XCTAssertTrue(thumbnailKey.hasPrefix(c.s3!.prefix))
         XCTAssertTrue(S3Thumbnail.listed(thumbnailKey, prefix: c.s3!.prefix, cameras: [camera]))

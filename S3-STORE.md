@@ -214,6 +214,110 @@ footage. Lifecycle covers this same prefix and expires images by upload age, inc
 late repair uploads. The normal writer IAM policy is unchanged; readers need only
 GetObject on the prefix. GUI retrieval of these objects is a separate client change.
 
+## Explicit metadata repair (0.18.0)
+
+```sh
+hbnvr store repair-metadata "S3 recordings" --dry-run
+hbnvr store repair-metadata "S3 recordings"
+hbnvr store repair-metadata                 # interactive picker
+# Add --runtime-dir PATH for an isolated foreground agent.
+```
+
+This is an opt-in reconstruction of playback metadata, not video repair, migration,
+or object cleanup. It works while the store records or is disabled. Install the
+matching CLI and agent. The selected store must be operational enough to open its
+private spool/journal; repair does not bypass an existing storage error.
+
+1. List only the store's configured bucket/prefix using the saved recorder credentials.
+   If S3 denies access, print an IAM policy for `s3:ListBucket` on the exact bucket,
+   conditioned on the exact requested prefix, and `s3:GetObject` within that prefix.
+   Prompt for temporary access key, hidden secret, and optional hidden session token.
+   These credentials are used only for reading, stay in agent RAM, and never replace
+   saved writer keys. A network failure stops repair instead of requesting more privilege.
+   An expected-owner or bucket-policy denial can also produce the credential prompt;
+   check those settings rather than repeatedly supplying keys.
+2. Match HBNVR shard names to **currently configured camera UUIDs**. Display names may
+   have changed. Ignore manifest/setup objects, other cameras, unknown layouts, and
+   oversized files. Preserve pending uploads. After all listing pages are read, skip
+   already journaled video unless a midpoint thumbnail is missing. Preserve every
+   existing recognized thumbnail name without downloading or overwriting it, even
+   if its contents are unreadable. Unknown image objects are also left untouched.
+   Preview candidate count and maximum initial download bytes, then ask for confirmation.
+   `--dry-run` stops here: it does not download, decrypt, or certify recoverability.
+3. Read one whole object at a time with its listed ETag as an If-Match condition.
+   Authenticate encrypted envelopes using the configured password. If necessary, ask
+   for an old password or offer to skip unreadable encrypted objects. A corrupt
+   encrypted envelope can be indistinguishable from a wrong password. No plaintext
+   media is written to disk. Network traffic, S3 requests, and CPU work may incur costs.
+4. Validate embedded timing, store/camera/shard identities, H.264/H.265 sample timestamps,
+   keyframe start, and the existing no-B-frame constraint. Recover all recorded timeline
+   anchors, canonical source, duration from sample timings, exact key, size, and SHA-256
+   of the original stored bytes. Never infer duration from file size or adjacent names.
+   Missing/unsupported timing, legacy files, changed objects, and invalid media are
+   skipped. **All footage and unexpected objects remain untouched**, including skipped
+   objects. Repair creates no quarantine or deletion state.
+5. Merge each recovered entry durably on the existing store queue, sharing the normal
+   serialized daily/monthly/catalog publisher with live uploads. Existing or pending
+   recording metadata wins. Only expected playback manifest keys are rewritten, using
+   saved writer credentials and the current manifest encryption password. Final
+   publication also refreshes already journaled entries for currently configured cameras.
+   Completion means a durable merge and queued publication, not confirmed cloud delivery;
+   check the separate playback warning/pending count in `hbnvr status`.
+   A scan that recovers nothing explicitly reports no new metadata/thumbnails;
+   existing journal entries may still be republished.
+6. For missing midpoint previews, reuse the downloaded object, decode only the preceding
+   keyframes, and submit completed JPEGs to the same upload/spool pool as recordings.
+   Use current store encryption and saved writer credentials, never the temporary reader
+   principal for PUTs. This also works when the video's manifest entry already exists.
+   The preview estimate includes indexed files needing images; no extra download of
+   the same video is needed for thumbnail generation during that attempt.
+
+Re-running is safe and skips indexed work with all expected thumbnails present or pending.
+In 0.18.1, download diagnostics distinguish `notFound` (HTTP 404),
+`preconditionFailed` (HTTP 412), `sizeMismatch`, `etagMissing`, and `etagMismatch`.
+The last three mean GET returned HTTP 200 but failed validation. CLI progress and
+daemon logs retain the first three examples of each reason (at most 15 per job),
+with exact skip totals at completion. Examples identify the candidate number and
+shard UUID, list expected/received bytes and Content-Length, and summarize ETags
+by length, quoting, and a truncated SHA-256 fingerprint. No raw ETag, object path,
+request/response body, credential, or password is logged. Diagnostic samples stay
+in the existing expiring job state; no extra on-disk diagnostic file is created.
+This instrumentation does not relax validation or change which videos are skipped.
+
+### S3 key representation (0.18.2 audit)
+
+Object keys and prefixes are raw Unicode strings in configuration, IAM resources,
+lifecycle rules, spool sidecars, playback journals/manifests, thumbnails, and Homebase
+discovery metadata. They are not URLs and must not be percent-decoded or form-decoded.
+SDK requests encode these strings for the wire; the restricted repair/GUI HTTP adapters
+preserve the SDK's already-encoded path and query rather than encoding them again.
+Pagination tokens are opaque strings, also left unchanged before SDK request encoding.
+
+The exception is `ListObjectsV2` with `EncodingType=url`: decode returned object keys
+once, replacing bare `+` with space **before** percent decoding. Thus `Room+Camera`
+becomes `Room Camera`, `%2B` remains a literal plus, and `%2520` remains literal `%20`.
+Earlier repair versions interpreted space-as-plus as a different key, producing false
+HTTP 404 skips for normal camera-name folders. Version 0.18.2 corrects only this LIST
+boundary; existing uploads and objects do not need renaming. Synthetic SDK regressions
+cover LIST-to-GET, prefixes/pagination, multipart completion/abort, spool replay, manifest
+journaling/publication, and lifecycle XML. The GUI's raw-key GET path and Homebase's
+metadata forwarding require no runtime changes.
+
+Ctrl-C cancels remaining reads/merges, but already accepted metadata and thumbnails
+remain and can still publish. Active jobs block store edits,
+enable/disable, spooling changes, and removal; they do not stop recording. Jobs are
+bound to the initiating UID/account UUID and expire after 15 minutes without a client
+poll. IPC remains responsive while listing/downloading. Removing a camera during repair
+prevents subsequent merges for that camera.
+
+Limits: 256 MiB per object, one in-memory object at a time (plus decryption/AVFoundation
+overhead), 100,000 candidates, and 10,000 listing pages per run. Requests time out after
+60 seconds; transient failures leave accepted work intact for a rerun, not an automatic
+retry storm. Password retries can download a file again, exceeding the preview estimate.
+Corrupt local journal records are preserved and must be resolved separately; repair
+will not publish an incomplete journal over a cloud index. Deleted/unrecoverable timing
+cannot be recreated. This command does not rebuild local SQLite manifests.
+
 ## Playback manifests (0.16.0)
 
 Normal recording maintains a **prospective index** of confirmed uploads. Previously
