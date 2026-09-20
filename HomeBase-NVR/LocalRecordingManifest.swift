@@ -6,9 +6,22 @@ import SQLite3
 /// Owned by one local-store worker. Readers use separate read-only connections.
 final class LocalRecordingManifest {
     static let filename = ".hbnvr-manifest.sqlite"
-    static let schemaVersion: Int64 = 1
+    static let schemaVersion: Int64 = 2
     private static let applicationID: Int64 = 0x48424e4d // HBNM
     enum State: String { case recording, complete, interrupted }
+    /// Last recorded identity, independent of configuration and directory names.
+    struct CameraMetadata: Equatable {
+        let name: String
+        let homebaseDeviceID: String?
+        var updatedAt: Double = Date().timeIntervalSince1970
+        func validate() throws {
+            guard CameraConfiguration.printable(name, limit: 80),
+                  !name.trimmingCharacters(in: .whitespaces).isEmpty, updatedAt.isFinite,
+                  homebaseDeviceID.map({ CameraConfiguration.printable($0, limit: 512) && $0.hasPrefix("camera-") }) ?? true else {
+                throw ServiceError("Invalid manifest camera metadata.")
+            }
+        }
+    }
     struct Recording {
         let id: String
         let filename: String
@@ -24,6 +37,27 @@ final class LocalRecordingManifest {
         let size: Int64
         let timing: ShardTimingMetadata
         var end: Double { start + Double(endTicks) / Double(timescale) }
+    }
+    /// Facts retained by the current writer, not reconstructed from files later.
+    struct Seed {
+        let temporaryName: String
+        let finalName: String
+        let timing: ShardTimingMetadata
+        let camera: CameraMetadata
+    }
+    struct FileIdentity: Equatable {
+        let device: Int64
+        let inode: Int64
+        let size: Int64
+        init(_ info: stat) {
+            device = Int64(info.st_dev); inode = Int64(bitPattern: info.st_ino); size = info.st_size
+        }
+    }
+    struct Completion {
+        let seed: Seed
+        let endTicks: Int64
+        let frames: Int64
+        let file: FileIdentity
     }
     struct Interval: Equatable {
         let start: Double
@@ -45,7 +79,7 @@ final class LocalRecordingManifest {
     private var databaseInode: ino_t = 0
 
     init(directory: LocalRecordingLayout.Directory, identity: LocalRecordingLayout.Identity,
-         owner: uid_t, readOnly: Bool = false) throws {
+         owner: uid_t, readOnly: Bool = false, recoverInterrupted: Bool = true) throws {
         self.directory = directory; self.owner = owner; self.readOnly = readOnly
         self.identity = identity
         try LocalRecordingLayout.verify(path: directory.path, fd: directory.fd, owner: owner)
@@ -99,11 +133,13 @@ final class LocalRecordingManifest {
                             timing_json TEXT NOT NULL)
                         """)
                     try execute("CREATE INDEX recording_time ON recordings(start_utc)")
+                    try createCameraMetadata()
                 }
                 guard fsync(directory.fd) == 0 else { throw ServiceError.posix("Persist local manifest directory entry") }
             }
+            let version = try scalar("PRAGMA user_version")
             guard try scalar("PRAGMA application_id") == Self.applicationID,
-                  try scalar("PRAGMA user_version") == Self.schemaVersion else {
+                  [1, Self.schemaVersion].contains(version) else {
                 throw ServiceError("Unsupported local manifest format; existing database and recordings were preserved.")
             }
             let identityStatement = try prepare("SELECT store_id, camera_id FROM identity WHERE singleton=1")
@@ -114,9 +150,18 @@ final class LocalRecordingManifest {
                 throw ServiceError("Local manifest belongs to a different camera or store; it was not changed.")
             }
             if !readOnly {
+                if version == 1 {
+                    // Add identity only; never infer or backfill recording times.
+                    try transaction {
+                        try createCameraMetadata()
+                        try execute("PRAGMA user_version=\(Self.schemaVersion)")
+                    }
+                }
                 // A previous process's accepted frames are not proof of a safely
                 // finalized container. Never promote them by inspecting old media.
-                try execute("UPDATE recordings SET state='interrupted' WHERE state='recording'")
+                if recoverInterrupted {
+                    try execute("UPDATE recordings SET state='interrupted' WHERE state='recording'")
+                }
             }
         } catch {
             if let database { sqlite3_close_v2(database) }; database = nil
@@ -125,16 +170,47 @@ final class LocalRecordingManifest {
     }
     deinit { if let database { sqlite3_close_v2(database) } }
 
+    private func createCameraMetadata() throws {
+        try execute("CREATE TABLE camera_metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), name TEXT NOT NULL, homebase_device_id TEXT, updated_utc REAL NOT NULL)")
+    }
+    func cameraMetadata() throws -> CameraMetadata? {
+        try checkFiles()
+        guard try scalar("PRAGMA user_version") >= 2 else { return nil }
+        let statement = try prepare("SELECT name,homebase_device_id,updated_utc FROM camera_metadata WHERE singleton=1")
+        defer { sqlite3_finalize(statement) }
+        let code = sqlite3_step(statement)
+        if code == SQLITE_DONE { return nil }
+        guard code == SQLITE_ROW else { throw failure("read camera identity", code) }
+        let value = CameraMetadata(name: string(statement, 0),
+            homebaseDeviceID: sqlite3_column_type(statement, 1) == SQLITE_NULL ? nil : string(statement, 1),
+            updatedAt: sqlite3_column_double(statement, 2))
+        try value.validate(); return value
+    }
+    func hasIndexedRecordings() throws -> Bool {
+        try checkFiles()
+        return try scalar("SELECT EXISTS(SELECT 1 FROM recordings LIMIT 1)") != 0
+    }
+
     func begin(id: String, temporaryName: String, finalName: String, start: Date,
-               timescale: UInt32, sourceTimestamp: UInt32, timing: ShardTimingMetadata) throws {
+               timescale: UInt32, sourceTimestamp: UInt32, timing: ShardTimingMetadata,
+               cameraMetadata: CameraMetadata? = nil) throws {
         guard UUID(uuidString: id) != nil, validLeaf(temporaryName), validLeaf(finalName),
               temporaryName == finalName + ".recording", timescale > 0,
               start.timeIntervalSince1970.isFinite else { throw ServiceError("Invalid local recording metadata.") }
         try timing.validate()
+        try cameraMetadata?.validate()
         guard timing.shardID == id, timing.storeID == identity.storeID, timing.cameraID == identity.cameraID,
               timing.timescale == timescale, timing.rtpTimestamp == sourceTimestamp,
               timing.time.canonicalUTC == start.timeIntervalSince1970 else { throw ServiceError("Shard timing does not match its manifest row.") }
         try transaction {
+            if let cameraMetadata {
+                try execute("""
+                    INSERT INTO camera_metadata VALUES (1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET
+                    name=excluded.name,homebase_device_id=excluded.homebase_device_id,updated_utc=excluded.updated_utc
+                    WHERE name!=excluded.name OR homebase_device_id IS NOT excluded.homebase_device_id
+                    """, [.text(cameraMetadata.name), cameraMetadata.homebaseDeviceID.map(Value.text) ?? .null,
+                          .real(cameraMetadata.updatedAt)])
+            }
             try execute("INSERT INTO recordings (id,filename,final_filename,start_utc,timescale,source_timestamp,state,camera_utc,received_utc,canonical_source,timing_json) VALUES (?,?,?,?,?,?,'recording',?,?,?,?)",
                 [.text(id), .text(temporaryName), .text(finalName), .real(start.timeIntervalSince1970),
                  .integer(Int64(timescale)), .integer(Int64(sourceTimestamp)),
@@ -172,27 +248,119 @@ final class LocalRecordingManifest {
     func interrupt(id: String) throws {
         try transaction { try execute("UPDATE recordings SET state='interrupted' WHERE id=? AND state='recording'", [.text(id)]) }
     }
+    /// Idempotent retry of an in-process writer's confirmed finalization. A fresh
+    /// connection must not mark another, currently recording shard interrupted.
+    /// Never overwrite conflicting rows or adopt a replaced/truncated video.
+    func completeRetained(_ value: Completion) throws {
+        let seed = value.seed, timing = seed.timing
+        try timing.validate(); try seed.camera.validate()
+        guard validLeaf(seed.finalName), seed.temporaryName == seed.finalName + ".recording",
+              timing.storeID == identity.storeID, timing.cameraID == identity.cameraID,
+              value.endTicks > 0, value.frames > 0, value.file.size > 0 else {
+            throw ServiceError("Invalid retained manifest completion.")
+        }
+        var info = stat()
+        guard fstatat(directory.fd, seed.finalName, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+            throw ServiceError.posix("Inspect retained finalized recording")
+        }
+        try validate(info, name: seed.finalName)
+        guard FileIdentity(info) == value.file else {
+            throw ServiceError("Finalized recording changed before manifest retry; file and index were preserved.")
+        }
+        try transaction {
+            var existing: Recording?
+            try visitRecordings(Self.recordingSelect + " WHERE id=?", [.text(timing.shardID)], limit: 1) {
+                existing = $0; return true
+            }
+            if let row = existing {
+                guard row.finalFilename == seed.finalName, row.timing == timing,
+                      [seed.temporaryName, seed.finalName].contains(row.filename), row.frames <= value.frames else {
+                    throw ServiceError("Manifest retry conflicts with an existing recording; index was preserved.")
+                }
+                if row.state == .complete {
+                    guard row.filename == seed.finalName, row.frames == value.frames, row.endTicks == value.endTicks,
+                          row.device == value.file.device, row.inode == value.file.inode, row.size == value.file.size else {
+                        throw ServiceError("Manifest retry conflicts with a completed recording; index was preserved.")
+                    }
+                    return // The earlier commit succeeded, even if its acknowledgment did not.
+                }
+                try execute("UPDATE recordings SET filename=final_filename,state='complete',end_ticks=?,frames=?,file_device=?,file_inode=?,file_size=? WHERE id=?",
+                    [.integer(value.endTicks), .integer(value.frames), .integer(value.file.device),
+                     .integer(value.file.inode), .integer(value.file.size), .text(timing.shardID)])
+            } else {
+                try execute("""
+                    INSERT INTO recordings (id,filename,final_filename,start_utc,timescale,source_timestamp,
+                        end_ticks,frames,state,file_device,file_inode,file_size,camera_utc,received_utc,canonical_source,timing_json)
+                    VALUES (?,?,?,?,?,?,?,?,'complete',?,?,?,?,?,?,?)
+                    """, [.text(timing.shardID), .text(seed.finalName), .text(seed.finalName), .real(timing.time.canonicalUTC),
+                          .integer(Int64(timing.timescale)), .integer(Int64(timing.rtpTimestamp)),
+                          .integer(value.endTicks), .integer(value.frames), .integer(value.file.device),
+                          .integer(value.file.inode), .integer(value.file.size), timing.time.cameraUTC.map(Value.real) ?? .null,
+                          .real(timing.time.receivedUTC), .text(timing.time.canonicalSource.rawValue), .text(try timing.json())])
+            }
+            // Replaying an older shard must not undo a newer camera rename/binding.
+            try execute("""
+                INSERT INTO camera_metadata VALUES (1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET
+                name=excluded.name,homebase_device_id=excluded.homebase_device_id,updated_utc=excluded.updated_utc
+                WHERE excluded.updated_utc>=camera_metadata.updated_utc AND
+                    (name!=excluded.name OR homebase_device_id IS NOT excluded.homebase_device_id)
+                """, [.text(seed.camera.name), seed.camera.homebaseDeviceID.map(Value.text) ?? .null, .real(seed.camera.updatedAt)])
+        }
+    }
     /// Called only AFTER a successful retention unlink. A crash between the two
     /// leaves a stale row, which availability queries exclude by checking the file.
     func remove(filename: String) throws {
         try transaction { try execute("DELETE FROM recordings WHERE filename=? OR final_filename=?", [.text(filename), .text(filename)]) }
     }
     func recordings() throws -> [Recording] { try readRecordings() }
-    private func readRecordings(from start: Double? = nil, to end: Double? = nil) throws -> [Recording] {
-        try checkFiles()
-        var sql = "SELECT id,filename,final_filename,start_utc,timescale,source_timestamp,end_ticks,frames,state,file_device,file_inode,file_size,timing_json FROM recordings"
+    func playbackRecordings(from start: Double, to end: Double, timeline: MediaTimeline) throws -> [Recording] {
+        try readRecordings(from: start, to: end, timeline: timeline, limit: MediaLimits.candidates)
+    }
+    /// Walk nearest-first without loading the archive or guessing from filenames.
+    /// Continue past expired/replaced files. Hitting a bound is an error, never
+    /// evidence that we reached the beginning or end of retained history.
+    func visitNeighbors(at point: Double, previous: Bool, timeline: MediaTimeline, work: MediaWork,
+                        visit: (Recording) throws -> Bool) throws {
+        let column = timeline.column
+        let end = "\(column)+CAST(end_ticks AS REAL)/timescale"
+        let predicate = previous ? "\(column)<?" : "(state='recording' OR \(end)>?)"
+        // Active rows' checkpoint durations are not their readable frontier.
+        // Inspect them first; the provider compares actual ranges with complete rows.
+        let order = previous ? "MIN(\(end),?) DESC,\(column) DESC,id" : "\(column),id"
+        let sql = Self.recordingSelect + " WHERE state IN ('complete','recording') AND \(column) IS NOT NULL AND \(predicate) ORDER BY (state='recording') DESC,\(order)"
+        try visitRecordings(sql, [.real(point)] + (previous ? [.real(point)] : []), limit: MediaLimits.candidates, work: work, visit: visit)
+    }
+    private static let recordingSelect = "SELECT id,filename,final_filename,start_utc,timescale,source_timestamp,end_ticks,frames,state,file_device,file_inode,file_size,timing_json FROM recordings"
+    private func readRecordings(from start: Double? = nil, to end: Double? = nil,
+                               timeline: MediaTimeline = .canonical, limit: Int? = nil) throws -> [Recording] {
+        var sql = Self.recordingSelect
         var values: [Value] = []
         if let start, let end {
-            sql += " WHERE state='complete' AND start_utc<? AND start_utc+CAST(end_ticks AS REAL)/timescale>?"
+            // Active rows identify a writer, NOT readable coverage. Their
+            // accepted-frame checkpoint may lag or lead actual on-disk media;
+            // the media provider determines the readable prefix independently.
+            sql += " WHERE state IN ('complete','recording') AND \(timeline.column)<? AND (state='recording' OR \(timeline.column)+CAST(end_ticks AS REAL)/timescale>?)"
             values = [.real(end), .real(start)]
         }
-        let statement = try prepare(sql + " ORDER BY start_utc,id", values)
-        defer { sqlite3_finalize(statement) }
         var result: [Recording] = []
+        try visitRecordings(sql + " ORDER BY \(timeline.column),id", values, limit: limit) { row in
+            result.append(row); return true
+        }
+        return result
+    }
+    private func visitRecordings(_ sql: String, _ values: [Value], limit: Int?, work: MediaWork? = nil,
+                                 visit: (Recording) throws -> Bool) throws {
+        try checkFiles()
+        let statement = try prepare(sql + (limit.map { " LIMIT \($0 + 1)" } ?? ""), values)
+        defer { sqlite3_finalize(statement) }
+        var count = 0
         while true {
+            try work?.check()
             let code = sqlite3_step(statement)
-            if code == SQLITE_DONE { return result }
+            if code == SQLITE_DONE { return }
             guard code == SQLITE_ROW else { throw failure("read", code) }
+            count += 1
+            if let limit, count > limit { throw ServiceError(.invalidMessage, "Too many recording shards to inspect safely.") }
             guard let state = State(rawValue: string(statement, 8)) else { throw ServiceError("Invalid local manifest recording state.") }
             let timing = try JSONDecoder().decode(ShardTimingMetadata.self, from: Data(string(statement, 12).utf8))
             try timing.validate()
@@ -207,7 +375,7 @@ final class LocalRecordingManifest {
             guard timing.shardID == row.id, timing.storeID == identity.storeID, timing.cameraID == identity.cameraID,
                   timing.time.canonicalUTC == row.start, Int64(timing.timescale) == row.timescale,
                   Int64(timing.rtpTimestamp) == row.sourceTimestamp else { throw ServiceError("Inconsistent local manifest timing.") }
-            result.append(row)
+            if try !visit(row) { return }
         }
     }
     func coverage(from start: Double, to end: Double) throws -> Coverage {
@@ -253,11 +421,11 @@ final class LocalRecordingManifest {
             var info = stat()
             if fstatat(directory.fd, Self.filename + suffix, &info, AT_SYMLINK_NOFOLLOW) != 0 {
                 if suffix != "", errno == ENOENT { continue }
-                throw ServiceError("Local manifest disappeared or is inaccessible. Stop/restart the store to begin a new manifest; old video will not be backfilled.")
+                throw ServiceError("Local manifest disappeared or is inaccessible; the writer must reopen it before indexing new shards. Old video will not be backfilled.")
             }
             try validate(info, name: Self.filename + suffix)
             if suffix.isEmpty, info.st_dev != databaseDevice || info.st_ino != databaseInode {
-                throw ServiceError("Local manifest was replaced while recording. Stop/restart the store; old video will not be backfilled.")
+                throw ServiceError("Local manifest was replaced while recording; the writer must reopen and validate it before indexing new shards. Old video will not be backfilled.")
             }
         }
     }
@@ -290,7 +458,10 @@ final class LocalRecordingManifest {
         let statement = try prepare(sql, values); defer { sqlite3_finalize(statement) }
         var code = sqlite3_step(statement)
         while code == SQLITE_ROW { code = sqlite3_step(statement) }
-        guard code == SQLITE_DONE else { throw failure("write", code) }
+        guard code == SQLITE_DONE else {
+            // Only the operation verb, never SQL values or the full statement.
+            throw failure(String(sql.prefix { !$0.isWhitespace }).lowercased(), code)
+        }
     }
     private func scalar(_ sql: String) throws -> Int64 {
         let statement = try prepare(sql); defer { sqlite3_finalize(statement) }
@@ -302,7 +473,11 @@ final class LocalRecordingManifest {
         sqlite3_column_text(statement, column).map { String(cString: $0) } ?? ""
     }
     private func failure(_ operation: String, _ code: Int32) -> ServiceError {
-        ServiceError("Local manifest \(operation) failed (SQLite \(code)). Existing video/database files were preserved; no scan or backfill is attempted.")
+        // Capture before rollback/finalize can replace the connection's diagnostic.
+        // Codes/strerror contain no SQL, credentials, or recording metadata.
+        let extended = sqlite3_extended_errcode(database), system = sqlite3_system_errno(database)
+        let detail = system == 0 ? "" : "; OS \(system): \(String(cString: strerror(system)))"
+        return ServiceError("Local manifest \(operation) failed (SQLite \(code), extended \(extended)\(detail)). Existing video/database files were preserved; no scan or backfill is attempted.")
     }
 }
 

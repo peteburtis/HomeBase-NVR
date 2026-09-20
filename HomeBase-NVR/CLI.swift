@@ -74,6 +74,15 @@ struct Status: ParsableCommand {
                 for store in status.stores ?? [] {
                     print("  Store \(store.name): \(store.state) — \(store.activeRecordings) active, \(store.completedShards) completed shards, \(store.pendingBytes) queued bytes")
                     if let error = store.lastError { print("    \(error)") }
+                    if let bytes = store.playbackRAMBytes { print("    Playback RAM: \(bytes) bytes") }
+                    if let local = store.local {
+                        if local.retryingDestination { print("    Destination unavailable; reopening automatically with 1–30s backoff.") }
+                        if local.retryingCameras > 0 { print("    Automatically retrying \(local.retryingCameras) camera(s), with 1–30s backoff; waiting for fresh keyframes.") }
+                        if local.droppedEvents > 0 { print("    Queue overload: \(local.droppedEvents) dropped events (since startup)") }
+                        if let warning = local.manifestWarning { print("    Playback index warning: \(warning) Video writes continue; indexing retries on new shards, without backfill.") }
+                        if let warning = local.retentionWarning { print("    Retention warning: \(warning) Cleanup retries every 30s; recording continues.") }
+                        if let warning = local.errorLogWarning { print("    \(warning)") }
+                    }
                     if let s3 = store.s3 {
                         print("    Client-side encryption: \(s3.clientEncrypted == true ? "enabled for new shards" : "off for new shards")")
                         print("    S3: \(s3.acceptingRecording ? "accepting recording" : "not accepting recording"); \(s3.spooling ? "spooling (" + s3.reasons.joined(separator: ", ") + ")" : "immediate uploads")")

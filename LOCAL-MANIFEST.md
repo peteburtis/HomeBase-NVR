@@ -1,4 +1,4 @@
-# Local recording manifests and shard timing (0.10.0)
+# Local recording manifests and shard timing (0.13.1)
 
 Each camera directory receives `.hbnvr-manifest.sqlite` when this version starts
 writing new footage there. This is a **prospectively maintained recording index**.
@@ -8,10 +8,11 @@ explicit rebuild possible; no rebuild operation exists yet. Existing MP4s and
 adopted, backfilled, or assigned capture times from filenames/filesystem dates.
 The pre-existing retention policy still ages those files normally.
 
-This increment implements the index and internal range queries only. It does not
-add a playback CLI, IPC operation, Homebase media relay, GUI, S3 manifest, or recent
-RAM buffer. No keyframe/byte-offset tables are maintained. A future media reader
-will open the selected MP4 and seek using its container information.
+The [media IPC](MEDIA-PROTOCOL.md) reads this index, finalized MP4s,
+completed disk fragments, and the local writer's resident encoded samples for availability/frame
+requests. It adds no playback CLI, Homebase media relay, GUI,
+S3 manifest, or rolling playback history. No keyframe/byte-offset tables are maintained;
+the media reader opens the selected MP4 and finds keyframes from its samples.
 
 ## Location, permissions, and ownership
 
@@ -26,7 +27,7 @@ will open the selected MP4 and seek using its container information.
 The database is daemon-owned, mode `0600`, with the same inherited requester/daemon
 ACLs as recordings. The existing camera marker and an identity row in the database
 bind it to a particular camera and store. The store worker is its single writer.
-Homebase must eventually query NVR, not open this database directly.
+Homebase queries NVR's playback discovery/range APIs, not this database directly.
 
 SQLite uses DELETE rollback-journal mode, FULL synchronous commits, and macOS
 fullfsync. A temporary `.hbnvr-manifest.sqlite-journal` can appear during writes or
@@ -38,7 +39,23 @@ their own recordings or index.
 
 ## Stored information and time semantics
 
-The initial schema (version 1) contains `identity` and `recordings` tables. Each recording stores:
+Schema version 2 contains `identity`, `camera_metadata`, and `recordings` tables.
+`camera_metadata` is a singleton containing the last recorded display name,
+optional Homebase hardware-device ID, and metadata-update UTC time. This time is
+only for choosing the newest descriptive metadata across renamed directories;
+it never determines a frame's capture time. Metadata is committed in the same
+transaction as shard creation, before accepting the first sample. Unchanged
+metadata does not receive a new update time. Camera removal does not erase it.
+While a camera is configured, discovery prefers its current name/binding; after
+removal/restart, retained manifest metadata makes its history discoverable.
+
+Opening a version-1 database for writing adds the metadata table transactionally,
+preserving all recording rows. Read-only playback can still read version 1 but
+returns no historical display name/hardware binding until new recording supplies
+them. No metadata is inferred from directories, file timestamps, or aliases.
+Discovery is read-only and never marks active shards interrupted.
+
+Each recording stores:
 
 - A UUID, current relative filename, and intended finalized filename.
 - `start_utc`: canonical time at media zero, as Unix seconds in UTC.
@@ -146,7 +163,7 @@ reconstruction and incomplete-video salvage remain separate future work.
 
 ## Lifecycle and failure policy
 
-1. Before the first sample, commit a `recording` row with its actual time anchor.
+1. Before the first sample, attempt to commit a `recording` row with its actual time anchor.
 2. At most once per five seconds of active frame processing, commit accepted-frame
    progress. No per-frame SQLite commits or idle heartbeat writes occur.
 3. Finalize/synchronize the MP4, rename the same file, and synchronize its directory.
@@ -154,9 +171,15 @@ reconstruction and incomplete-video salvage remain separate future work.
    state in one SQLite transaction.
 
 `recording` progress is provisional: AVAssetWriter can still buffer those samples.
-It is **not** advertised as readable/durable coverage. Only `complete` rows with a
-matching existing regular file are returned by the availability query. Recent
-in-memory/in-progress playback is a separate future layer.
+It is **not** advertised as readable/durable coverage. The manifest-only coverage
+helper returns only `complete` rows with a matching existing regular file. Media
+IPC also considers `recording` rows, but only to locate a current writer's pinned
+file: it independently parses a fixed completed-fragment prefix and obtains its
+readable duration. This does not require more frequent manifest checkpoints or
+claim that AVFoundation-buffered samples are on disk. A bounded RAM bridge separately
+publishes shared references to the writer's actual accepted sample buffers and
+retires them as disk fragments become readable. It requires no per-frame manifest
+writes. Interrupted/unowned files are never adopted through this path.
 
 An interrupted process leaves `recording` rows that are marked `interrupted` when
 the writer next opens that manifest. Failed finalization also marks the row
@@ -171,15 +194,53 @@ between those operations, a query excludes the missing file. User-deleted,
 replaced, or truncated indexed files are also excluded without inferring alternate
 paths or capture times. The byte-size/inode check is not a content-integrity hash.
 
-A manifest write/read failure stops the affected local store with an actionable
-status error; other stores and camera reception remain independent. Completed or
-unfinished video is preserved (subject to normal retention). Corrupt, foreign, or
-unsupported databases are never silently reset. If an operator deliberately
-removes a manifest **while the store is stopped**, the next new recording starts
-an empty one. Prior footage remains on disk but has no automatic timeline entry.
-Deleting/replacing a manifest while open is detected and requires stopping and
-restarting the store. Back up the manifest using SQLite's backup facilities, or
-copy it while the store is stopped; it is not disposable cache.
+A manifest failure is an **indexing warning, never a reason to stop video writes**.
+The writer closes the failed connection and retries opening/validating the index
+at later shard starts with 1–30 second capped backoff. It also retains the current
+shard's original timing/identity metadata: after confirmed MP4 finalization it can
+commit the complete entry even if the initial row or a progress checkpoint failed.
+This uses known in-process recording facts, not a directory scan or media backfill.
+
+If that final index write fails, a RAM-only queue holds at most **16 finalized
+metadata entries per store**, with no video bytes or open file descriptors. Each
+entry expires **60 seconds after its initial final-write failure**. Retry delays
+are 1, 2, 4, 8, 16, then capped at 30 seconds (attempts normally at +1, +3, +7,
++15, and +31 seconds, with discard at +60). At most one queued attempt runs per
+one-second maintenance tick. Delayed ticks do not extend expiry. A full queue
+rejects the new metadata entry rather than evicting accepted work. Shutdown clears
+remaining entries without waiting for the retry window; process crashes lose them.
+
+Each retry opens a fresh validated SQLite connection without marking another live
+shard interrupted. It verifies the finalized file's frozen device/inode/size and
+commits idempotently: an already-committed identical row is success, while conflicting
+rows, replaced footage, and unsafe databases are preserved. Older retries cannot
+replace newer camera names/bindings. Initial failures, each retry failure, successful
+recovery, queue-limit rejection, expiry, and shutdown discard go to both error logs.
+Discard affects **only pending index metadata**, never video (normal retention still
+applies). Such a shard can remain absent from playback. This mitigation does not fix
+the underlying file-access/descriptor failure or repair pre-existing index gaps.
+
+Pending retries keep the manifest warning visible even when a newer shard indexes
+successfully. Recovery clears the current warning when no other camera update needs
+attention; discarded gaps remain in the error log rather than being auto-rebuilt.
+Failed media writes/finalization instead abandon that shard for fresh keyframe
+attempts with bounded backoff; they never permanently latch recording off.
+
+Completed or unfinished video is preserved subject to normal retention. Corrupt,
+foreign, unsafe, or unsupported databases are never silently reset. Deleting or
+replacing an open index is detected; before indexing a subsequent new shard, the
+writer must reopen and validate it. A deliberately removed manifest starts empty
+on that next attempt; prior footage remains unindexed except for still-retained,
+in-process finalized metadata within the bounded retry window. Back up using SQLite's
+backup facilities or copy while the store is stopped; this is not disposable cache.
+Retention retries independently, and index errors do not prevent normal expiration
+of owned media files.
+
+Errors are timestamped in `<local root>/.hbnvr-errors.log` as well as the ordinary
+agent log. SQLite diagnostics include operation, primary and extended result codes,
+and OS errno when available, captured before rollback can replace them. The private
+log rotates at approximately 1 MiB with one previous `.1` file. No raw SQL values
+or credentials are logged. Failed diagnostic writes never gate video or retries.
 
 ## Query contract
 
@@ -201,7 +262,8 @@ streaming, keyframe preroll, and file demuxing remain outside the manifest.
 
 `LocalManifestTests` covers prospective creation, no backfill after deletion,
 gaps/overlaps, provisional and interrupted rows, safe paths/permissions,
-corruption/unsupported schema, blocked writes, timestamp wrap and clock changes,
+corruption/unsupported schema, blocked writes, idempotent retained completions,
+preservation of live rows/newer camera identity during retry, timestamp wrap and clock changes,
 missing/replaced/truncated media, retention, and real synthetic-video shard timing.
 The existing H.264/H.265 local recording and power-interruption tests remain in use.
 `RecordingTimeTests` checks RTCP parsing, source matching, rollover/expiry, the
@@ -241,4 +303,5 @@ sqlite3 -readonly "$HOME/NVR/Living Room Camera/.hbnvr-manifest.sqlite" \
 This reads metadata only; no camera video or AWS access is needed. A short query is
 preferable to a long SQLite transaction that blocks the recording writer. Files
 predating installation are expected not to appear. New rows are provisional until
-the shard finalizes; no claims of active-shard playback are made in this release.
+the shard finalizes. Active-shard media availability comes from the actual completed
+disk fragments, not these provisional progress columns; see [the media protocol](MEDIA-PROTOCOL.md#reading-a-shard-that-is-still-recording).

@@ -29,11 +29,12 @@ final class LocalManifestTests: XCTestCase {
     }
     @discardableResult
     func recorded(_ fixture: Fixture, _ db: LocalRecordingManifest, number: Int = 1,
-                  start: Double = 100, duration: Int64 = 10, complete: Bool = true) throws -> (id: String, file: String) {
+                  start: Double = 100, duration: Int64 = 10, complete: Bool = true,
+                  metadata: LocalRecordingManifest.CameraMetadata? = nil) throws -> (id: String, file: String) {
         let id = UUID().uuidString, file = "2026-09-17_12-00-00-\(number).mp4"
         try db.begin(id: id, temporaryName: file + ".recording", finalName: file,
                      start: Date(timeIntervalSince1970: start), timescale: 90000, sourceTimestamp: UInt32.max - 10,
-                     timing: timing(fixture, id: id, start: start))
+                     timing: timing(fixture, id: id, start: start), cameraMetadata: metadata)
         try db.progress(id: id, endTicks: duration * 90000, frames: duration * 15)
         if complete {
             // Metadata unit tests stand in for the already-verified MP4 writer.
@@ -60,6 +61,20 @@ final class LocalManifestTests: XCTestCase {
         XCTAssertEqual(try SecureFiles.info(path)!.st_mode & 0o777, 0o600)
         XCTAssertFalse(FileManager.default.fileExists(atPath: path + "-wal"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: path + "-journal"))
+    }
+    func testCameraMetadataIsAtomicValidatedAndDoesNotChurnWhenUnchanged() throws {
+        let f = try fixture(), db = try f.open()
+        let first = LocalRecordingManifest.CameraMetadata(name: "Kitchen", homebaseDeviceID: "camera-one", updatedAt: 1)
+        try recorded(f, db, metadata: first)
+        XCTAssertEqual(try db.cameraMetadata(), first)
+        try recorded(f, db, number: 2, metadata: .init(name: "Kitchen", homebaseDeviceID: "camera-one", updatedAt: 2))
+        XCTAssertEqual(try db.cameraMetadata(), first)
+        XCTAssertThrowsError(try recorded(f, db, number: 3, metadata: .init(name: "Invalid", homebaseDeviceID: "not-a-camera", updatedAt: 3)))
+        XCTAssertEqual(try db.recordings().count, 2)
+        XCTAssertEqual(try db.cameraMetadata(), first)
+        let renamed = LocalRecordingManifest.CameraMetadata(name: "Pantry", homebaseDeviceID: "camera-one", updatedAt: 4)
+        try recorded(f, db, number: 3, metadata: renamed)
+        XCTAssertEqual(try f.open(readOnly: true).cameraMetadata(), renamed)
     }
     func testAcceptedProgressIsNotAvailableAndRestartOnlyMarksInterrupted() throws {
         let f = try fixture()
@@ -91,6 +106,57 @@ final class LocalManifestTests: XCTestCase {
         try recorded(f, db!, number: 2, start: 200)
         XCTAssertEqual(try db!.recordings().count, 1)
     }
+    private func completion(_ f: Fixture, timing: ShardTimingMetadata, filename: String,
+                            name: String = "Old name", updatedAt: Double = 100) throws -> LocalRecordingManifest.Completion {
+        let path = f.directory.path + "/" + filename
+        try SecureFiles.atomicWrite(Data([1, 2, 3]), to: path, mode: 0o600)
+        var info = stat(); XCTAssertEqual(lstat(path, &info), 0)
+        return .init(seed: .init(temporaryName: filename + ".recording", finalName: filename, timing: timing,
+                                camera: .init(name: name, homebaseDeviceID: "camera-one", updatedAt: updatedAt)),
+                     endTicks: 900000, frames: 150, file: .init(info))
+    }
+    func testRetainedCompletionInsertsMissingRowAndIsIdempotentWithoutRevertingCameraMetadata() throws {
+        let f = try fixture(), db = try f.open(), id = UUID().uuidString
+        let value = try completion(f, timing: timing(f, id: id, start: 100), filename: "2026-09-17_12-00-01.mp4")
+        try recorded(f, db, number: 2, start: 200, metadata: .init(name: "New name", homebaseDeviceID: "camera-two", updatedAt: 200))
+        try db.completeRetained(value); try db.completeRetained(value)
+        let rows = try db.recordings()
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows.first?.id, id); XCTAssertEqual(rows.first?.state, .complete)
+        XCTAssertEqual(rows.first?.frames, 150)
+        XCTAssertEqual(try db.cameraMetadata()?.name, "New name")
+        XCTAssertEqual(try db.cameraMetadata()?.homebaseDeviceID, "camera-two")
+    }
+    func testRetainedCompletionRecoversProvisionalRowsWithoutInterruptingActiveRecording() throws {
+        for interrupted in [false, true] {
+            let f = try fixture(), db = try f.open()
+            let old = try recorded(f, db, complete: false)
+            let row = try XCTUnwrap(db.recordings().first)
+            if interrupted { try db.interrupt(id: old.id) }
+            let active = try recorded(f, db, number: 2, start: 200, complete: false)
+            let value = try completion(f, timing: row.timing, filename: old.file)
+            let retry = try LocalRecordingManifest(directory: f.directory, identity: f.identity, owner: geteuid(), recoverInterrupted: false)
+            try retry.completeRetained(value); try retry.completeRetained(value)
+            let rows = try db.recordings()
+            XCTAssertEqual(rows.first { $0.id == old.id }?.state, .complete)
+            XCTAssertEqual(rows.first { $0.id == active.id }?.state, .recording)
+            try db.progress(id: active.id, endTicks: 1000000, frames: 160)
+        }
+    }
+    func testRetainedCompletionRefusesConflictsAndChangedMedia() throws {
+        let f = try fixture(), db = try f.open(), old = try recorded(f, db, complete: false)
+        let row = try XCTUnwrap(db.recordings().first)
+        let value = try completion(f, timing: row.timing, filename: old.file)
+        let conflict = LocalRecordingManifest.Completion(seed: .init(temporaryName: old.file + ".recording", finalName: old.file,
+            timing: try timing(f, id: old.id, start: 200), camera: value.seed.camera), endTicks: 900000, frames: 150, file: value.file)
+        XCTAssertThrowsError(try db.completeRetained(conflict))
+        let wrong = LocalRecordingManifest.Completion(seed: value.seed, endTicks: 900001, frames: 150, file: value.file)
+        try db.completeRetained(value)
+        XCTAssertThrowsError(try db.completeRetained(wrong))
+        try SecureFiles.atomicWrite(Data([4, 5, 6]), to: f.directory.path + "/" + old.file, mode: 0o600)
+        XCTAssertThrowsError(try db.completeRetained(value)) // Same size, different inode.
+        XCTAssertEqual(try db.recordings().first?.endTicks, 900000)
+    }
     func testInitialSchemaRequiresTimingAndRoundTripsWithoutCameraClock() throws {
         let f = try fixture(), path = f.directory.path + "/" + LocalRecordingManifest.filename
         var db: LocalRecordingManifest? = try f.open()
@@ -102,7 +168,7 @@ final class LocalManifestTests: XCTestCase {
         var version: OpaquePointer?
         XCTAssertEqual(sqlite3_prepare_v2(raw, "PRAGMA user_version", -1, &version, nil), SQLITE_OK)
         XCTAssertEqual(sqlite3_step(version), SQLITE_ROW)
-        XCTAssertEqual(sqlite3_column_int64(version, 0), 1)
+        XCTAssertEqual(sqlite3_column_int64(version, 0), LocalRecordingManifest.schemaVersion)
         sqlite3_finalize(version)
         for column in ["received_utc", "canonical_source", "timing_json"] {
             XCTAssertEqual(sqlite3_exec(raw, "UPDATE recordings SET \(column)=NULL", nil, nil, nil), SQLITE_CONSTRAINT, column)
@@ -176,7 +242,11 @@ final class LocalManifestTests: XCTestCase {
         XCTAssertEqual(sqlite3_open(path, &other), SQLITE_OK)
         defer { sqlite3_close(other) }
         XCTAssertEqual(sqlite3_exec(other, "BEGIN IMMEDIATE", nil, nil, nil), SQLITE_OK)
-        XCTAssertThrowsError(try recorded(f, db!, number: 2))
+        XCTAssertThrowsError(try recorded(f, db!, number: 2)) { error in
+            let message = (error as? ServiceError)?.message ?? ""
+            XCTAssertTrue(message.contains("SQLite 5, extended 5"))
+            XCTAssertTrue(message.contains("begin failed"))
+        }
         XCTAssertEqual(sqlite3_exec(other, "ROLLBACK", nil, nil, nil), SQLITE_OK)
         XCTAssertEqual(try db!.recordings().count, 1)
         db = nil

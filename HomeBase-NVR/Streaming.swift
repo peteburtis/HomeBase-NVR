@@ -36,6 +36,7 @@ final class StreamingCoordinator: @unchecked Sendable {
         var began: TimeInterval = 0
         var firstFrame: TimeInterval?
         var lastFrame: TimeInterval?
+        var latestTime: RecordingTime?
         var retryAt: TimeInterval?
         var failures = 0
         var sampleTime: TimeInterval = 0
@@ -104,6 +105,15 @@ final class StreamingCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Only timing is retained. A live anchor is not a promise of buffered video.
+    func liveTime(camera: String) -> RecordingTime? {
+        queue.sync {
+            guard let entry = entries[camera], entry.status.state == "streaming",
+                  let last = entry.lastFrame, now - last <= 15 else { return nil }
+            return entry.latestTime
+        }
+    }
+
     func stop() {
         let clients: [RTSPClient] = queue.sync {
             stopped = true
@@ -124,7 +134,7 @@ final class StreamingCoordinator: @unchecked Sendable {
         entry.generation = UUID()
         let generation = entry.generation
         entry.began = now
-        entry.firstFrame = nil; entry.lastFrame = nil; entry.retryAt = nil
+        entry.firstFrame = nil; entry.lastFrame = nil; entry.retryAt = nil; entry.latestTime = nil
         entry.sampleTime = now; entry.sampleBytes = entry.status.receivedBytes; entry.sampleFrames = entry.status.frames
         entry.status.state = "connecting"
         let source = RTSPSource(cameraIdentifier: entry.status.id, streamURL: url,
@@ -146,11 +156,14 @@ final class StreamingCoordinator: @unchecked Sendable {
                     entry.began = self.now
                 case .received(let bytes): entry.status.receivedBytes &+= UInt64(bytes)
                 case .video(let packets, let frames, let dropped, let media):
+                    if let media { entry.latestTime = media.time }
                     entry.status.rtpPackets &+= packets
                     entry.status.frames &+= frames
                     entry.status.droppedFrames &+= dropped
                     if dropped > 0 { self.record(.end(camera: entry.status.id)) }
-                    if entry.camera.recordingStarted, let media { self.record(.media(camera: entry.status.id, name: entry.status.name, media)) }
+                    if entry.camera.recordingStarted, let media {
+                        self.record(.media(camera: entry.status.id, name: entry.status.name, media, homebaseDeviceID: entry.camera.homebaseDeviceID))
+                    }
                     if frames > 0 {
                         if entry.firstFrame == nil {
                             entry.firstFrame = self.now

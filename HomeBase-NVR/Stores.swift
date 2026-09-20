@@ -117,9 +117,17 @@ struct EncodedMedia: Sendable {
     }
 }
 enum RecordingEvent: Sendable {
-    case media(camera: String, name: String, EncodedMedia)
+    case media(camera: String, name: String, EncodedMedia, homebaseDeviceID: String? = nil)
     case end(camera: String)
-    var bytes: Int { if case .media(_, _, let media) = self { return media.frame.payload.count }; return 0 }
+    var bytes: Int { if case .media(_, _, let media, _) = self { return media.frame.payload.count }; return 0 }
+}
+struct LocalStoreStatus: Codable {
+    var retryingDestination: Bool
+    var retryingCameras: Int
+    var droppedEvents: UInt64
+    var manifestWarning: String?
+    var retentionWarning: String?
+    var errorLogWarning: String?
 }
 struct RecordingStoreStatus: Codable {
     let id: String
@@ -130,8 +138,10 @@ struct RecordingStoreStatus: Codable {
     var completedShards: UInt64 = 0
     var recordedFrames: UInt64 = 0
     var pendingBytes = 0
+    var playbackRAMBytes: Int? = nil
     var lastError: String?
     var s3: S3StoreStatus?
+    var local: LocalStoreStatus?
     mutating func recordFailure(_ message: String) {
         state = "error"
         // Cleanup/finalization can fail too; preserve the cause that stopped recording.
@@ -156,7 +166,7 @@ final class RecordingStoreManager: @unchecked Sendable {
     private let spoolRoot: String
     private let transportFactory: S3TransportFactory
     init(spoolRoot: String = Paths.system.base + "/private/spool", transportFactory: @escaping S3TransportFactory = AWSS3Transport.make, log: @escaping (String) -> Void = { _ in }) { self.spoolRoot = spoolRoot; self.transportFactory = transportFactory; self.log = log }
-    func install(_ config: RecordingStoreConfiguration) throws {
+    func install(_ config: RecordingStoreConfiguration, recoverUnavailable: Bool = false) throws {
         lock.lock(); let existing = destinations[config.id] as? S3RecordingStore; lock.unlock()
         if let existing, config.type == "S3" {
             let previous = existing.configuration
@@ -182,7 +192,7 @@ final class RecordingStoreManager: @unchecked Sendable {
         }
         try remove(config.id)
         let destination: LocalRecordingStore
-        do { destination = try LocalRecordingStore(configuration: config, log: log) }
+        do { destination = try LocalRecordingStore(configuration: config, recoverUnavailable: recoverUnavailable, log: log) }
         catch {
             guard !config.enabled else { throw error }
             lock.lock()
@@ -195,7 +205,7 @@ final class RecordingStoreManager: @unchecked Sendable {
     }
     func load(_ configs: [RecordingStoreConfiguration]) {
         for config in configs {
-            do { try install(config) }
+            do { try install(config, recoverUnavailable: true) }
             catch {
                 lock.lock()
                 if config.type == "S3" { unavailableS3.insert(config.id) }
@@ -210,7 +220,7 @@ final class RecordingStoreManager: @unchecked Sendable {
         for store in values where store.configuration.enabled { store.accept(event) }
     }
     var hasWritableStore: Bool {
-        snapshot().contains { $0.s3?.acceptingRecording ?? ($0.enabled && $0.state != "error" && $0.state != "stopping") }
+        snapshot().contains { $0.s3?.acceptingRecording ?? ($0.enabled && !["error", "retrying", "stopping"].contains($0.state)) }
     }
     func drain(timeout: TimeInterval = 3) throws {
         lock.lock(); let values = Array(destinations.values); lock.unlock()

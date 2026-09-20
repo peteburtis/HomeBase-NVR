@@ -1,5 +1,11 @@
 # Homebase camera integration (0.8.0)
 
+NVR 0.13.0 also provides a separate playback catalog via
+`playback.snapshot` / `playback.watch`, with persisted camera identity from local
+manifests, store reachability, and recording-independent history discovery.
+See [playback discovery](MEDIA-PROTOCOL.md#playback-discovery). This does not change
+the existing recording-control subscription below or implement its Homebase consumer.
+
 Homebase's camera module automatically connects to the installed NVR at
 `/Library/Application Support/HomeBase-NVR/run/control.sock`. No configuration,
 pairing, XPC service, shared credential files, or background CLI subprocess is needed.

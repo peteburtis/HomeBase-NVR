@@ -952,6 +952,224 @@ class Integration(unittest.TestCase):
         self.assertFalse((directory / "control.sock").exists())
         self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 3)
 
+    def media_open(self, directory):
+        client = self.connect(directory)
+        client.sendall(b'{"protocolVersion":1,"operation":"media.open","mediaProtocolVersion":1}\n')
+        reply = b""
+        while not reply.endswith(b"\n"):
+            part = client.recv(1)
+            self.assertTrue(part)
+            reply += part
+        info = json.loads(reply)["mediaSession"]
+        self.assertEqual(info["version"], 1)
+        self.assertTrue(info["supportsThumbnails"])
+        self.assertEqual(info["thumbnailFormats"], ["image/jpeg"])
+        self.assertEqual(info["maxThumbnailDimension"], 2048)
+        return client
+
+    def media_send(self, client, request):
+        payload = json.dumps(request).encode()
+        client.sendall(struct.pack("!BI", 1, len(payload)) + payload)
+
+    def media_response(self, client):
+        def exact(length):
+            result = b""
+            while len(result) < length:
+                part = client.recv(length - len(result))
+                self.assertTrue(part, "EOF is not a successful media response")
+                result += part
+            return result
+        records = []
+        while True:
+            kind, length = struct.unpack("!BI", exact(5))
+            self.assertGreater(length, 0); self.assertLessEqual(length, 65536)
+            payload = exact(length)
+            self.assertEqual(kind, 1)  # These smoke cases have no recorded media.
+            record = json.loads(payload); records.append(record)
+            if record["type"] == "end":
+                return records
+
+    def test_media_session_reuse_errors_and_command_isolation(self):
+        directory, process = self.agent()
+        request = dict(requestID="range-1", operation="availability", cameraID="11111111-1111-1111-1111-111111111111",
+                       range=dict(start=100, end=110))
+        with self.media_open(directory) as client:
+            self.media_send(client, request)
+            records = self.media_response(client)
+            self.assertEqual([r["type"] for r in records], ["begin", "gap", "end"])
+            self.assertEqual(records[-1]["outcome"], "unavailable")
+            self.assertEqual(records[0]["timeline"], "canonical")
+            self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+            self.media_send(client, dict(request, operation="neighbors"))
+            neighbors = self.media_response(client)
+            self.assertEqual([r["type"] for r in neighbors], ["begin", "neighbors", "end"])
+            self.assertEqual(neighbors[1]["neighbors"], {})
+            self.assertEqual(neighbors[-1]["outcome"], "complete")
+            self.assertEqual(neighbors[-1]["frames"], 0)
+            self.media_send(client, dict(request, operation="status"))
+            self.assertEqual(self.media_response(client)[-1]["code"], 7)
+            # Properly framed malformed JSON is a request error, not corruption
+            # of the reusable connection. Arbitrary filenames cannot be requested.
+            client.sendall(struct.pack("!BI", 1, 1) + b"{")
+            self.assertEqual(self.media_response(client)[-1]["code"], 7)
+            self.media_send(client, dict(request, cameraID="/etc/passwd"))
+            self.assertEqual(self.media_response(client)[-1]["code"], 7)
+            self.media_send(client, dict(request, operation="frames", relativeTo="now", range=dict(start=-45, end=-15)))
+            records = self.media_response(client)
+            self.assertLess(abs(records[0]["anchor"] - time.time()), 3)
+            self.assertEqual(records[0]["range"]["start"], records[0]["anchor"] - 45)
+            self.assertEqual(records[-1]["frames"], 0)
+            process.terminate(); self.assertEqual(process.wait(timeout=3), 0)
+            self.assertEqual(client.recv(1), b"")
+
+    def test_thumbnail_point_validation_gaps_and_session_reuse(self):
+        directory, _ = self.agent()
+        request = dict(requestID="thumb", operation="thumbnail", cameraID="11111111-1111-1111-1111-111111111111",
+                       timestamp=-30, relativeTo="now", size=dict(width=320, height=180))
+        with self.media_open(directory) as client:
+            for invalid in [dict(request, size=dict(width=0, height=180)), dict(request, timestamp=1),
+                            dict(request, timeline="unknown"), dict(request, cameraID="/etc/passwd")]:
+                self.media_send(client, invalid)
+                self.assertEqual(self.media_response(client)[-1]["code"], 7)
+            for timeline in ["canonical", "camera", "received"]:
+                self.media_send(client, dict(request, timeline=timeline))
+                records = self.media_response(client)
+                self.assertEqual([r["type"] for r in records], ["begin", "end"])
+                self.assertEqual(records[0]["timeline"], timeline)
+                self.assertLess(abs(records[0]["anchor"] - time.time()), 3)
+                self.assertEqual(records[0]["timestamp"], records[0]["anchor"] - 30)
+                self.assertEqual(records[-1]["outcome"], "unavailable")
+                self.assertEqual(records[-1]["frames"], 0)
+            self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+
+    def test_media_limits_version_and_invalid_framing(self):
+        directory, _ = self.agent()
+        self.assertEqual(self.camera_request(directory, "media.open", mediaProtocolVersion=99)["code"], 5)
+        clients = [self.media_open(directory) for _ in range(8)]
+        try:
+            self.assertEqual(self.camera_request(directory, "media.open", mediaProtocolVersion=1)["code"], 3)
+            self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+        finally:
+            for client in clients:
+                client.close()
+        time.sleep(.2)
+        for kind, length in [(1, 0), (1, 65537), (2, 1)]:
+            with self.media_open(directory) as client:
+                client.sendall(struct.pack("!BI", kind, length))
+                try:
+                    self.assertEqual(client.recv(1), b"")
+                except ConnectionResetError:
+                    pass
+        self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+
+    def test_media_live_anchor_survives_recording_stop_but_not_camera_disable(self):
+        directory, _ = self.agent()
+        camera = self.add_stream(directory, self.rtsp_fixture())
+        self.await_streams(directory, lambda streams: streams and streams[0]["frames"] >= 5)
+        request = dict(requestID="live", operation="availability", cameraID=camera,
+                       relativeTo="live", range=dict(start=-45, end=-15))
+        with self.media_open(directory) as client:
+            self.media_send(client, request)
+            records = self.media_response(client)
+            self.assertLess(abs(records[0]["anchor"] - time.time()), 3)
+            self.assertEqual(records[-1]["outcome"], "unavailable")  # live timing != retained footage
+            self.camera_request(directory, "cameras.stop", cameraID=camera)
+            self.media_send(client, request)
+            self.assertEqual(self.media_response(client)[0]["type"], "begin")
+            self.media_send(client, dict(request, timeline="camera"))
+            self.assertEqual(self.media_response(client)[-1]["code"], 3)  # fixture has no RTCP mapping
+            self.camera_request(directory, "cameras.disable", cameraID=camera)
+            self.media_send(client, request)
+            self.assertEqual(self.media_response(client)[-1]["code"], 3)
+
+    def test_playback_catalog_subscription_and_recording_distinction(self):
+        directory, process = self.agent()
+        with self.connect(directory) as watch:
+            watch.sendall(b'{"protocolVersion":1,"operation":"playback.watch"}\n')
+            with watch.makefile("rb") as frames:
+                def snapshot(predicate):
+                    end = time.monotonic() + 10
+                    while time.monotonic() < end:
+                        reply = json.loads(frames.readline())
+                        self.assertNotIn("error", reply)
+                        value = reply["playbackSnapshot"]
+                        if predicate(value):
+                            return value
+                    self.fail("No matching playback snapshot")
+                initial = snapshot(lambda x: x["ready"])
+                self.assertEqual(initial["stores"], [])
+                self.assertEqual(initial["cameras"], [])
+                self.assertEqual(initial["instanceID"], self.camera_request(directory, "cameras.snapshot")["cameraSnapshot"]["instanceID"])
+                output = self.root / "playback"
+                added = self.cli("store", "add", "--runtime-dir", directory,
+                                 input=f"1\nPlayback test\n{output}\n1m\n1w\nyes\nyes\n")
+                self.assertEqual(added.returncode, 0, added.stderr)
+                current = snapshot(lambda x: x["ready"] and len(x["stores"]) == 1)
+                store_id = current["stores"][0]["id"]
+                self.assertEqual(current["stores"][0]["state"], "available")
+                self.assertTrue(current["stores"][0]["frameReading"])
+                camera = dict(SchemaVersion=1, Name="Discovery fixture", Provider="RTSP", IPAddress="192.0.2.1",
+                              RTSPPort=554, HomebaseDeviceID="camera-fixture-serial",
+                              Credentials=dict(SchemaVersion=1, Username="private-user", Password="private-password"))
+                result = self.camera_request(directory, "cameras.add", camera=camera)
+                self.assertNotIn("error", result, result)
+                camera_id = result["camera"]["id"]
+                current = snapshot(lambda x: x["ready"] and len(x["cameras"]) == 1)
+                self.assertEqual(current["cameras"][0]["homebaseDeviceID"], "camera-fixture-serial")
+                self.assertEqual(current["cameras"][0]["stores"],
+                                 [dict(storeID=store_id, recordingEnabled=True, indexedHistory=False)])
+                for secret in ["private-user", "private-password", "192.0.2.1", str(output)]:
+                    self.assertNotIn(secret, json.dumps(current))
+                self.camera_request(directory, "stores.disable", storeID=store_id)
+                stopped = snapshot(lambda x: x["ready"] and not x["stores"][0]["enabled"])
+                self.assertEqual(stopped["stores"][0]["state"], "available")
+                self.assertFalse(stopped["cameras"][0]["stores"][0]["recordingEnabled"])
+                self.assertGreater(stopped["revision"], current["revision"])
+                self.camera_request(directory, "cameras.remove", cameraID=camera_id)
+                snapshot(lambda x: x["ready"] and not x["cameras"])
+                self.camera_request(directory, "stores.remove", storeID=store_id)
+                empty = snapshot(lambda x: x["ready"] and not x["stores"])
+                self.assertEqual(self.camera_request(directory, "playback.snapshot")["playbackSnapshot"], empty)
+                self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+                process.terminate(); self.assertEqual(process.wait(timeout=3), 0)
+                self.assertEqual(frames.readline(), b"")
+
+    def test_playback_offline_volume_refresh_and_watch_limit(self):
+        directory, process = self.agent()
+        output = self.root / "playback-volume"
+        result = self.cli("store", "add", "--runtime-dir", directory,
+                          input=f"1\nPlayback volume\n{output}\n1m\n1w\nno\nyes\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        def await_state(state):
+            end = time.monotonic() + 8
+            while time.monotonic() < end:
+                value = self.camera_request(directory, "playback.snapshot")["playbackSnapshot"]
+                if value["ready"] and value["stores"][0]["state"] == state:
+                    return value
+                time.sleep(.05)
+            self.fail(f"No {state} discovery: {value}")
+        initial = await_state("available")
+        watches = []
+        try:
+            for _ in range(8):
+                watch = self.connect(directory); watches.append(watch)
+                watch.sendall(b'{"protocolVersion":1,"operation":"playback.watch"}\n')
+                self.assertIn("playbackSnapshot", json.loads(watch.recv(65536)))
+            self.assertEqual(self.camera_request(directory, "playback.watch")["code"], 3)
+            self.assertEqual(self.cli("status", "--runtime-dir", directory).returncode, 0)
+            offline = self.root / "offline"
+            output.rename(offline)
+            missing = await_state("unavailable")
+            self.assertEqual(missing["stores"][0]["id"], initial["stores"][0]["id"])
+            offline.rename(output)
+            await_state("available")
+        finally:
+            for watch in watches:
+                watch.close()
+        process.terminate(); self.assertEqual(process.wait(timeout=3), 0)
+        self.agent()
+        self.assertNotEqual(self.camera_request(directory, "playback.snapshot")["playbackSnapshot"]["instanceID"], initial["instanceID"])
+
     def test_camera_subscription_and_persistent_recording_commands(self):
         directory, process = self.agent()
         with self.connect(directory) as watch:

@@ -142,8 +142,69 @@ enum MP4WriterWait {
     }
 }
 
+/// Best-effort bounded diagnostic history, independent of SQLite. Called only on
+/// the store worker. Files inherit the recording root's private controller ACLs.
+enum LocalRecordingErrorLog {
+    static let filename = ".hbnvr-errors.log"
+    static let limit = 1_048_576
+    static func append(_ message: String, camera: String? = nil, directory: Int32, date: Date = Date()) throws {
+        func validate(_ info: stat) throws {
+            guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(),
+                  info.st_mode & 0o077 == 0, info.st_nlink == 1 else {
+                throw ServiceError("Unsafe local recording error log; expected a daemon-owned private regular file without links.")
+            }
+        }
+        var fd = openat(directory, filename, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { throw ServiceError.posix("Open local recording error log") }
+        defer { if fd >= 0 { close(fd) } }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw ServiceError.posix("Inspect local recording error log") }
+        try validate(info)
+        if info.st_size >= limit {
+            let previous = filename + ".1"
+            var old = stat()
+            if fstatat(directory, previous, &old, AT_SYMLINK_NOFOLLOW) == 0 { try validate(old) }
+            else if errno != ENOENT { throw ServiceError.posix("Inspect rotated recording error log") }
+            guard renameat(directory, filename, directory, previous) == 0 else { throw ServiceError.posix("Rotate local recording error log") }
+            close(fd); fd = -1
+            fd = openat(directory, filename, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            guard fd >= 0 else { throw ServiceError.posix("Create local recording error log") }
+        }
+        let clean = String(message.prefix(2048)).replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
+        let line = "\(ISO8601DateFormatter().string(from: date))\(camera.map { " camera=\($0)" } ?? "") \(clean)\n"
+        let bytes = Data(line.utf8)
+        try bytes.withUnsafeBytes { buffer in
+            var offset = 0
+            while offset < buffer.count {
+                let count = write(fd, buffer.baseAddress! + offset, buffer.count - offset)
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else { throw ServiceError.posix("Write local recording error log") }
+                offset += count
+            }
+        }
+        // No per-error fsync: diagnostics must not amplify a disk failure or
+        // compete with media checkpoints. Normal OS writeback applies.
+    }
+}
+
 /// Built-in destination. File/container concerns never escape this implementation.
 final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
+    enum Operation { case openDestination, createShard, beginManifest, checkpointManifest, completeManifest, retryManifest, manifestCommitted, append, finalize, retention }
+    struct Hooks {
+        var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        var before: (Operation, String?) throws -> Void = { _, _ in }
+        var automaticMaintenance = true
+    }
+    private struct Retry {
+        var failures = 0
+        var deadline: TimeInterval = 0
+        var message: String?
+        mutating func failed(_ message: String, now: TimeInterval) {
+            failures = min(failures + 1, 6)
+            deadline = now + min(30, pow(2, Double(failures - 1)))
+            self.message = message
+        }
+    }
     let configuration: RecordingStoreConfiguration
     private let queue: DispatchQueue
     private let lock = NSLock()
@@ -153,7 +214,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     private var queuedBytes = 0
     private var queuedEvents = 0
     private let drained = DispatchGroup()
-    private let directoryFD: Int32
+    private var directoryFD: Int32 = -1
     private let path: String
     private var instanceLock: InstanceLock?
     private var legacyLock: InstanceLock?
@@ -163,7 +224,28 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var cameras: [String: Track] = [:]
     private var manifests: [String: LocalRecordingManifest] = [:]
+    static let manifestRetryLimit = 16
+    static let manifestRetryLifetime: TimeInterval = 60
+    private struct ManifestRetry {
+        let directory: String
+        let completion: LocalRecordingManifest.Completion
+        let expires: TimeInterval
+        var retry: Retry
+        var camera: String { completion.seed.timing.cameraID }
+        var id: String { completion.seed.timing.shardID }
+    }
+    // Metadata only, no MP4 bytes, connections, or pinned file descriptors.
+    private var manifestRetries: [ManifestRetry] = []
+    private let hooks: Hooks
+    private var opening = Retry()
+    private var nextRetention: TimeInterval = 0
+    private var retentionWarning: String?
+    private var queueRecovering = false // Protected by lock; the worker drains before resuming.
+    private var droppedEvents: UInt64 = 0
+    private var diagnosticWarning: String?
     private final class Track {
+        let camera: String
+        init(camera: String) { self.camera = camera }
         var name = ""
         var directory: LocalRecordingLayout.Directory?
         var codec = ""
@@ -171,21 +253,41 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         var writer: MP4Shard?
         var manifest: LocalRecordingManifest?
         var recordingID: String?
+        var manifestSeed: LocalRecordingManifest.Seed?
         var clock = LocalRecordingClock()
         var lastManifestCheckpoint: TimeInterval = 0
+        var retry = Retry()
+        var indexRetry = Retry()
     }
 
-    init(configuration: RecordingStoreConfiguration, log: @escaping (String) -> Void = { _ in }) throws {
+    init(configuration: RecordingStoreConfiguration, recoverUnavailable: Bool = false,
+         hooks: Hooks = Hooks(), log: @escaping (String) -> Void = { _ in }) throws {
         try configuration.validate()
         self.configuration = configuration
         self.log = log
+        self.hooks = hooks
         shardSeconds = try IntervalText.seconds(configuration.shardDuration)
         retentionSeconds = try IntervalText.seconds(configuration.retentionPeriod)
         queue = DispatchQueue(label: "hbnvr.local-store.\(configuration.id)")
         status = RecordingStoreStatus(id: configuration.id, name: configuration.name, enabled: configuration.enabled, state: configuration.enabled ? "ready" : "disabled")
-        let root = try StoreDirectory.openDirectory(configuration.directory)
-        directoryFD = root
         path = configuration.directory
+        do { try openDestination() }
+        catch {
+            guard recoverUnavailable else { throw error }
+            opening.failed(message(error), now: hooks.now())
+            report("\(message(error)); destination will be retried automatically.")
+        }
+        refreshStatus()
+        if hooks.automaticMaintenance {
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: 1)
+            timer.setEventHandler { [weak self] in self?.maintain() }
+            self.timer = timer; timer.resume()
+        }
+    }
+    private func openDestination() throws {
+        try hooks.before(.openDestination, nil)
+        let root = try StoreDirectory.openDirectory(path)
         do {
             try StoreDirectory.validate(root, owner: configuration.ownerUID, daemon: geteuid())
             instanceLock = try InstanceLock(path: path + "/.hbnvr.lock")
@@ -198,50 +300,102 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             }
             // Real write/unlink probe in the daemon identity, before reporting usable.
             let name = ".probe-" + UUID().uuidString
-            let probe = openat(directoryFD, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+            let probe = openat(root, name, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
             guard probe >= 0 else { throw ServiceError.posix("Daemon cannot write to recording destination") }
             close(probe)
-            guard unlinkat(directoryFD, name, 0) == 0 else { throw ServiceError.posix("Daemon cannot clean up recording destination") }
-        } catch { close(directoryFD); throw error }
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: 30)
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            self.lock.lock(); let stopping = self.finished; self.lock.unlock()
-            guard !stopping else { return }
-            do { try self.expire() } catch { self.fail(error); self.finishTracks() }
+            guard unlinkat(root, name, 0) == 0 else { throw ServiceError.posix("Daemon cannot clean up recording destination") }
+            directoryFD = root
+            opening = Retry()
+        } catch {
+            instanceLock = nil; legacyLock = nil; close(root); throw error
         }
-        self.timer = timer; timer.resume()
     }
-    deinit { timer?.cancel(); close(directoryFD) }
+    deinit { timer?.cancel(); if directoryFD >= 0 { close(directoryFD) } }
+
+    // Also callable by deterministic tests; all maintenance stays on the store worker.
+    func performMaintenance() { queue.async { [self] in maintain() } }
+    private func maintain() {
+        lock.lock(); let stopping = finished; lock.unlock()
+        guard !stopping else { return }
+        defer { refreshStatus() }
+        retryManifestUpdates()
+        if directoryFD < 0 {
+            guard hooks.now() >= opening.deadline else { return }
+            do { try openDestination() }
+            catch {
+                opening.failed(message(error), now: hooks.now())
+                report("\(message(error)); destination retry in \(Int(opening.deadline - hooks.now()))s.")
+                return
+            }
+        }
+        guard hooks.now() >= nextRetention else { return }
+        nextRetention = hooks.now() + 30
+        do { try LocalRecordingLayout.verify(path: path, fd: directoryFD, owner: configuration.ownerUID) }
+        catch {
+            // A removed/replaced mount must be reopened and validated, never used
+            // through stale path/descriptor pairs. Keep all prior media intact.
+            finishTracks(); manifests.removeAll()
+            instanceLock = nil; legacyLock = nil
+            close(directoryFD); directoryFD = -1
+            opening.failed(message(error), now: hooks.now())
+            report("Destination unavailable; reopening automatically. \(message(error))")
+            return
+        }
+        do { try hooks.before(.retention, nil); try expire(); retentionWarning = nil }
+        catch {
+            let warning = message(error)
+            if retentionWarning != warning { report("Retention will retry; recording continues. \(warning)") }
+            retentionWarning = warning
+        }
+    }
 
     func snapshot() -> RecordingStoreStatus {
         lock.lock(); defer { lock.unlock() }
-        var value = status; value.pendingBytes = queuedBytes; return value
+        var value = status; value.pendingBytes = queuedBytes
+        value.playbackRAMBytes = RecordingRAMCache.shared.retainedBytes(store: configuration.id)
+        return value
     }
     func accept(_ event: RecordingEvent) {
         lock.lock()
         guard accepting, configuration.enabled else { lock.unlock(); return }
+        if queueRecovering { droppedEvents &+= 1; lock.unlock(); return }
         guard queuedBytes + event.bytes <= 32 * 1024 * 1024, queuedEvents < 2048 else {
-            accepting = false
-            status.recordFailure("Local store queue limit reached; reception continues. Disable/enable this store to retry.")
+            queueRecovering = true; droppedEvents &+= 1
+            status.state = "retrying"
+            status.lastError = "Local store queue limit reached; draining and automatically restarting at fresh keyframes."
+            // Schedule while locked, before shutdown's final barrier can be queued.
+            queue.async { [self] in
+                report("Queue limit reached; automatic keyframe recovery after draining.")
+                for track in cameras.values {
+                    if track.writer != nil {
+                        recordingFailed(ServiceError("Local store queue limit reached; dropped frames require a new shard."), track: track)
+                    } else { track.clock = LocalRecordingClock() }
+                }
+                lock.lock(); queueRecovering = false; lock.unlock()
+                refreshStatus()
+            }
             lock.unlock()
-            log("Store \(configuration.id): queue limit reached; recording stopped, reception continues.")
-            queue.async { [self] in finishTracks() }
             return
         }
         queuedBytes += event.bytes; queuedEvents += 1
-        lock.unlock()
         queue.async { [self] in
             defer { lock.lock(); queuedBytes -= event.bytes; queuedEvents -= 1; lock.unlock() }
-            do {
-                switch event {
-                case .end(let camera):
-                    if let track = cameras.removeValue(forKey: camera) { try finish(track) }
-                case .media(let camera, let name, let media): try consume(camera: camera, name: name, media: media)
+            defer { refreshStatus() }
+            switch event {
+            case .end(let camera):
+                if let track = cameras[camera] {
+                    do { try finish(track) } catch { recordingFailed(error, track: track) }
+                    track.clock = LocalRecordingClock()
+                    if track.retry.message == nil && track.indexRetry.message == nil { cameras[camera] = nil }
                 }
-            } catch { fail(error); finishTracks() }
+            case .media(let camera, let name, let media, let hardware):
+                let track = cameras[camera] ?? Track(camera: camera); cameras[camera] = track
+                guard directoryFD >= 0, hooks.now() >= track.retry.deadline else { return }
+                do { try consume(camera: camera, name: name, media: media, homebaseDeviceID: hardware) }
+                catch { recordingFailed(error, track: track) }
+            }
         }
+        lock.unlock()
     }
     func finish(timeout: TimeInterval) -> Bool {
         lock.lock()
@@ -252,6 +406,10 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             queue.async { [self] in
                 timer?.cancel(); timer = nil
                 finishTracks()
+                // Never delay shutdown for a retry window or persist another
+                // journal. Pending metadata is volatile; report every loss.
+                for pending in manifestRetries { discardManifest(pending, reason: "store stopped") }
+                manifestRetries.removeAll()
                 manifests.removeAll()
                 // Release before notifying a replacing instance, not at eventual deinit.
                 instanceLock = nil
@@ -267,16 +425,116 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         queue.async { barrier.leave() }
         return barrier.wait(timeout: .now() + timeout) == .success
     }
-    private func fail(_ error: Error) {
-        let message = (error as? ServiceError)?.message ?? "Local recording failed; check destination access and free space."
-        lock.lock(); accepting = false
-        status.recordFailure(message)
-        lock.unlock()
-        log("Store \(configuration.id): \(message)")
+    private func message(_ error: Error) -> String {
+        (error as? ServiceError)?.message ?? "Local recording failed (\(MP4WriterWait.errorCodes(error))); check destination access and free space."
+    }
+    private func report(_ message: String, camera: String? = nil) {
+        log("Store \(configuration.id)\(camera.map { ", camera \($0)" } ?? ""): \(message)")
+        guard directoryFD >= 0 else { return }
+        do {
+            try LocalRecordingLayout.verify(path: path, fd: directoryFD, owner: configuration.ownerUID)
+            try LocalRecordingErrorLog.append(message, camera: camera, directory: directoryFD)
+            diagnosticWarning = nil
+        } catch {
+            let warning = "Could not append \(LocalRecordingErrorLog.filename): \(self.message(error)) Errors still go to the agent log."
+            if diagnosticWarning != warning { log("Store \(configuration.id): \(warning)") }
+            diagnosticWarning = warning
+        }
+    }
+    private func refreshStatus() {
+        let retrying = cameras.values.filter { $0.retry.message != nil }
+        let indexWarning = manifestRetries.first.map { "Manifest retry pending for shard \($0.id): \($0.retry.message ?? "write failed")" } ?? cameras.values.compactMap { track in
+            track.indexRetry.message.map { "\(track.name): \($0)" }
+        }.sorted().first
+        lock.lock(); defer { lock.unlock() }
+        status.local = LocalStoreStatus(retryingDestination: directoryFD < 0, retryingCameras: retrying.count, droppedEvents: droppedEvents,
+            manifestWarning: indexWarning, retentionWarning: retentionWarning, errorLogWarning: diagnosticWarning)
+        if !finished {
+            status.lastError = opening.message ?? retrying.sorted { $0.camera < $1.camera }.first?.retry.message
+            status.state = !configuration.enabled ? "disabled" : (directoryFD < 0 || queueRecovering || !retrying.isEmpty)
+                ? (status.activeRecordings > 0 ? "degraded" : "retrying")
+                : (indexWarning != nil || retentionWarning != nil || diagnosticWarning != nil ? "degraded" : "ready")
+        }
+    }
+    private func recordingFailed(_ error: Error, track: Track) {
+        let original = message(error)
+        let retry = track.retry
+        // End only this camera's damaged shard. Never cancel/delete AVFoundation's
+        // output, and never latch the store off because cleanup also failed.
+        do { try finish(track) }
+        catch { report("Shard cleanup: \(message(error))", camera: track.camera) }
+        track.retry = retry
+        track.retry.failed(original, now: hooks.now())
+        track.clock = LocalRecordingClock()
+        track.directory = nil; track.manifest = nil
+        report("\(original) Retrying a new shard on a keyframe in \(Int(track.retry.deadline - hooks.now()))s.", camera: track.camera)
+    }
+    private func indexFailed(_ error: Error, track: Track) {
+        let warning = message(error)
+        track.indexRetry.failed(warning, now: hooks.now())
+        if let directory = track.directory { manifests[directory.path] = nil }
+        track.manifest = nil; track.recordingID = nil
+        report("\(warning) Video recording continues; retained metadata will be retried after this shard finalizes.", camera: track.camera)
+    }
+    private func writeRetainedManifest(_ value: LocalRecordingManifest.Completion, path: String) throws {
+        let directory = LocalRecordingLayout.Directory(path: path, fd: try StoreDirectory.openDirectory(path))
+        let identity = LocalRecordingLayout.Identity(storeID: configuration.id, cameraID: value.seed.timing.cameraID)
+        guard try LocalRecordingLayout.identity(in: directory.fd) == identity else {
+            throw ServiceError("Camera directory identity changed before manifest retry; index was preserved.")
+        }
+        let manifest = try LocalRecordingManifest(directory: directory, identity: identity,
+            owner: configuration.ownerUID, recoverInterrupted: false)
+        try manifest.completeRetained(value)
+        try hooks.before(.manifestCommitted, identity.cameraID)
+    }
+    private func enqueueManifest(_ value: LocalRecordingManifest.Completion, directory: String, error: Error) {
+        let now = hooks.now()
+        var retry = Retry(); retry.failed(message(error), now: now)
+        let pending = ManifestRetry(directory: directory, completion: value,
+            expires: now + Self.manifestRetryLifetime, retry: retry)
+        // A shard contributes at most one immutable finalized update. Do not
+        // extend its lifetime or replace accepted work when the queue is full.
+        guard !manifestRetries.contains(where: { $0.id == pending.id }) else { return }
+        guard manifestRetries.count < Self.manifestRetryLimit else {
+            discardManifest(pending, reason: "retry queue full (\(Self.manifestRetryLimit) entries)"); return
+        }
+        manifestRetries.append(pending)
+        report("Manifest write failed for shard \(pending.id): \(message(error)) Retrying finalized metadata in 1s, for at most 60s; video preserved.", camera: pending.camera)
+    }
+    private func discardManifest(_ pending: ManifestRetry, reason: String) {
+        report("Manifest retry discarded for shard \(pending.id): \(reason). Video preserved; this shard may be absent from playback. Last error: \(pending.retry.message ?? "unknown")", camera: pending.camera)
+    }
+    private func retryManifestUpdates() {
+        let now = hooks.now()
+        let expired = manifestRetries.filter { now >= $0.expires }
+        manifestRetries.removeAll { now >= $0.expires }
+        for pending in expired { discardManifest(pending, reason: "60s retry window expired") }
+        // At most one attempt per maintenance tick, independent of camera count.
+        guard let index = manifestRetries.indices.filter({ manifestRetries[$0].retry.deadline <= now })
+            .min(by: { manifestRetries[$0].retry.deadline < manifestRetries[$1].retry.deadline }) else { return }
+        var pending = manifestRetries[index]
+        do {
+            try hooks.before(.retryManifest, pending.camera)
+            try writeRetainedManifest(pending.completion, path: pending.directory)
+            manifestRetries.remove(at: index)
+            if let track = cameras[pending.camera], !manifestRetries.contains(where: { $0.camera == pending.camera }),
+               track.writer == nil || track.recordingID != nil {
+                track.indexRetry = Retry()
+            }
+            report("Manifest retry succeeded for shard \(pending.id) after \(pending.retry.failures) retry attempt(s); playback index restored.", camera: pending.camera)
+        } catch {
+            pending.retry.failed(message(error), now: now)
+            manifestRetries[index] = pending
+            report("Manifest retry failed for shard \(pending.id): \(message(error)) \(pending.retry.deadline < pending.expires ? "Next retry in \(Int(pending.retry.deadline - now))s." : "Retry window expires before another attempt.")", camera: pending.camera)
+        }
     }
     private func finishTracks() {
         for track in cameras.values {
-            do { try finish(track) } catch { fail(error) }
+            do { try finish(track) }
+            catch {
+                lock.lock(); status.lastError = message(error); lock.unlock()
+                report("Finalization failed; file preserved. \(message(error))", camera: track.camera)
+            }
         }
         cameras.removeAll()
     }
@@ -284,17 +542,40 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         guard let writer = track.writer else { return }
         track.writer = nil
         let recordingID = track.recordingID; track.recordingID = nil
+        let seed = track.manifestSeed; track.manifestSeed = nil
         defer { lock.lock(); status.activeRecordings -= 1; lock.unlock() }
         do {
+            try hooks.before(.finalize, track.camera)
             try writer.finish()
-            if let recordingID, let manifest = track.manifest {
-                try manifest.complete(id: recordingID, filename: writer.finalName,
-                                      endTicks: writer.endTicks, frames: writer.sampleCount)
-            }
         } catch {
-            if let recordingID { try? track.manifest?.interrupt(id: recordingID) }
+            if let recordingID {
+                do { try track.manifest?.interrupt(id: recordingID) }
+                catch { indexFailed(error, track: track) }
+            }
             throw error
         }
+        if let seed, let file = writer.finalizedFile, let directory = track.directory {
+            let completion = LocalRecordingManifest.Completion(seed: seed, endTicks: writer.endTicks,
+                frames: writer.sampleCount, file: file)
+            let recovering = track.indexRetry.message != nil
+            do {
+                try hooks.before(.completeManifest, track.camera)
+                if let recordingID, let manifest = track.manifest {
+                    try manifest.complete(id: recordingID, filename: writer.finalName,
+                                          endTicks: writer.endTicks, frames: writer.sampleCount)
+                    try hooks.before(.manifestCommitted, track.camera)
+                } else {
+                    try writeRetainedManifest(completion, path: directory.path)
+                }
+                track.indexRetry = Retry()
+                if recovering { report("Manifest write recovered at finalization for shard \(seed.timing.shardID); playback index restored.", camera: track.camera) }
+            } catch {
+                track.indexRetry.failed(message(error), now: hooks.now())
+                manifests[directory.path] = nil; track.manifest = nil
+                enqueueManifest(completion, directory: directory.path, error: error)
+            }
+        }
+        track.retry = Retry()
         lock.lock(); status.completedShards &+= 1; lock.unlock()
     }
     private func manifest(for directory: LocalRecordingLayout.Directory,
@@ -311,11 +592,9 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         manifests[directory.path] = value
         return value
     }
-    private func consume(camera: String, name: String, media: EncodedMedia) throws {
+    private func consume(camera: String, name: String, media: EncodedMedia, homebaseDeviceID: String?) throws {
         guard UUID(uuidString: camera) != nil else { throw ServiceError("Invalid recording camera ID.") }
-        lock.lock(); let failed = status.state == "error"; lock.unlock()
-        if failed { return }
-        let track = cameras[camera] ?? Track(); cameras[camera] = track
+        let track = cameras[camera]!
         if track.name != name { try finish(track); track.name = name; track.directory = nil; track.manifest = nil }
         if track.codec != media.codec { try finish(track); track.codec = media.codec; track.sets.removeAll(); track.clock = LocalRecordingClock() }
         let nals = try Self.nals(media.frame.payload)
@@ -351,23 +630,39 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             }
             let directory = track.directory!
             try LocalRecordingLayout.verify(path: directory.path, fd: directory.fd, owner: configuration.ownerUID)
-            track.manifest = try manifest(for: directory,
-                identity: .init(storeID: configuration.id, cameraID: camera), create: true)
             let timing = ShardTimingMetadata(storeID: configuration.id, cameraID: camera, media: media, time: observed.timing)
+            try hooks.before(.createShard, camera)
             track.writer = try MP4Shard(directory: directory,
                                         codec: media.codec, sets: required.map { track.sets[$0]! }, clock: media.clockRate,
                                         firstTimestamp: media.frame.timestamp, capturedAt: observed.time, timing: timing)
             lock.lock(); status.activeRecordings += 1; lock.unlock()
             let id = timing.shardID
-            try track.manifest!.begin(id: id, temporaryName: track.writer!.temporaryName, finalName: track.writer!.finalName,
-                                      start: observed.time, timescale: media.clockRate, sourceTimestamp: media.frame.timestamp, timing: timing)
-            track.recordingID = id
-            track.lastManifestCheckpoint = ProcessInfo.processInfo.systemUptime
+            let seed = LocalRecordingManifest.Seed(temporaryName: track.writer!.temporaryName,
+                finalName: track.writer!.finalName, timing: timing,
+                camera: .init(name: name, homebaseDeviceID: homebaseDeviceID))
+            track.manifestSeed = seed
+            if hooks.now() >= track.indexRetry.deadline {
+                do {
+                    try hooks.before(.beginManifest, camera)
+                    track.manifest = try manifest(for: directory,
+                        identity: .init(storeID: configuration.id, cameraID: camera), create: true)
+                    try track.manifest!.begin(id: id, temporaryName: track.writer!.temporaryName, finalName: track.writer!.finalName,
+                                      start: observed.time, timescale: media.clockRate, sourceTimestamp: media.frame.timestamp, timing: timing,
+                                      cameraMetadata: seed.camera)
+                    track.recordingID = id
+                } catch { indexFailed(error, track: track) }
+            }
+            track.lastManifestCheckpoint = hooks.now()
         }
+        try hooks.before(.append, camera)
         try track.writer!.append(media.frame)
-        let now = ProcessInfo.processInfo.systemUptime
+        track.retry.message = nil
+        let now = hooks.now()
         if now - track.lastManifestCheckpoint >= 5, let id = track.recordingID, let writer = track.writer {
-            try track.manifest!.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount)
+            do {
+                try hooks.before(.checkpointManifest, camera)
+                try track.manifest!.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount)
+            } catch { indexFailed(error, track: track) }
             track.lastManifestCheckpoint = now
         }
         lock.lock(); status.recordedFrames &+= 1; lock.unlock()
@@ -396,23 +691,30 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     private func expire() throws {
         try LocalRecordingLayout.verify(path: path, fd: directoryFD, owner: configuration.ownerUID)
         let cutoff = Date().addingTimeInterval(-Double(retentionSeconds))
+        var failure: Error?
         for leaf in try FileManager.default.contentsOfDirectory(atPath: path) {
-            var info = stat()
-            guard fstatat(directoryFD, leaf, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
-                if errno == ENOENT { continue }; throw ServiceError.posix("Inspect retained recording directory")
-            }
-            guard info.st_mode & S_IFMT == S_IFDIR else { continue }
-            let child = openat(directoryFD, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard child >= 0 else { throw ServiceError.posix("Open retained recording directory") }
-            let directory = LocalRecordingLayout.Directory(path: path + "/" + leaf, fd: child)
-            let legacy = leaf == "hbnvr-" + configuration.id
-            let identity = try LocalRecordingLayout.identity(in: child)
-            guard legacy || identity?.storeID == configuration.id else { continue }
-            try StoreDirectory.validate(child, owner: configuration.ownerUID, daemon: geteuid())
-            let index = try identity.flatMap { try manifest(for: directory, identity: $0, create: false) }
-            try expire(in: child, path: directory.path, legacy: legacy, cutoff: cutoff, manifest: index)
-            withExtendedLifetime(directory) {}
+            do {
+                var info = stat()
+                guard fstatat(directoryFD, leaf, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    if errno == ENOENT { continue }; throw ServiceError.posix("Inspect retained recording directory")
+                }
+                guard info.st_mode & S_IFMT == S_IFDIR else { continue }
+                let child = openat(directoryFD, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard child >= 0 else { throw ServiceError.posix("Open retained recording directory") }
+                let directory = LocalRecordingLayout.Directory(path: path + "/" + leaf, fd: child)
+                let legacy = leaf == "hbnvr-" + configuration.id
+                let identity = try LocalRecordingLayout.identity(in: child)
+                guard legacy || identity?.storeID == configuration.id else { continue }
+                try StoreDirectory.validate(child, owner: configuration.ownerUID, daemon: geteuid())
+                var index: LocalRecordingManifest?
+                do { index = try identity.flatMap { try manifest(for: directory, identity: $0, create: false) } }
+                catch { if failure == nil { failure = error } }
+                // Expiration of owned media must not depend on a functioning index.
+                try expire(in: child, path: directory.path, legacy: legacy, cutoff: cutoff, manifest: index)
+                withExtendedLifetime(directory) {}
+            } catch { if failure == nil { failure = error } }
         }
+        if let failure { throw failure }
     }
     private func expire(in fd: Int32, path: String, legacy: Bool, cutoff: Date, manifest: LocalRecordingManifest?) throws {
         var active = Set<String>()
@@ -424,21 +726,25 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
                 active.insert(writer.temporaryName)
             }
         }
+        var failure: Error?
         for name in try FileManager.default.contentsOfDirectory(atPath: path) {
-            guard !active.contains(name), legacy ? Self.expirationDate(name) != nil : LocalRecordingLayout.isShard(name) else { continue }
-            var info = stat()
-            guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
-                if errno == ENOENT { continue }; throw ServiceError.posix("Inspect retained recording")
-            }
-            guard info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1, info.st_uid == geteuid() else { continue }
-            // Keep readable start-time filenames stable on commit. Filesystem times
-            // avoid local-time/DST ambiguity and preserve completion-based retention.
-            let timestamp = name.hasSuffix(".recording") ? info.st_birthtimespec : info.st_mtimespec
-            let date = legacy ? Self.expirationDate(name)! : Date(timeIntervalSince1970: Double(timestamp.tv_sec) + Double(timestamp.tv_nsec) / 1e9)
-            guard date < cutoff else { continue }
-            guard unlinkat(fd, name, 0) == 0 else { throw ServiceError.posix("Expire retained recording") }
-            try manifest?.remove(filename: name)
+            do {
+                guard !active.contains(name), legacy ? Self.expirationDate(name) != nil : LocalRecordingLayout.isShard(name) else { continue }
+                var info = stat()
+                guard fstatat(fd, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    if errno == ENOENT { continue }; throw ServiceError.posix("Inspect retained recording")
+                }
+                guard info.st_mode & S_IFMT == S_IFREG, info.st_nlink == 1, info.st_uid == geteuid() else { continue }
+                // Keep readable start-time filenames stable on commit. Filesystem times
+                // avoid local-time/DST ambiguity and preserve completion-based retention.
+                let timestamp = name.hasSuffix(".recording") ? info.st_birthtimespec : info.st_mtimespec
+                let date = legacy ? Self.expirationDate(name)! : Date(timeIntervalSince1970: Double(timestamp.tv_sec) + Double(timestamp.tv_nsec) / 1e9)
+                guard date < cutoff else { continue }
+                guard unlinkat(fd, name, 0) == 0 else { throw ServiceError.posix("Expire retained recording") }
+                try manifest?.remove(filename: name)
+            } catch { if failure == nil { failure = error } }
         }
+        if let failure { throw failure }
     }
 }
 
@@ -460,11 +766,15 @@ final class MP4Shard {
     private var syncFD: Int32 = -1
     private var lastSync: TimeInterval = 0
     private var finalization: DispatchGroup?
+    private let timing: ShardTimingMetadata?
+    private var readableFile: GrowingMediaFile?
+    private var ramTail: RecordingRAMTail?
+    private(set) var finalizedFile: LocalRecordingManifest.FileIdentity?
     var endTicks: Int64 { samples == 0 ? 0 : ticks + lastDuration }
     var sampleCount: Int64 { Int64(samples) }
     init(directory: LocalRecordingLayout.Directory, codec: String, sets: [Data], clock: UInt32, firstTimestamp: UInt32, capturedAt: Date = Date(), timing: ShardTimingMetadata? = nil) throws {
         guard clock > 0, clock <= Int32.max else { throw ServiceError("Unsupported video clock rate.") }
-        self.clock = Int32(clock); last = firstTimestamp; directoryFD = directory.fd; self.directory = directory
+        self.clock = Int32(clock); last = firstTimestamp; directoryFD = directory.fd; self.directory = directory; self.timing = timing
         lastDuration = Int64(clock) / 15
         format = try Self.format(codec: codec, sets: sets)
         finalName = try LocalRecordingLayout.availableStem(in: directory.fd, at: capturedAt) + ".mp4"
@@ -482,8 +792,11 @@ final class MP4Shard {
         writer.add(input)
         guard writer.startWriting() else { throw ServiceError("Could not start MP4 recording; check free space and permissions.") }
         writer.startSession(atSourceTime: .zero)
+        if let timing { ramTail = RecordingRAMCache.shared.open(timing: timing, codec: codec, sets: sets) }
     }
     deinit {
+        ramTail?.close()
+        readableFile?.invalidate()
         // cancelWriting deletes its output. Even on an error/timeout, leave the
         // visible recording intact and let an already-started finalization finish.
         if writer.status == .writing, finalization == nil { _ = beginFinalization() }
@@ -511,7 +824,7 @@ final class MP4Shard {
         try MP4WriterWait.untilReady(
             ready: { self.input.isReadyForMoreMediaData },
             failure: { self.writer.status == .writing ? nil : self.writerFailure("accept video") },
-            timeoutMessage: "Local MP4 writer remained backpressured for 30 seconds; reception continues. The bounded store queue may contain unrecorded video. Check status and retry this store.")
+            timeoutMessage: "Local MP4 writer remained backpressured for 30 seconds; reception continues. Queued video may be unrecorded; a new shard will be retried automatically.")
         var block: CMBlockBuffer?
         guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: frame.payload.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: frame.payload.count, flags: 0, blockBufferOut: &block) == noErr, let block else { throw ServiceError("Could not allocate encoded sample.") }
         let copied = frame.payload.withUnsafeBytes { CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: $0.count) }
@@ -523,6 +836,7 @@ final class MP4Shard {
             CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(), Unmanaged.passUnretained(frame.keyFrame ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
         }
         guard input.append(sample) else { throw writerFailure("append video") }
+        ramTail?.append(block: block, pts: ticks, duration: lastDuration, key: frame.keyFrame)
         samples += 1
         try checkpoint()
     }
@@ -537,6 +851,10 @@ final class MP4Shard {
                   info.st_uid == geteuid(), info.st_nlink == 1,
                   fchmod(syncFD, 0o600) == 0 else { throw ServiceError("Unsafe in-progress recording file.") }
             guard fsync(directoryFD) == 0 else { throw ServiceError.posix("Persist recording directory entry") }
+            if let timing {
+                let file = try GrowingMediaFile.publish(fd: syncFD, timing: timing)
+                readableFile = file; ramTail?.attach(file)
+            }
         }
         guard now - lastSync >= 5 else { return }
         // Batch flushes on this store's worker, never on reception or every frame.
@@ -546,6 +864,7 @@ final class MP4Shard {
     }
     private func beginFinalization() -> DispatchGroup {
         if let finalization { return finalization }
+        readableFile?.invalidate(); readableFile = nil
         let done = DispatchGroup(); done.enter(); finalization = done
         input.markAsFinished()
         // Keep the writer alive if the caller's bounded wait expires. Never cancel
@@ -570,6 +889,9 @@ final class MP4Shard {
         guard fchmod(fd, 0o600) == 0, futimens(fd, nil) == 0, fsync(fd) == 0 else { throw ServiceError.posix("Secure completed recording") }
         guard renameatx_np(directoryFD, temporaryName, directoryFD, finalName, UInt32(RENAME_EXCL)) == 0 else { throw ServiceError.posix("Publish completed recording") }
         guard fsync(directoryFD) == 0 else { throw ServiceError.posix("Persist completed recording name") }
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { throw ServiceError.posix("Inspect completed recording identity") }
+        finalizedFile = LocalRecordingManifest.FileIdentity(info)
     }
     private func writerFailure(_ operation: String) -> ServiceError {
         ServiceError("MP4 writer could not \(operation) (state \(writer.status.rawValue); \(MP4WriterWait.errorCodes(writer.error))). The .mp4.recording file was left for recovery.")

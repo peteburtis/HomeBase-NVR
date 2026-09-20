@@ -341,7 +341,7 @@ final class StoreTests: XCTestCase {
         let manager = RecordingStoreManager()
         manager.load([good, missing])
         XCTAssertTrue(manager.hasWritableStore)
-        XCTAssertEqual(manager.snapshot().first { $0.id == missing.id }?.state, "error")
+        XCTAssertEqual(manager.snapshot().first { $0.id == missing.id }?.state, "retrying")
         for media in try Self.video() { manager.accept(.media(camera: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", name: "Test Camera", media)) }
         manager.stop()
         XCTAssertEqual(manager.snapshot().first { $0.id == good.id }?.recordedFrames, 45)
@@ -350,9 +350,305 @@ final class StoreTests: XCTestCase {
         let store = try LocalRecordingStore(configuration: config(root + "/bounded"))
         let oversized = EncodedMedia(codec: "H264", clockRate: 90000, parameterSets: [], frame: EncodedVideoFrame(payload: Data(count: 33 * 1024 * 1024), timestamp: 0, keyFrame: true))
         store.accept(.media(camera: UUID().uuidString, name: "Test Camera", oversized))
-        XCTAssertEqual(store.snapshot().state, "error")
+        XCTAssertTrue(store.flush(timeout: 2))
+        XCTAssertEqual(store.snapshot().local?.droppedEvents, 1)
         XCTAssertEqual(store.snapshot().pendingBytes, 0)
+        let recoveredCamera = UUID().uuidString
+        for media in try Self.video() { store.accept(.media(camera: recoveredCamera, name: "Recovery", media)) }
+        XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertGreaterThan(store.snapshot().recordedFrames, 0)
         XCTAssertTrue(store.finish(timeout: 2))
+    }
+    func testManifestFailuresRecoverTheAffectedShardWithoutStoppingVideo() async throws {
+        for operation in [LocalRecordingStore.Operation.beginManifest, .checkpointManifest, .completeManifest] {
+            let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+            var now: TimeInterval = 0, failing = true
+            let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, _ in
+                if step == operation && failing { throw ServiceError("Injected SQLite 10, extended 778, OS 5") }
+            }, automaticMaintenance: false))
+            defer { _ = store.finish(timeout: 5) }
+            let frames = try Self.video(count: 90)
+            for frame in frames.prefix(10) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+            XCTAssertTrue(store.flush(timeout: 5)); now = 6
+            for frame in frames[10..<45] { store.accept(.media(camera: camera, name: "Camera", frame)) }
+            store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+            XCTAssertEqual(store.snapshot().recordedFrames, 45)
+            XCTAssertEqual(store.snapshot().completedShards, 1)
+            if operation == .completeManifest { XCTAssertNotNil(store.snapshot().local?.manifestWarning) }
+            else { XCTAssertNil(store.snapshot().local?.manifestWarning) }
+            XCTAssertNil(store.snapshot().lastError)
+            let folder = configuration.directory + "/Camera"
+            let first = try XCTUnwrap(FileManager.default.contentsOfDirectory(atPath: folder).first { $0.hasSuffix(".mp4") })
+            let count = try await decodedFrames(folder + "/" + first)
+            XCTAssertEqual(count, 45)
+            let log = try String(contentsOfFile: configuration.directory + "/" + LocalRecordingErrorLog.filename, encoding: .utf8)
+            XCTAssertTrue(log.contains("SQLite 10")); XCTAssertTrue(log.contains(camera))
+            failing = false; now = 7
+            store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+            XCTAssertNil(store.snapshot().local?.manifestWarning)
+            let recoveryLog = try String(contentsOfFile: configuration.directory + "/" + LocalRecordingErrorLog.filename, encoding: .utf8)
+            XCTAssertTrue(recoveryLog.contains(operation == .completeManifest ? "Manifest retry succeeded" : "Manifest write recovered at finalization"))
+            now = 100
+            for frame in frames.dropFirst(45) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+            store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+            XCTAssertEqual(store.snapshot().completedShards, 2)
+            XCTAssertEqual(store.snapshot().recordedFrames, 90)
+            XCTAssertNil(store.snapshot().local?.manifestWarning)
+            let directory = LocalRecordingLayout.Directory(path: folder, fd: try StoreDirectory.openDirectory(folder))
+            let manifest = try LocalRecordingManifest(directory: directory,
+                identity: .init(storeID: configuration.id, cameraID: camera), owner: geteuid(), readOnly: true)
+            XCTAssertEqual(try manifest.recordings().filter { $0.state == .complete }.count, 2)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: folder + "/" + first))
+        }
+    }
+    func testManifestRetriesBackOffExpireAndKeepVideo() throws {
+        let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+        var now: TimeInterval = 0, attempts: [TimeInterval] = []
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, _ in
+            if step == .retryManifest { attempts.append(now); throw ServiceError("Injected retry failure") }
+            if step == .completeManifest { throw ServiceError("Injected final index failure") }
+        }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        for frame in try Self.video() { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        for instant in [0.0, 0.5, 1, 2, 3, 6, 7, 14, 15, 30, 31, 59, 60, 61, 100] {
+            now = instant; store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        }
+        XCTAssertEqual(attempts, [1, 3, 7, 15, 31])
+        let log = try String(contentsOfFile: configuration.directory + "/" + LocalRecordingErrorLog.filename, encoding: .utf8)
+        XCTAssertEqual(log.components(separatedBy: "Manifest retry failed").count - 1, 5)
+        XCTAssertEqual(log.components(separatedBy: "60s retry window expired").count - 1, 1)
+        XCTAssertTrue(log.contains("Video preserved"))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: configuration.directory + "/Camera").filter { $0.hasSuffix(".mp4") }.count, 1)
+        XCTAssertEqual(store.snapshot().completedShards, 1)
+    }
+    func testManifestRetryQueueIsCappedAndShutdownLogsDiscard() throws {
+        let configuration = try config(try temporary() + "/output")
+        var now: TimeInterval = 0, retryAttempts = 0
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, _ in
+            if step == .completeManifest { throw ServiceError("Injected persistent failure") }
+            if step == .retryManifest { retryAttempts += 1; throw ServiceError("Injected persistent failure") }
+        }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        let key = try XCTUnwrap(Self.video().first)
+        for index in 0...LocalRecordingStore.manifestRetryLimit {
+            let camera = UUID().uuidString
+            store.accept(.media(camera: camera, name: "Camera \(index)", key)); store.accept(.end(camera: camera))
+            XCTAssertTrue(store.flush(timeout: 5))
+        }
+        XCTAssertEqual(store.snapshot().completedShards, UInt64(LocalRecordingStore.manifestRetryLimit + 1))
+        now = 1
+        store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(retryAttempts, 1) // One attempt per tick, not a retry storm.
+        XCTAssertTrue(store.finish(timeout: 5))
+        let log = try String(contentsOfFile: configuration.directory + "/" + LocalRecordingErrorLog.filename, encoding: .utf8)
+        XCTAssertEqual(log.components(separatedBy: "retry queue full").count - 1, 1)
+        XCTAssertEqual(log.components(separatedBy: "store stopped").count - 1, LocalRecordingStore.manifestRetryLimit)
+        now = 10; store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(retryAttempts, 1)
+    }
+    func testManifestRetryAcceptsLostCommitAcknowledgmentWithoutDuplicating() throws {
+        let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+        var now: TimeInterval = 0, loseAck = true
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, _ in
+            if step == .manifestCommitted && loseAck { loseAck = false; throw ServiceError("Injected lost acknowledgment") }
+        }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        for frame in try Self.video() { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertNotNil(store.snapshot().local?.manifestWarning)
+        now = 1; store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertNil(store.snapshot().local?.manifestWarning)
+        let path = configuration.directory + "/Camera"
+        let directory = LocalRecordingLayout.Directory(path: path, fd: try StoreDirectory.openDirectory(path))
+        let db = try LocalRecordingManifest(directory: directory, identity: .init(storeID: configuration.id, cameraID: camera), owner: geteuid(), readOnly: true)
+        let rows = try db.recordings()
+        XCTAssertEqual(rows.count, 1); XCTAssertEqual(rows.first?.state, .complete)
+        XCTAssertEqual(rows.first?.frames, 45)
+    }
+    func testManifestRetryRestoresMissingBeginWhileNextShardKeepsRecording() throws {
+        let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+        var now: TimeInterval = 0, failing = true
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, _ in
+            if failing && (step == .beginManifest || step == .completeManifest) { throw ServiceError("Injected unavailable index") }
+        }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        let frames = try Self.video(count: 90)
+        for frame in frames.prefix(45) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertNotNil(store.snapshot().local?.manifestWarning)
+        now = 3; failing = false
+        for frame in frames.dropFirst(45) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        XCTAssertTrue(store.flush(timeout: 5))
+        store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        let folder = configuration.directory + "/Camera"
+        let directory = LocalRecordingLayout.Directory(path: folder, fd: try StoreDirectory.openDirectory(folder))
+        let db = try LocalRecordingManifest(directory: directory, identity: .init(storeID: configuration.id, cameraID: camera), owner: geteuid(), readOnly: true)
+        let rows = try db.recordings()
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows.map(\.state), [.complete, .recording])
+        XCTAssertEqual(rows.first?.frames, 45)
+        XCTAssertEqual(store.snapshot().activeRecordings, 1)
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(try db.recordings().map(\.state), [.complete, .complete])
+        XCTAssertNil(store.snapshot().local?.manifestWarning)
+    }
+    func testWriterFailureIsCameraScopedAndRecoversAtKeyframe() throws {
+        let configuration = try config(try temporary() + "/output")
+        let first = UUID().uuidString, second = UUID().uuidString, frames = try Self.video(count: 90)
+        var now: TimeInterval = 0, failing = false
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, camera in
+            if step == .append && camera == first && failing { throw ServiceError("Injected write failure") }
+        }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        for frame in frames.prefix(10) { store.accept(.media(camera: first, name: "First", frame)) }
+        XCTAssertTrue(store.flush(timeout: 5)); failing = true
+        for frame in frames[10..<45] { store.accept(.media(camera: first, name: "First", frame)) }
+        for frame in frames.prefix(45) { store.accept(.media(camera: second, name: "Second", frame)) }
+        XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().local?.retryingCameras, 1)
+        XCTAssertEqual(store.snapshot().activeRecordings, 1)
+        XCTAssertEqual(store.snapshot().state, "degraded")
+        XCTAssertEqual(store.snapshot().recordedFrames, 55)
+        now = 31; failing = false
+        // A non-keyframe never starts the replacement shard.
+        store.accept(.media(camera: first, name: "First", frames[44]))
+        XCTAssertTrue(store.flush(timeout: 5)); XCTAssertEqual(store.snapshot().activeRecordings, 1)
+        for frame in frames.dropFirst(45) { store.accept(.media(camera: first, name: "First", frame)) }
+        store.accept(.end(camera: first)); store.accept(.end(camera: second))
+        XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().recordedFrames, 100)
+        XCTAssertEqual(store.snapshot().completedShards, 3)
+        XCTAssertEqual(store.snapshot().local?.retryingCameras, 0)
+        XCTAssertNil(store.snapshot().lastError)
+    }
+    func testQueueOverflowFinalizesOldShardAndResumesWithoutMissingFrameContinuation() throws {
+        let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+        var now: TimeInterval = 0
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        let frames = try Self.video()
+        for frame in frames.prefix(10) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        XCTAssertTrue(store.flush(timeout: 5))
+        let oversized = EncodedMedia(codec: "H264", clockRate: 90000, parameterSets: [],
+            frame: EncodedVideoFrame(payload: Data(count: 33 * 1024 * 1024), timestamp: 60000, keyFrame: false))
+        store.accept(.media(camera: camera, name: "Camera", oversized))
+        XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().completedShards, 1)
+        XCTAssertEqual(store.snapshot().local?.droppedEvents, 1)
+        XCTAssertEqual(store.snapshot().state, "retrying")
+        now = 1
+        store.accept(.media(camera: camera, name: "Camera", frames[14]))
+        XCTAssertTrue(store.flush(timeout: 5)); XCTAssertEqual(store.snapshot().activeRecordings, 0)
+        for frame in frames.dropFirst(15) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().completedShards, 2)
+        XCTAssertEqual(store.snapshot().recordedFrames, 40)
+        XCTAssertNil(store.snapshot().lastError)
+    }
+    func testPersistentWriterFailureUsesCappedBackoffAndCanRecover() throws {
+        let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+        var now: TimeInterval = 0, failing = true, attempts: [Double] = []
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, _ in
+            if step == .createShard { attempts.append(now); if failing { throw ServiceError("Injected disk unavailable") } }
+        }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        let key = try XCTUnwrap(Self.video().first)
+        for instant in [0.0, 0.5, 1, 2, 3, 6, 7, 14, 15, 30, 31, 60, 61, 90, 91] {
+            now = instant; store.accept(.media(camera: camera, name: "Camera", key)); XCTAssertTrue(store.flush(timeout: 5))
+        }
+        XCTAssertEqual(attempts, [0, 1, 3, 7, 15, 31, 61, 91])
+        XCTAssertEqual(store.snapshot().state, "retrying")
+        now = 121; failing = false
+        for frame in try Self.video() { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().recordedFrames, 45)
+        XCTAssertNil(store.snapshot().lastError)
+    }
+    func testFinalizationFailurePreservesFileButNextShardStillRecords() throws {
+        let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+        var now: TimeInterval = 0, failing = true
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(now: { now }, before: { step, _ in
+            if step == .finalize && failing { throw ServiceError("Injected finalization failure") }
+        }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        let frames = try Self.video(count: 90)
+        for frame in frames.prefix(45) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        let folder = configuration.directory + "/Camera"
+        let unfinished = try XCTUnwrap(FileManager.default.contentsOfDirectory(atPath: folder).first { $0.hasSuffix(".recording") })
+        failing = false; now = 31
+        for frame in frames.dropFirst(45) { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().completedShards, 1)
+        XCTAssertNil(store.snapshot().lastError)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder + "/" + unfinished))
+    }
+    func testUnavailableStartupAndRetentionFailuresRecoverWithoutRestart() throws {
+        let root = try temporary()
+        var configuration = try config(root + "/output"); configuration.directory = root + "/missing"
+        var now: TimeInterval = 0, retentionFails = true
+        let store = try LocalRecordingStore(configuration: configuration, recoverUnavailable: true,
+            hooks: .init(now: { now }, before: { step, _ in
+                if step == .retention && retentionFails { throw ServiceError("Injected retention failure") }
+            }, automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        XCTAssertEqual(store.snapshot().state, "retrying")
+        try StoreDirectory.create(configuration.directory, owner: geteuid(), daemon: geteuid())
+        now = 1; store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertNotNil(store.snapshot().local?.retentionWarning)
+        let camera = UUID().uuidString
+        for frame in try Self.video() { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().completedShards, 1)
+        XCTAssertNil(store.snapshot().lastError)
+        retentionFails = false; now = 32
+        store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertNil(store.snapshot().local?.retentionWarning)
+        XCTAssertEqual(store.snapshot().state, "ready")
+        XCTAssertTrue(store.finish(timeout: 5))
+        now = 100; store.performMaintenance(); XCTAssertTrue(store.flush(timeout: 5))
+        let replacement = try LocalRecordingStore(configuration: configuration)
+        XCTAssertTrue(replacement.finish(timeout: 5))
+    }
+    func testErrorLogIsPrivateRotatesAndRejectsLinks() throws {
+        let configuration = try config(try temporary() + "/output")
+        let fd = try StoreDirectory.openDirectory(configuration.directory); defer { close(fd) }
+        let path = configuration.directory + "/" + LocalRecordingErrorLog.filename
+        try LocalRecordingErrorLog.append("SQLite 10\nwrite failure", camera: "test", directory: fd, date: Date(timeIntervalSince1970: 0))
+        let line = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertTrue(line.hasPrefix("1970-01-01T00:00:00Z camera=test "))
+        XCTAssertEqual(line.filter { $0 == "\n" }.count, 1)
+        XCTAssertEqual((try SecureFiles.info(path)?.st_mode ?? 0) & 0o777, 0o600)
+        let log = open(path, O_WRONLY); XCTAssertGreaterThanOrEqual(log, 0)
+        XCTAssertEqual(ftruncate(log, off_t(LocalRecordingErrorLog.limit)), 0); close(log)
+        try LocalRecordingErrorLog.append("new error", directory: fd)
+        XCTAssertEqual(try SecureFiles.info(path + ".1")?.st_size, off_t(LocalRecordingErrorLog.limit))
+        XCTAssertTrue(try String(contentsOfFile: path, encoding: .utf8).contains("new error"))
+        let saved = try Data(contentsOf: URL(fileURLWithPath: path))
+        XCTAssertEqual(link(path, path + ".link"), 0)
+        XCTAssertThrowsError(try LocalRecordingErrorLog.append("must not write", directory: fd))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), saved)
+    }
+    func testCorruptManifestAndUnwritableLogDoNotBlockVideo() throws {
+        let configuration = try config(try temporary() + "/output"), camera = UUID().uuidString
+        let root = try StoreDirectory.openDirectory(configuration.directory); defer { close(root) }
+        let directory = try LocalRecordingLayout.cameraDirectory(root: configuration.directory, fd: root,
+            store: configuration.id, camera: camera, name: "Camera", owner: geteuid())
+        let path = directory.path + "/" + LocalRecordingManifest.filename, corrupt = Data("damaged database".utf8)
+        try SecureFiles.atomicWrite(corrupt, to: path, mode: 0o600)
+        let outside = configuration.directory + "/untouched"
+        try SecureFiles.atomicWrite(Data("unchanged".utf8), to: outside, mode: 0o600)
+        XCTAssertEqual(symlink(outside, configuration.directory + "/" + LocalRecordingErrorLog.filename), 0)
+        let store = try LocalRecordingStore(configuration: configuration, hooks: .init(automaticMaintenance: false))
+        defer { _ = store.finish(timeout: 5) }
+        for frame in try Self.video() { store.accept(.media(camera: camera, name: "Camera", frame)) }
+        store.accept(.end(camera: camera)); XCTAssertTrue(store.flush(timeout: 5))
+        XCTAssertEqual(store.snapshot().completedShards, 1)
+        XCTAssertNotNil(store.snapshot().local?.manifestWarning)
+        XCTAssertNotNil(store.snapshot().local?.errorLogWarning)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), corrupt)
+        XCTAssertEqual(try String(contentsOfFile: outside, encoding: .utf8), "unchanged")
     }
     func testStoreLockSurvivesUntilDrainedAndAllowsReplacement() throws {
         let configuration = try config(try temporary() + "/output")

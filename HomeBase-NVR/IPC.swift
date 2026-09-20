@@ -16,6 +16,7 @@ struct Request: Codable {
     var recordingStarted: Bool? = nil
     var homebaseDeviceID: String? = nil
     var nvrInstanceID: String? = nil
+    var mediaProtocolVersion: Int? = nil
 }
 struct AgentStatus: Codable {
     let ready: Bool
@@ -37,10 +38,12 @@ struct Reply: Codable {
     var store: RecordingStoreConfiguration? = nil
     var setup: S3SetupStatus? = nil
     var cameraSnapshot: NVRCameraSnapshot? = nil
+    var mediaSession: MediaSessionInfo? = nil
+    var playbackSnapshot: PlaybackSnapshot? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
 }
 
-final class Cancellation {
+final class Cancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
     var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
@@ -185,6 +188,13 @@ enum AgentReadiness {
 
 final class AgentServer {
     private let cameraEvents = NVRCameraEvents()
+    private lazy var playbackCatalog = PlaybackCatalog(instanceID: cameraEvents.instanceID)
+    private lazy var mediaSessions = MediaSessions(provider: LocalMediaProvider(
+        configurations: { [weak self] in
+            guard let self else { throw ServiceError(.unavailable, "Agent stopped.") }
+            return try self.stores.list()
+        }, live: { [weak self] camera in self?.streams.liveTime(camera: camera) }),
+        authorize: { [weak self] uid in self?.authorization.permits(uid: uid) ?? false })
     private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, log: { [weak self] message in self?.log(message) })
     private let setupJobs: S3SetupJobs
     private let transportFactory: S3TransportFactory
@@ -209,7 +219,7 @@ final class AgentServer {
         else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
     }
     func run() throws {
-        defer { cameraEvents.stop() }
+        defer { cameraEvents.stop(); mediaSessions.stop(); playbackCatalog.stop() }
         let path = SocketIO.path(directory)
         // Validate length before acquiring resources.
         try SocketIO.address(path) { _, _ in () }
@@ -236,9 +246,12 @@ final class AgentServer {
         defer { sources.forEach { $0.cancel() } }
         var cleanedUp = false
         defer { if !cleanedUp { setupJobs.stop(); streams.stop(); recordings.stop() } }
-        recordings.load(try stores.list())
+        let initialStores = try stores.list()
+        recordings.load(initialStores)
         let initialCameras = try cameras.configurations()
         try cameraEvents.replace(initialCameras)
+        playbackCatalog.replace(stores: initialStores, cameras: initialCameras)
+        playbackCatalog.start()
         for (id, camera) in initialCameras { streams.add(id: id, camera: camera) }
         let started = ProcessInfo.processInfo.systemUptime
         log("hbnvr ready (PID \(getpid())) at \(path)")
@@ -253,6 +266,8 @@ final class AgentServer {
             if !handle(client, started: started) { close(client) }
         }
         cameraEvents.stop()
+        playbackCatalog.stop()
+        mediaSessions.stop()
         setupJobs.stop()
         let shutdownDeadline = ProcessInfo.processInfo.systemUptime + 45
         recordings.beginShutdown()
@@ -280,9 +295,21 @@ final class AgentServer {
                 if request.operation.hasPrefix("cameras."), let values = try? cameras.configurations() {
                     try? cameraEvents.replace(values)
                 }
+                if request.operation.hasPrefix("cameras.") || request.operation.hasPrefix("stores."),
+                   let values = try? cameras.configurations(), let configs = try? stores.list() {
+                    playbackCatalog.replace(stores: configs, cameras: values)
+                }
             }
             var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
             switch request.operation {
+            case "playback.snapshot":
+                reply.playbackSnapshot = try playbackCatalog.snapshot()
+            case "playback.watch":
+                try playbackCatalog.subscribe(fd, authorize: { [weak self] in self?.authorization.permits(uid: uid) ?? false })
+                return true
+            case "media.open":
+                try mediaSessions.open(fd, uid: uid, version: request.mediaProtocolVersion, deadline: deadline)
+                return true
             case "cameras.snapshot":
                 try cameraEvents.replace(cameras.configurations())
                 reply.cameraSnapshot = cameraEvents.snapshot
@@ -492,7 +519,7 @@ final class NVRCameraEvents {
     private let lock = NSLock()
     private var revision: UInt64 = 0
     private var cameras: [NVRCameraState] = []
-    private var subscribers: [UUID: NVRCameraSubscriber] = [:]
+    private var subscribers: [UUID: SnapshotSubscriber] = [:]
     var snapshot: NVRCameraSnapshot {
         lock.lock(); defer { lock.unlock() }
         return NVRCameraSnapshot(instanceID: instanceID, revision: revision, cameras: cameras)
@@ -511,7 +538,7 @@ final class NVRCameraEvents {
         lock.lock(); defer { lock.unlock() }
         guard subscribers.count < 8 else { throw ServiceError(.unavailable, "Camera subscription limit reached; retry later.") }
         let id = UUID(), data = try Self.encode(NVRCameraSnapshot(instanceID: instanceID, revision: revision, cameras: cameras))
-        let subscriber = NVRCameraSubscriber(fd: fd, initial: data) { [weak self] in
+        let subscriber = SnapshotSubscriber(fd: fd, initial: data) { [weak self] in
             guard let self else { return }; self.lock.lock(); self.subscribers[id] = nil; self.lock.unlock()
         }
         subscribers[id] = subscriber
@@ -530,7 +557,7 @@ final class NVRCameraEvents {
     }
 }
 
-private final class NVRCameraSubscriber: @unchecked Sendable {
+final class SnapshotSubscriber: @unchecked Sendable {
     private let fd: Int32
     private let condition = NSCondition()
     private var pending: Data?
@@ -538,8 +565,9 @@ private final class NVRCameraSubscriber: @unchecked Sendable {
     private var stopped = false
     private var closed = false
     private let ended: () -> Void
-    init(fd: Int32, initial: Data, ended: @escaping () -> Void) {
-        self.fd = fd; pending = initial; latest = initial; self.ended = ended
+    private let authorize: () -> Bool
+    init(fd: Int32, initial: Data, authorize: @escaping () -> Bool = { true }, ended: @escaping () -> Void) {
+        self.fd = fd; pending = initial; latest = initial; self.ended = ended; self.authorize = authorize
     }
     func offer(_ data: Data) {
         condition.lock(); defer { condition.unlock() }
@@ -567,6 +595,7 @@ private final class NVRCameraSubscriber: @unchecked Sendable {
             if let pending { latest = pending }; pending = nil
             let data = latest
             condition.unlock()
+            guard authorize() else { return }
             do { try SocketIO.write(data, fd: fd, deadline: ProcessInfo.processInfo.systemUptime + 5) }
             catch { return }
         }

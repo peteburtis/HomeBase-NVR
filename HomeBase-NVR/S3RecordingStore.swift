@@ -85,13 +85,13 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
             do {
                 switch event {
                 case .end(let camera): if let track = tracks.removeValue(forKey: camera) { try finish(track, camera: camera) }
-                case .media(let camera, let name, let media):
+                case .media(let camera, let name, let media, _):
                     if !mediaConfiguration.enabled || upload.suspended { finishTracks(); return }
                     try consume(camera: camera, name: name, media: media)
                 }
             } catch {
                 report(error)
-                if case .media(let camera, _, _) = event, let track = tracks[camera] {
+                if case .media(let camera, _, _, _) = event, let track = tracks[camera] {
                     track.failed = true
                     do { try finish(track, camera: camera) } catch { report(error) }
                 }
