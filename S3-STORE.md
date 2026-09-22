@@ -1,5 +1,11 @@
 # S3 stores (0.18.0)
 
+As of 0.21.0, [historical tags](HISTORICAL-TAGS.md) can update authoritative
+manifest tag timelines without rewriting or re-uploading MP4/JPEG objects.
+Embedded media tags remain the original snapshot; manifest edits take precedence.
+Ordinary timestamp edits need no media reads. Exact frame addressing can use
+temporary GetObject credentials and RAM-only inspection. Live tags are unchanged.
+
 Use `hbnvr store add`, choose **S3**, and follow the same name/options/confirmation
 workflow as a local store. `change`, `list`, `enable`, `disable`, and `remove` accept
 names or UUIDs and `--runtime-dir` for isolated foreground agents. No sudo is needed.

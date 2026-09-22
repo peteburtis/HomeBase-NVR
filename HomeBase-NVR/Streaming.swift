@@ -54,10 +54,12 @@ final class StreamingCoordinator: @unchecked Sendable {
     private var stopped = false
     private let log: (String) -> Void
     private let record: (RecordingEvent) -> Void
+    private let live: (RecordingEvent) -> Void
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
 
-    init(log: @escaping (String) -> Void, record: @escaping (RecordingEvent) -> Void = { _ in }) {
-        self.log = log; self.record = record
+    init(log: @escaping (String) -> Void, record: @escaping (RecordingEvent) -> Void = { _ in },
+         live: @escaping (RecordingEvent) -> Void = { _ in }) {
+        self.log = log; self.record = record; self.live = live
     }
 
     func add(id: String, camera: CameraConfiguration) {
@@ -67,13 +69,16 @@ final class StreamingCoordinator: @unchecked Sendable {
                 if entry.camera == camera { return }
                 var changed = entry.camera
                 changed.recordingStarted = camera.recordingStarted
+                changed.tags = camera.tags
                 if changed == camera {
-                    // Recording control does not interrupt the receiver or reset counters.
+                    // Tag and recording controls do not interrupt the receiver or reset counters.
+                    let stoppedRecording = entry.camera.recordingStarted && !camera.recordingStarted
                     entry.camera = camera; entry.status.recordingStarted = camera.recordingStarted
-                    if !camera.recordingStarted { record(.end(camera: id)) }
+                    if stoppedRecording { record(.end(camera: id)) }
                     return
                 }
                 record(.end(camera: id))
+                live(.end(camera: id))
             }
             entries[id]?.client?.stop()
             let entry = Entry(id: id, camera: camera)
@@ -92,7 +97,7 @@ final class StreamingCoordinator: @unchecked Sendable {
     }
 
     func remove(id: String) {
-        queue.sync { entries.removeValue(forKey: id)?.client?.stop(); record(.end(camera: id)) }
+        queue.sync { entries.removeValue(forKey: id)?.client?.stop(); record(.end(camera: id)); live(.end(camera: id)) }
     }
 
     func snapshot() -> [CameraStreamStatus] {
@@ -119,7 +124,7 @@ final class StreamingCoordinator: @unchecked Sendable {
             stopped = true
             timer?.cancel(); timer = nil
             let clients = entries.values.compactMap(\.client)
-            entries.keys.forEach { record(.end(camera: $0)) }
+            entries.keys.forEach { record(.end(camera: $0)); live(.end(camera: $0)) }
             entries.removeAll()
             return clients
         }
@@ -156,11 +161,18 @@ final class StreamingCoordinator: @unchecked Sendable {
                     entry.began = self.now
                 case .received(let bytes): entry.status.receivedBytes &+= UInt64(bytes)
                 case .video(let packets, let frames, let dropped, let media):
+                    // The command and frame share this serial ordering boundary.
+                    // Stamp once BEFORE either destination queues the value copy.
+                    var media = media
+                    media?.tags = entry.camera.tags
                     if let media { entry.latestTime = media.time }
                     entry.status.rtpPackets &+= packets
                     entry.status.frames &+= frames
                     entry.status.droppedFrames &+= dropped
-                    if dropped > 0 { self.record(.end(camera: entry.status.id)) }
+                    if dropped > 0 { self.record(.end(camera: entry.status.id)); self.live(.end(camera: entry.status.id)) }
+                    if let media {
+                        self.live(.media(camera: entry.status.id, name: entry.status.name, media, homebaseDeviceID: entry.camera.homebaseDeviceID))
+                    }
                     if entry.camera.recordingStarted, let media {
                         self.record(.media(camera: entry.status.id, name: entry.status.name, media, homebaseDeviceID: entry.camera.homebaseDeviceID))
                     }
@@ -183,6 +195,7 @@ final class StreamingCoordinator: @unchecked Sendable {
 
     private func retry(_ entry: Entry, error: String) {
         record(.end(camera: entry.status.id))
+        live(.end(camera: entry.status.id))
         let client = entry.client
         entry.client = nil
         entry.generation = UUID()

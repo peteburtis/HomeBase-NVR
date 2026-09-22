@@ -30,6 +30,10 @@ struct S3RepairPage: Sendable { let objects: [S3RepairObject]; let next: String?
 protocol S3RepairReading: Sendable {
     func list(after: String?) async throws -> S3RepairPage
     func read(_ object: S3RepairObject) async throws -> Data
+    func readIndexed(_ shard: S3PlaybackShard) async throws -> Data
+}
+extension S3RepairReading {
+    func readIndexed(_ shard: S3PlaybackShard) async throws -> Data { throw S3RepairFailure.unavailable }
 }
 typealias S3RepairReaderFactory = @Sendable (S3Configuration, S3RepairCredentials) async throws -> any S3RepairReading
 
@@ -164,6 +168,21 @@ struct AWSS3RepairReader: S3RepairReading {
             let data = try await output.body?.readData() ?? Data()
             try Task.checkCancellation()
             try S3RepairReadFailure.validate(data, object: object, etag: output.eTag, contentLength: output.contentLength)
+            return data
+        } catch { throw S3RepairFailure.sanitize(error) }
+    }
+    /// Manifest-bound GET for exact frame addressing; no ListBucket needed.
+    func readIndexed(_ shard: S3PlaybackShard) async throws -> Data {
+        guard shard.size > 0, shard.size <= Self.maximumObjectBytes,
+              shard.key.hasPrefix(configuration.prefix), shard.key.utf8.count <= 1024,
+              !shard.key.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) else { throw S3RepairFailure.tooLarge }
+        let engine = httpFactory(configuration, shard.key, Int(shard.size))
+        defer { (engine as? S3RepairHTTP)?.close() }
+        do {
+            let output = try await client(engine: engine).getObject(input: .init(bucket: configuration.bucket,
+                expectedBucketOwner: configuration.expectedOwner, key: shard.key))
+            let data = try await output.body?.readData() ?? Data()
+            guard data.count == shard.size, S3ObjectMetadata.hash(data) == shard.sha256 else { throw S3RepairFailure.changed }
             return data
         } catch { throw S3RepairFailure.sanitize(error) }
     }

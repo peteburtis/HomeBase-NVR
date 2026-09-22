@@ -3,7 +3,7 @@ import Darwin
 
 /// Media protocol v1 is independent of the command protocol. No filenames, URLs,
 /// credentials, opaque memory handles, or client-supplied filesystem paths cross it.
-enum MediaTimeline: String, Codable { case canonical, camera, received
+enum MediaTimeline: String, Codable, Sendable { case canonical, camera, received
     func anchor(_ time: RecordingTime) -> Double? {
         switch self { case .canonical: return time.canonicalUTC; case .camera: return time.cameraUTC; case .received: return time.receivedUTC }
     }
@@ -40,11 +40,13 @@ struct MediaRequest: Codable {
     var timeline: MediaTimeline = .canonical
     let range: MediaRange // Unix seconds for absolute; signed seconds for relative
     var relativeTo: String? = nil // nil (absolute) | live | now
-    enum CodingKeys: String, CodingKey { case requestID, operation, cameraID, timeline, range, relativeTo }
+    var includeTags = false
+    enum CodingKeys: String, CodingKey { case requestID, operation, cameraID, timeline, range, relativeTo, includeTags }
     init(requestID: String, operation: String, cameraID: String, timeline: MediaTimeline = .canonical,
-         range: MediaRange, relativeTo: String? = nil) {
+         range: MediaRange, relativeTo: String? = nil, includeTags: Bool = false) {
         self.requestID = requestID; self.operation = operation; self.cameraID = cameraID
         self.timeline = timeline; self.range = range; self.relativeTo = relativeTo
+        self.includeTags = includeTags
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -54,12 +56,14 @@ struct MediaRequest: Codable {
         timeline = try c.decodeIfPresent(MediaTimeline.self, forKey: .timeline) ?? .canonical
         range = try c.decode(MediaRange.self, forKey: .range)
         relativeTo = try c.decodeIfPresent(String.self, forKey: .relativeTo)
+        includeTags = try c.decodeIfPresent(Bool.self, forKey: .includeTags) ?? false
     }
     func resolve(now: Double, live: RecordingTime?) throws -> (range: MediaRange, anchor: Double?) {
         guard CameraConfiguration.printable(requestID, limit: 64), requestID.utf8.count <= 64,
               UUID(uuidString: cameraID) != nil, ["frames", "availability", "neighbors"].contains(operation),
               range.start.isFinite, range.end.isFinite, range.start < range.end,
-              range.end - range.start <= MediaLimits.maximumRangeSeconds else {
+              range.end - range.start <= MediaLimits.maximumRangeSeconds,
+              !includeTags || operation == "frames" else {
             throw ServiceError(.invalidMessage, "Expected a camera UUID, request ID, frames/availability/neighbors operation, and finite range of at most 24 hours.")
         }
         let anchor = try MediaTimeSelection.anchor(relativeTo: relativeTo, timeline: timeline, now: now, live: live)
@@ -97,8 +101,14 @@ enum MediaLimits {
     static let idleSeconds: Double = 60
     static let stallSeconds: Double = 5
     static let requestSeconds: Double = 300
+    static let tagBytes = 4 * 1024 * 1024
+    static let taggedFrames = 1_000_000
+    static let tagRanges = 65_536
 }
 struct MediaSessionInfo: Codable {
+    var segmentTagsVersion = 1
+    var maxSegmentTagBytes = MediaLimits.tagBytes
+    var maxTaggedSegmentFrames = MediaLimits.taggedFrames
     var supportsThumbnails = true
     var thumbnailFormats = ["image/jpeg"]
     var maxThumbnailDimension = 2048
@@ -136,6 +146,11 @@ struct MediaSegment: Codable {
     let codec: String
     let parameterSets: [Data]
     let nalUnitLengthBytes: Int
+    // Present only for includeTags requests. Exactly tagByteCount bytes of UTF-8
+    // JSON follow this header in binary records, before any video frame headers.
+    var tagRangesVersion: Int? = nil
+    var tagFrameCount: Int? = nil
+    var tagByteCount: Int? = nil
 }
 struct MediaFrame: Codable {
     let segment: Int

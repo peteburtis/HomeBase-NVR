@@ -137,7 +137,9 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
                 timestamp: media.frame.timestamp, capturedAt: observed.time, timing: timing)
             track.config = mediaConfiguration
         }
-        try track.writer!.append(media.frame)
+        if try track.writer!.append(media.frame, tags: media.tags) {
+            report(ServiceError("Tag metadata limit reached; remaining shard tags are explicitly unknown. Video recording continues."))
+        }
         if let (frame, slot) = track.thumbnail.observe(media, sets: required.map { track.sets[$0]! }, time: observed.timing) {
             makeThumbnail(frame, camera: camera, slot: slot, configuration: mediaConfiguration)
         }
@@ -152,7 +154,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
             let result = Result {
                 let sample = try S3Thumbnail.sample(frame.media, sets: frame.sets)
                 return try S3Thumbnail.render(sample, info: .init(storeID: configuration.id, cameraID: camera,
-                    slot: slot, timestamp: frame.time.canonicalUTC), store: configuration)
+                    slot: slot, timestamp: frame.time.canonicalUTC, tags: frame.media.tags), store: configuration)
             }
             queue.async { [self] in
                 defer { renderingThumbnails.remove(id); thumbnailWork.leave(); publishStatus() }
@@ -175,6 +177,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         var metadata = S3ShardMetadata.make(store: config, camera: camera, name: track.name, capturedAt: writer.capturedAt,
             data: bytes, encrypted: encrypted, id: writer.timing?.shardID ?? UUID().uuidString)
         metadata.timing = writer.timing; metadata.endTicks = writer.endTicks
+        metadata.tagMetadata = try StoredVideoTags.freeze(writer.tagTimeline, password: encrypted ? config.s3?.clientEncryption?.password : nil)
         upload.ready(metadata, data: bytes)
         lock.lock(); status.completedShards &+= 1; lock.unlock()
     }
@@ -204,6 +207,24 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         next.lastError = upload.lastError ?? mediaError; next.s3 = detail; status = next
     }
     func snapshot() -> RecordingStoreStatus { lock.lock(); defer { lock.unlock() }; return status }
+    func historicalShards() throws -> [S3PlaybackShard] {
+        try queue.sync {
+            _ = try playback.repairKnownKeys()
+            return playback.entries.values.map(\.shard)
+        }
+    }
+    func commitHistorical(_ edits: [S3PlaybackPublisher.TagReplacement], expected: RecordingStoreConfiguration) throws {
+        try queue.sync {
+            guard configuration == expected, !shuttingDown else { throw ServiceError("Store changed while preparing historical tags.") }
+            do { try playback.editTags(edits) }
+            catch {
+                log("Store \(configuration.id): historical tag commit failed; recovery metadata preserved. Inspect the tag job result.")
+                throw error
+            }
+            playback.tick(); publishStatus()
+            log("Store \(configuration.id): historical tags committed for \(edits.count) shards; manifest publication queued.")
+        }
+    }
     func repairSink(expected: RecordingStoreConfiguration, cameras: Set<String>,
                     cameraStillExists: @escaping @Sendable (String) throws -> Bool) -> S3RepairSink {
         S3RepairSink(knownKeys: { [self] in

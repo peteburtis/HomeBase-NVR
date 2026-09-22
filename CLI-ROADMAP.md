@@ -5,7 +5,54 @@ Triggers remain future work. No plugin loader is planned. The original S3 discus
 notes below are retained; the implemented decisions immediately below supersede their earlier
 examples and open questions.
 
-## Current baseline (0.14.0)
+## Historical segment tag serving (0.22.0)
+
+- Media v1 advertises `segmentTagsVersion: 1`; `frames` requests opt in with
+  `includeTags: true`. One bounded, chunked JSON map precedes each segment's
+  video; half-open frame ranges include preroll and coalesce equal values per key.
+- Completed files use manifest metadata matched to the pinned file revision.
+  Active disk/RAM use a writer-published tag snapshot, independent of SQLite's
+  five-second checkpoint and retained video payloads. Unknown and absent both
+  mean no value on this API; internal removal bookkeeping remains intact.
+- No Homebase/GUI changes or thumbnail tag reporting in this slice. See
+  [the wire contract](MEDIA-PROTOCOL.md#segment-tag-maps-0220).
+
+## Historical video tags (0.21.0)
+
+- `media tag set/remove/inspect/apply/status` and authenticated `media.tags.*`
+  jobs address finalized media by file/shard frames or any recorded timeline plus
+  optional exact frame offsets. Explicit store selection supports cross-store
+  source-epoch mapping, with ambiguity rejection and reported coverage gaps.
+- Local metadata replacement/index updates have recoverable intents (schema 4).
+  S3 edits replace only authoritative manifest tag timelines; original MP4/JPEG
+  objects are not rewritten. Late upload replay and repair preserve edited tags.
+- Batches, dry-run, opaque expected revisions, no-op retries, encrypted metadata,
+  and bounded background preparation are implemented. Client tag interpretation
+  remains a later slice. See
+  [historical tags](HISTORICAL-TAGS.md) for precise durability and limits.
+
+## Prospective video tags (0.20.0)
+
+- `camera tag set/remove/list [NAME]` and authenticated `cameras.tags.*` IPC
+  maintain a persistent, opaque string dictionary per camera. Changes apply
+  only at the next frame-ingestion boundary; no retrospective edits or separate
+  tag subscription. Shared live frames carry the complete dictionary.
+- New MP4s, local manifest schema 3, S3 indexes and thumbnail captions preserve
+  frame-accurate tag changes. Encrypted S3 tag sidecars remain encrypted. Existing
+  repair preserves embedded tags without inferring missing legacy metadata.
+- Local-history frame/thumbnail IPC reporting and Homebase/client semantics are
+  explicitly next slices. See [video tags](VIDEO-TAGS.md).
+
+## Shared live receiver (0.19.0)
+
+- Authenticated `live.open` taps the existing H.264 receiver, independently of
+  recording intent/stores. Camera watch advertises credential-free dimensions and
+  codec. Keyframe startup, bounded per-subscriber RAM, slow-reader disconnection,
+  and independent socket writers protect recording. Homebase shares this feed with
+  unchanged clients via a temporary quality override. See [live IPC](LIVE-VIDEO.md).
+- H.265 live fanout and stable cross-client frame references remain deferred.
+
+## Earlier playback baseline (0.14.0)
 
 - Optional `supportsNeighbors` on `media.open` exposes nearest retained local
   intervals before/after a requested range, across days and stores. It uses the
@@ -36,7 +83,7 @@ examples and open questions.
   include keyframe preroll and timing/codec headers; unavailable ranges are explicit.
   No Homebase consumer, S3-only RAM/object playback, or playback CLI is
   introduced here. See [the media protocol](MEDIA-PROTOCOL.md).
-- Future live-feed direction: Homebase normally relays NVR's feed, opening its own
+- Implemented in 0.19.0: Homebase normally relays NVR's H.264 feed, opening its own
   camera connection only when NVR is unavailable. Stable frame references wait for
   that shared-feed architecture; switching feeds starts a new stream identity.
 

@@ -22,8 +22,10 @@ final class MemoryMP4Shard: NSObject, AVAssetWriterDelegate, @unchecked Sendable
     private var initialization = false
     private var outputBytes: Int64 = 0
     private var finished = false
+    private var tagAccumulator = VideoTagAccumulator()
+    var tagTimeline: VideoTagTimeline { tagAccumulator.timeline }
     var endTicks: Int64 { ticks + duration }
-    var residentBytes: Int64 { lock.lock(); defer { lock.unlock() }; return max(inputBytes, outputBytes) }
+    var residentBytes: Int64 { lock.lock(); defer { lock.unlock() }; return max(inputBytes, outputBytes) + tagAccumulator.residentBytes }
     init(codec: String, sets: [Data], clock: UInt32, timestamp: UInt32, capturedAt: Date = Date(), timing: ShardTimingMetadata? = nil) throws {
         guard clock > 0, clock <= Int32.max, ["H264", "H265"].contains(codec) else { throw ServiceError("Unsupported S3 video format.") }
         self.capturedAt = capturedAt; self.timing = timing; self.clock = Int32(clock); last = timestamp; duration = max(1, Int64(clock) / 15)
@@ -48,7 +50,7 @@ final class MemoryMP4Shard: NSObject, AVAssetWriterDelegate, @unchecked Sendable
         segments.append(Data(segmentData)); outputBytes += Int64(segmentData.count)
     }
     func elapsed(_ timestamp: UInt32) -> Double { Double(ticks + Int64(Int32(bitPattern: timestamp &- last))) / Double(clock) }
-    func append(_ frame: EncodedVideoFrame) throws {
+    @discardableResult func append(_ frame: EncodedVideoFrame, tags: [String: String] = [:]) throws -> Bool {
         let delta = Int64(Int32(bitPattern: frame.timestamp &- last))
         guard !finished, samples == 0 || delta > 0 else { throw ServiceError("S3 recording requires a no-B-frame camera profile with increasing timestamps.") }
         if samples > 0 { ticks += delta; duration = delta }; last = frame.timestamp
@@ -68,7 +70,9 @@ final class MemoryMP4Shard: NSObject, AVAssetWriterDelegate, @unchecked Sendable
             CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(), Unmanaged.passUnretained(frame.keyFrame ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
         }
         guard input.append(sample) else { throw failure("append") }
+        let overflow = try tagAccumulator.append(tags, ticks: ticks, frame: Int64(samples))
         samples += 1; inputBytes += Int64(frame.payload.count)
+        return overflow
     }
     func finish(timeout: Double = 30) throws -> Data {
         guard !finished, samples > 0 else { throw ServiceError("Empty or already finalized S3 shard.") }
@@ -82,6 +86,7 @@ final class MemoryMP4Shard: NSObject, AVAssetWriterDelegate, @unchecked Sendable
         guard initialization, segments.count >= 2 else { throw ServiceError("S3 MP4 is missing its initialization or media segment.") }
         var result = Data(); result.reserveCapacity(Int(outputBytes))
         for segment in segments { result.append(segment) }
+        result.append(try VideoTagMP4.box(tagTimeline))
         segments.removeAll(); outputBytes = 0
         return result
     }

@@ -179,7 +179,7 @@ final class PlaybackCatalogTests: XCTestCase {
         let path = config.directory + "/Kitchen/" + LocalRecordingManifest.filename
         var raw: OpaquePointer?
         XCTAssertEqual(sqlite3_open(path, &raw), SQLITE_OK)
-        XCTAssertEqual(sqlite3_exec(raw, "DROP TABLE camera_metadata; PRAGMA user_version=1", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(raw, "DROP TABLE camera_metadata; ALTER TABLE recordings DROP COLUMN tags_json; PRAGMA user_version=1", nil, nil, nil), SQLITE_OK)
         sqlite3_close(raw)
         let scan = PlaybackDiscovery.scan(config, work: MediaWork())
         XCTAssertEqual(scan.state, "available")

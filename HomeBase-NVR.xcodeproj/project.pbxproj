@@ -7,6 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        D30000000000000000000012 = {isa = PBXBuildFile; fileRef = D30000000000000000000011; };
+        D30000000000000000000022 = {isa = PBXBuildFile; fileRef = D30000000000000000000021; };
+        D30000000000000000000032 = {isa = PBXBuildFile; fileRef = D30000000000000000000031; };
+        D30000000000000000000042 = {isa = PBXBuildFile; fileRef = D30000000000000000000041; };
+        D20000000000000000000002 = {isa = PBXBuildFile; fileRef = D20000000000000000000001; };
+        D10000000000000000000002 = {isa = PBXBuildFile; fileRef = D10000000000000000000001; };
         D00000000000000000000002 = {isa = PBXBuildFile; fileRef = D00000000000000000000001; };
         CF0000000000000000000002 = {isa = PBXBuildFile; fileRef = CF0000000000000000000001; };
         CF0000000000000000000004 = {isa = PBXBuildFile; fileRef = CF0000000000000000000003; };
@@ -69,6 +75,12 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+        D30000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/HistoricalTags.swift"; sourceTree = SOURCE_ROOT; };
+        D30000000000000000000021 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/LocalTagFile.swift"; sourceTree = SOURCE_ROOT; };
+        D30000000000000000000031 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/HistoricalFrameIndex.swift"; sourceTree = SOURCE_ROOT; };
+        D30000000000000000000041 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/HistoricalTagEngine.swift"; sourceTree = SOURCE_ROOT; };
+        D20000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/VideoTags.swift"; sourceTree = SOURCE_ROOT; };
+        D10000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/LiveVideo.swift"; sourceTree = SOURCE_ROOT; };
         D00000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Thumbnail.swift"; sourceTree = SOURCE_ROOT; };
         CF0000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3Repair.swift"; sourceTree = SOURCE_ROOT; };
         CF0000000000000000000003 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "HomeBase-NVR/S3RepairMedia.swift"; sourceTree = SOURCE_ROOT; };
@@ -276,6 +288,12 @@
         CB0000000000000000000002,
         CB0000000000000000000004,
         CB0000000000000000000006,
+        D10000000000000000000002,
+        D20000000000000000000002,
+        D30000000000000000000012,
+        D30000000000000000000022,
+        D30000000000000000000032,
+        D30000000000000000000042,
         CB0000000000000000000008,
         CB000000000000000000000A,
         CA0000000000000000000002 /* RecordingTime in Sources */,

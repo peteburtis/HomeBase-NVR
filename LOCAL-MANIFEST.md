@@ -39,7 +39,16 @@ their own recordings or index.
 
 ## Stored information and time semantics
 
-Schema version 2 contains `identity`, `camera_metadata`, and `recordings` tables.
+Schema version 4 contains `identity`, `camera_metadata`, `recordings`, and the
+historical editor's transient `tag_edits` recovery table. See
+[historical tags](HISTORICAL-TAGS.md) for safe file replacement and recovery.
+Schema version 3 introduced the recording tag column described below.
+It added nullable `recordings.tags_json`: the prospective tag timeline for accepted
+frames, updated with existing five-second checkpoints and finalization. Writers
+upgrade versions 1/2/3 without scanning/backfilling media. Old rows
+remain NULL (unknown tags), not an invented empty dictionary. Read-only discovery
+still accepts older indexes. Playback IPC tag reporting is not implemented yet.
+See [video tags](VIDEO-TAGS.md) for the embedded MP4 representation and limits.
 `camera_metadata` is a singleton containing the last recorded display name,
 optional Homebase hardware-device ID, and metadata-update UTC time. This time is
 only for choosing the newest descriptive metadata across renamed directories;

@@ -23,6 +23,12 @@ struct Request: Codable {
     var homebaseDeviceID: String? = nil
     var nvrInstanceID: String? = nil
     var mediaProtocolVersion: Int? = nil
+    var liveProtocolVersion: Int? = nil
+    var tagKey: String? = nil
+    var tagValue: String? = nil
+    var historicalTags: HistoricalTagRequest? = nil
+    var tagJobID: String? = nil
+    var tagOffset: Int? = nil
 }
 struct AgentStatus: Codable {
     let ready: Bool
@@ -47,6 +53,10 @@ struct Reply: Codable {
     var cameraSnapshot: NVRCameraSnapshot? = nil
     var mediaSession: MediaSessionInfo? = nil
     var playbackSnapshot: PlaybackSnapshot? = nil
+    var liveSession: LiveVideoSessionInfo? = nil
+    var tags: [String: String]? = nil
+    var tagJob: HistoricalTagStatus? = nil
+    var tagData: Data? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
 }
 
@@ -195,6 +205,7 @@ enum AgentReadiness {
 
 final class AgentServer {
     private let cameraEvents = NVRCameraEvents()
+    private let liveSessions = LiveVideoSessions()
     private lazy var playbackCatalog = PlaybackCatalog(instanceID: cameraEvents.instanceID)
     private lazy var mediaSessions = MediaSessions(provider: LocalMediaProvider(
         configurations: { [weak self] in
@@ -205,8 +216,12 @@ final class AgentServer {
     private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, log: { [weak self] message in self?.log(message) })
     private let setupJobs: S3SetupJobs
     private let repairJobs: S3RepairJobs
+    private let tagJobs = HistoricalTagJobs()
+    private let tagReaderFactory: S3RepairReaderFactory
     private let transportFactory: S3TransportFactory
-    private lazy var streams = StreamingCoordinator(log: { [weak self] message in self?.log(message) }, record: { [weak self] event in self?.recordings.accept(event) })
+    private lazy var streams = StreamingCoordinator(log: { [weak self] message in self?.log(message) },
+        record: { [weak self] event in self?.recordings.accept(event) },
+        live: { [weak self] event in self?.liveSessions.accept(event) })
     var stores: RecordingStoreRepository {
         RecordingStoreRepository(directory: system ? Paths.system.base + "/private/stores" : directory + "/stores")
     }
@@ -221,6 +236,7 @@ final class AgentServer {
     init(directory: String, authorization: Authorization, system: Bool, transportFactory: @escaping S3TransportFactory = AWSS3Transport.make,
          repairFactory: @escaping S3RepairReaderFactory = AWSS3RepairReader.make) {
         self.directory = directory; self.authorization = authorization; self.system = system
+        tagReaderFactory = repairFactory
         self.transportFactory = transportFactory; setupJobs = S3SetupJobs(factory: transportFactory)
         let repairLogger = Logger(subsystem: "com.graygoolabs.hbnvr", category: "repair")
         repairJobs = S3RepairJobs(factory: repairFactory, log: { message in
@@ -233,7 +249,7 @@ final class AgentServer {
         else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
     }
     func run() throws {
-        defer { cameraEvents.stop(); mediaSessions.stop(); playbackCatalog.stop() }
+        defer { cameraEvents.stop(); mediaSessions.stop(); liveSessions.stop(); playbackCatalog.stop() }
         let path = SocketIO.path(directory)
         // Validate length before acquiring resources.
         try SocketIO.address(path) { _, _ in () }
@@ -259,7 +275,7 @@ final class AgentServer {
         }
         defer { sources.forEach { $0.cancel() } }
         var cleanedUp = false
-        defer { if !cleanedUp { setupJobs.stop(); repairJobs.stop(); streams.stop(); recordings.stop() } }
+        defer { if !cleanedUp { tagJobs.stop(); setupJobs.stop(); repairJobs.stop(); streams.stop(); recordings.stop() } }
         let initialStores = try stores.list()
         recordings.load(initialStores)
         let initialCameras = try cameras.configurations()
@@ -282,8 +298,10 @@ final class AgentServer {
         cameraEvents.stop()
         playbackCatalog.stop()
         mediaSessions.stop()
+        liveSessions.stop()
         setupJobs.stop()
         repairJobs.stop()
+        tagJobs.stop()
         let shutdownDeadline = ProcessInfo.processInfo.systemUptime + 45
         recordings.beginShutdown()
         streams.stop()
@@ -316,7 +334,61 @@ final class AgentServer {
                 }
             }
             var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
+            if request.operation.hasPrefix("stores."), !["stores.list", "stores.setup.poll", "stores.setup.cancel", "stores.repair.poll", "stores.repair.cancel"].contains(request.operation) {
+                try tagJobs.requireIdle()
+            }
             switch request.operation {
+            case "media.tags.start":
+                guard let edit = request.historicalTags else { throw ServiceError("historicalTags is required.") }
+                if let instance = request.nvrInstanceID, instance != cameraEvents.instanceID { throw ServiceError("NVR instance changed; reconnect before editing history.") }
+                let configs = try stores.list()
+                for config in configs { try repairJobs.requireIdle(config.id) }
+                reply.tagJob = try tagJobs.start(edit, uid: uid, configs: configs, manager: recordings,
+                    factory: tagReaderFactory, credentials: request.repairCredentials, password: request.repairPassword)
+            case "media.tags.poll", "media.tags.read":
+                guard let id = request.tagJobID else { throw ServiceError("tagJobID is required.") }
+                if request.operation == "media.tags.poll" { reply.tagJob = try tagJobs.poll(id, uid: uid) }
+                else { reply.tagData = try tagJobs.read(id, offset: request.tagOffset ?? 0, uid: uid) }
+            case "cameras.tags.get", "cameras.tags.set", "cameras.tags.remove":
+                guard let id = request.cameraID else { throw ServiceError(.invalidMessage, "Camera ID is required.") }
+                var camera = try cameras.configuration(id: id)
+                if request.nvrInstanceID != nil || request.homebaseDeviceID != nil {
+                    guard request.nvrInstanceID == cameraEvents.instanceID,
+                          let hardware = request.homebaseDeviceID, hardware == camera.homebaseDeviceID else {
+                        throw ServiceError(.unavailable, "NVR session or camera identity changed; reconnect before changing tags.")
+                    }
+                }
+                if request.operation != "cameras.tags.get" {
+                    guard let key = request.tagKey, !key.isEmpty, key.utf8.count <= 256 else {
+                        throw ServiceError(.invalidMessage, "A nonempty tagKey of at most 256 UTF-8 bytes is required.")
+                    }
+                    if request.operation == "cameras.tags.set" {
+                        guard let value = request.tagValue else { throw ServiceError(.invalidMessage, "tagValue is required; an empty string is valid.") }
+                        camera.tags[key] = value
+                    } else {
+                        guard request.tagValue == nil else { throw ServiceError(.invalidMessage, "Remove takes a tagKey, not a tagValue.") }
+                        camera.tags.removeValue(forKey: key)
+                    }
+                    try VideoTags.validate(camera.tags)
+                    reply.camera = try cameras.save(camera, id: id)
+                    // Disk persistence precedes the short, ordered in-memory change.
+                    // Frames already accepted keep their old dictionaries.
+                    streams.add(id: id, camera: camera)
+                }
+                reply.tags = camera.tags
+            case "live.open":
+                guard request.liveProtocolVersion == 1 else { throw ServiceError(.incompatible, "live.open requires liveProtocolVersion 1.") }
+                guard request.nvrInstanceID == cameraEvents.instanceID,
+                      let id = request.cameraID, let hardware = request.homebaseDeviceID,
+                      let camera = try cameras.configurations().first(where: { $0.0 == id })?.1,
+                      camera.homebaseDeviceID == hardware,
+                      let profile = LiveVideoProfile.advertised(camera),
+                      streams.liveTime(camera: id) != nil else {
+                    throw ServiceError(.unavailable, "No compatible current live receiver for this camera identity.")
+                }
+                try liveSessions.open(fd, camera: id, profile: profile, deadline: deadline,
+                    authorize: { [weak self] in self?.authorization.permits(uid: uid) ?? false })
+                return true
             case "playback.snapshot":
                 reply.playbackSnapshot = try playbackCatalog.snapshot()
             case "playback.watch":
@@ -539,6 +611,7 @@ struct NVRCameraState: Codable, Equatable {
     let homebaseDeviceID: String?
     let enabled: Bool
     let recordingStarted: Bool
+    var liveVideo: LiveVideoProfile? = nil
 }
 struct NVRCameraSnapshot: Codable, Equatable {
     let instanceID: String
@@ -560,7 +633,8 @@ final class NVRCameraEvents {
     }
     func replace(_ values: [(String, CameraConfiguration)]) throws {
         let next = values.map { NVRCameraState(id: $0.0, homebaseDeviceID: $0.1.homebaseDeviceID,
-                                               enabled: $0.1.enabled, recordingStarted: $0.1.recordingStarted) }.sorted { $0.id < $1.id }
+                                               enabled: $0.1.enabled, recordingStarted: $0.1.recordingStarted,
+                                               liveVideo: LiveVideoProfile.advertised($0.1)) }.sorted { $0.id < $1.id }
         lock.lock(); defer { lock.unlock() }
         guard next != cameras else { return }
         let update = NVRCameraSnapshot(instanceID: instanceID, revision: revision + 1, cameras: next)

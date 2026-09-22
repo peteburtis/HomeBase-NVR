@@ -1,4 +1,4 @@
-# HBNVR media IPC — version 1 (hbnvr 0.15.1)
+# HBNVR media IPC — version 1 (hbnvr 0.22.0)
 
 This is the local, authenticated media-request API. Homebase is one potential
 client; no Homebase-specific binding is required. This release does not modify
@@ -304,7 +304,7 @@ interval exists in that direction **at query time**. An empty object means neith
 Errors, incomplete replies, inaccessible stores, and bounded-scan limits never
 mean archive end. Older servers do not advertise the capability.
 
-The lookup merges configured local stores (including disabled ones), using only
+The lookup uses the first-discovered local store (including when disabled), using only
 identity-bound indexes and the same validated disk/RAM frontiers as availability.
 Deleted/replaced files are skipped; camera/received/canonical time rules still apply.
 Intervals crossing the excluded range are clipped. Returned intervals describe
@@ -328,8 +328,9 @@ Normal outcomes are `complete` (full requested coverage), `partial` (some gaps),
 and `unavailable` (no coverage). `error` terminates a failed request, possibly after
 some frames; it must not be treated as a completed range. Numeric error codes match
 ordinary IPC: 3 unavailable, 4 permission, 5 incompatible, 6 timeout, 7 invalid
-message. Transport failure may prevent delivery of End. If a frame/record is only
-partly written the server closes rather than inserting an error into its payload.
+message. Transport failure may prevent delivery of End. If a frame/record or
+segment tag payload is only partly written the server closes rather than inserting
+an error into its payload.
 
 Gap records follow available/frame data and describe the union of uncovered
 intervals. They mean unavailable **through this provider**, not proof that footage
@@ -376,6 +377,85 @@ and uses on-disk ranges for the remaining history. Separate epochs with
 overlapping wall times remain separate segments, not silently merged footage.
 Keyframe preroll can repeat bytes even where requested presentation is deduplicated.
 The current API does not provide exact frame references or a live-follow operation.
+
+### Segment tag maps (0.22.0)
+
+The opening `mediaSession` advertises `segmentTagsVersion: 1`,
+`maxSegmentTagBytes: 4194304`, and `maxTaggedSegmentFrames: 1000000`.
+Only `frames` requests accept `includeTags: true`; it defaults to false.
+Existing requests receive the original segment/frame framing without any tag
+payload or extra sample scan. Homebase/GUI consumers are not changed in this slice;
+their request validation/decoding must adopt this capability before requesting it.
+
+```json
+{"requestID":"tagged-1","operation":"frames","cameraID":"11111111-1111-1111-1111-111111111111","timeline":"canonical","range":{"start":1800000000,"end":1800000030},"includeTags":true}
+```
+
+For each returned segment, its JSON header additionally contains:
+
+- `tagRangesVersion: 1`.
+- `tagFrameCount`: the number of video frames selected for this segment, including
+  keyframe preroll. Count frames from zero separately for each segment.
+- `tagByteCount`: byte length of the immediately following UTF-8 JSON dictionary.
+
+Read exactly `tagByteCount` bytes from type-2 binary records (each at most the
+ordinary 65,536-byte record bound), concatenate them, and decode the dictionary
+**before** processing this segment's first video-frame header. No JSON record or
+video payload is interleaved inside that dictionary. This is one logical map per
+segment, not metadata on every frame. Even an empty map sends the two bytes `{}`.
+
+Example map for a 45-frame segment:
+
+```json
+{
+  "person.alice": [
+    {"startFrame": 0, "endFrame": 10, "value": "present"},
+    {"startFrame": 20, "endFrame": 45, "value": "present"}
+  ],
+  "example.note": [{"startFrame": 5, "endFrame": 8, "value": ""}]
+}
+```
+
+Spans are sorted, non-overlapping, half-open `[startFrame,endFrame)` **per key**.
+Adjacent equal values coalesce even if unrelated keys changed between them.
+An empty string is a value. A key missing from the map, or a frame outside that
+key's spans, has no value. Unknown legacy metadata and known absence deliberately
+have the same public representation; no complete vocabulary, unknown marker,
+removal tombstone, file path, or edit history is sent. Internal explicit removals
+still suppress original embedded values. Applications assign any meaning to
+absence; the NVR does not interpret tags as authorization.
+
+Frame ordinals describe the actual returned samples, not nominal FPS. Prospective
+changes use the writer's recorded sample ordinals, so MP4 clock rounding cannot
+move a tag change one frame late. Historical overrides resolve against sample
+presentation times. Shard/RAM/disk boundaries may split transport segments and
+reset their local frame numbering; identical values across adjacent footage are
+not a semantic off/on transition. Coalescing here is within each returned segment,
+not a new archive-wide tag-range query API.
+
+Completed recordings use the manifest's effective timeline, matched in one SQLite
+read to the exact file identity pinned by that reader. Concurrent edits either
+produce a retryable changed-source error or leave an already-captured old revision
+consistent for the whole segment. The next request sees the new revision. Video
+bytes are never modified to serve tags and live camera tag state is never consulted.
+
+For active recordings, the writer publishes the bounded tag timeline and accepted
+frame frontier together with each RAM append. Snapshots retain immutable/COW
+metadata but only weak video handles. RAM eviction does not discard the active
+tag timeline. Growing-file requests capture it before inspecting disk and cap
+their frame/time frontier to that snapshot, so SQLite's periodic checkpoint cannot
+leave the newest accepted frames mislabeled. RAM snapshots capture their frames
+and tags under the same short lock. Finalization/eviction still interrupts reads
+as documented below; tag delivery never pins an entire GOP or delays recording.
+
+Tagged disk reads extend the existing keyframe scan through the selected end,
+retaining only bounded sample coordinates, then stream the same pinned source.
+Limits per segment: 1,000,000 sample coordinates, 65,536 value-bearing spans, and
+4 MiB encoded tag JSON. Oversized maps fail explicitly rather than dropping tags;
+narrow the range. The five-minute request deadline remains in force. A failed or
+interrupted segment may deliver fewer than `tagFrameCount` frames; only a successful
+End completes the request. Clients must not treat undispatched frame ranges as video.
+Thumbnail tag reporting and S3/client interpretation remain separate features.
 
 ## Reading a shard that is still recording
 

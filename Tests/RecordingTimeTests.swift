@@ -147,7 +147,9 @@ final class RecordingTimeTests: XCTestCase {
                 var sample = EncodedMedia(codec: input.codec, clockRate: input.clockRate, parameterSets: input.parameterSets, frame: input.frame,
                     receivedAt: Date(timeIntervalSince1970: 1_789_680_000 + offset), receivedUptime: 100 + offset,
                     cameraUTC: 1_789_679_999 + offset, ssrc: 42)
-                sample.time = try timeline.observe(sample); samples.append(sample)
+                sample.time = try timeline.observe(sample)
+                sample.tags = samples.count < 5 ? [:] : samples.count < 10 ? ["arbitrary": "yes", "empty": ""] : [:]
+                samples.append(sample)
                 store.accept(.media(camera: camera, name: "Clock Camera", sample))
             }
             XCTAssertTrue(store.finish(timeout: 30)); XCTAssertNil(store.snapshot().lastError)
@@ -161,13 +163,18 @@ final class RecordingTimeTests: XCTestCase {
             let first = try XCTUnwrap(samples.first)
             let memory = try MemoryMP4Shard(codec: first.codec, sets: first.parameterSets, clock: first.clockRate,
                 timestamp: first.frame.timestamp, timing: timing)
-            for sample in samples { try memory.append(sample.frame) }
+            for sample in samples { try memory.append(sample.frame, tags: sample.tags) }
             let bytes = try memory.finish(), file = root + "/memory.mp4"
             try SecureFiles.atomicWrite(bytes, to: file, mode: 0o600)
             try await verify(path: file, timing: timing, samples: samples)
         }
     }
     func verify(path: String, timing: ShardTimingMetadata, samples: [EncodedMedia]) async throws {
+        let tags = try XCTUnwrap(VideoTagMP4.read(Data(contentsOf: URL(fileURLWithPath: path))))
+        for (index, sample) in samples.enumerated() {
+            let ticks = Int64(sample.frame.timestamp &- samples[0].frame.timestamp)
+            XCTAssertEqual(tags.tags(at: ticks), sample.tags, "frame \(index)")
+        }
         let asset = AVURLAsset(url: URL(fileURLWithPath: path))
         let embedded = try await ShardTimingMetadata.read(from: asset)
         XCTAssertEqual(try XCTUnwrap(embedded, path), timing)

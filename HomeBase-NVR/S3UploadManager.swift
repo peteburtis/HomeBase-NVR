@@ -307,8 +307,9 @@ final class S3UploadManager: @unchecked Sendable {
         result.retrying = work.values.filter { $0.lane == .retry }.count
         result.assemblingBytes = assemblingBytes
         result.residentBytes = work.values.reduce(0) { value, item in
-            if case .memory(let data) = item.payload { return value + Int64(data.count) }
-            return value + item.activeRAM
+            let tags = item.metadata.tagMetadata?.residentBytes ?? 0
+            if case .memory(let data) = item.payload { return value + Int64(data.count) + tags }
+            return value + item.activeRAM + tags
         }
         result.volatileShards = work.values.filter { if case .memory = $0.payload { return true }; return false }.count
         result.spoolBytes = spool.bytes; result.spoolCount = spool.entries.count

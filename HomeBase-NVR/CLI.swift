@@ -7,7 +7,7 @@ import os
 struct HBNVR: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "hbnvr", abstract: "Manage the HomeBase NVR service.", version: BuildInfo.version,
-        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Camera.self, Store.self, Decrypt.self, Agent.self])
+        subcommands: [Install.self, Uninstall.self, Start.self, Stop.self, Status.self, Add.self, Remove.self, Camera.self, Store.self, Media.self, Decrypt.self, Agent.self])
 }
 
 func command(_ work: () throws -> Void) throws {

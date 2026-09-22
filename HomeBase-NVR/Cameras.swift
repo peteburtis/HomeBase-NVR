@@ -22,6 +22,7 @@ struct CameraConfiguration: Codable, Equatable {
     var name: String
     var enabled = true
     var recordingStarted = true
+    var tags: [String: String] = [:]
     var provider = "RTSP"
     let ipAddress: String
     var onvifPort: UInt16? = nil
@@ -37,6 +38,7 @@ struct CameraConfiguration: Codable, Equatable {
         case homebaseDeviceID = "HomebaseDeviceID"
         case videoProfile = "VideoProfile"
         case enabled = "Enabled", recordingStarted = "RecordingStarted"
+        case tags = "Tags"
     }
     static func printable(_ text: String, limit: Int) -> Bool {
         !text.isEmpty && text.count <= limit && text.utf8.count <= limit * 4 &&
@@ -67,6 +69,7 @@ struct CameraConfiguration: Codable, Equatable {
     }
     var endpoint: String { "\(ipAddress.lowercased()):\(rtspPort)" }
     func validate() throws {
+        try VideoTags.validate(tags)
         guard schemaVersion == 1, ["RTSP", "ONVIF"].contains(provider) else {
             throw ServiceError(.invalidMessage, "Camera configuration requires SchemaVersion 1 and Provider RTSP or ONVIF.")
         }
@@ -98,6 +101,7 @@ extension CameraConfiguration {
         name = try values.decode(String.self, forKey: .name)
         enabled = try values.contains(.enabled) ? values.decode(Bool.self, forKey: .enabled) : true
         recordingStarted = try values.contains(.recordingStarted) ? values.decode(Bool.self, forKey: .recordingStarted) : true
+        tags = try values.decodeIfPresent([String: String].self, forKey: .tags) ?? [:]
         provider = try values.decode(String.self, forKey: .provider)
         ipAddress = try values.decode(String.self, forKey: .ipAddress)
         onvifPort = try values.decodeIfPresent(UInt16.self, forKey: .onvifPort)
@@ -250,6 +254,7 @@ struct CameraStore {
         let old = try configuration(id: id)
         var allowed = old
         allowed.name = camera.name; allowed.enabled = camera.enabled; allowed.recordingStarted = camera.recordingStarted
+        allowed.tags = camera.tags
         allowed.videoProfile = camera.videoProfile; allowed.rtspURL = camera.rtspURL
         guard allowed == camera else { throw ServiceError("Camera options cannot replace the endpoint, credentials, or discovery identity.") }
         if old != camera {
@@ -260,7 +265,7 @@ struct CameraStore {
                   let updated = try JSONSerialization.jsonObject(with: CameraJSON.encode(camera)) as? [String: Any] else {
                 throw ServiceError("Camera JSON changed unexpectedly; stop the agent before manual edits.")
             }
-            for key in ["Name", "Enabled", "RecordingStarted", "VideoProfile", "RTSPURL"] { document[key] = updated[key] }
+            for key in ["Name", "Enabled", "RecordingStarted", "VideoProfile", "RTSPURL", "Tags"] { document[key] = updated[key] }
             let data = try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) + Data([10])
             guard data.count <= 65536 else { throw ServiceError("Updated camera JSON exceeds 64 KiB; no changes were saved.") }
             try SecureFiles.atomicWrite(data, to: path, mode: 0o600)

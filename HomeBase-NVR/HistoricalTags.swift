@@ -1,0 +1,159 @@
+import Foundation
+import CryptoKit
+
+/// Mutating history is separate from camera tags and never changes live state.
+/// All ranges are half open. Store selection is independent of the coordinates.
+struct HistoricalTagRequest: Codable, Equatable, Sendable {
+    struct Boundary: Codable, Equatable, Sendable {
+        let timestamp: Double
+        var frameOffset: Int = 0
+    }
+    struct Selection: Codable, Equatable, Sendable {
+        var file: String? = nil
+        var shardID: String? = nil
+        var sourceStoreID: String? = nil
+        var cameraID: String? = nil
+        var timeline: MediaTimeline = .canonical
+        var epochID: String? = nil
+        var start: Boundary? = nil
+        var end: Boundary? = nil
+        var startFrame: Int? = nil
+        var endFrame: Int? = nil
+        var allFrames: Bool = false
+    }
+    struct Edit: Codable, Equatable, Sendable {
+        let selection: Selection
+        let key: String
+        var value: String? = nil // nil removes; empty string is a value.
+    }
+    let jobID: String
+    let storeIDs: [String]
+    let edits: [Edit]
+    var expectedRevisions: [String: String]? = nil // "storeUUID/shardUUID": opaque revision
+    var dryRun: Bool = false
+    var inspect: Bool = false
+    func validate() throws {
+        guard UUID(uuidString: jobID) != nil, (1...8).contains(storeIDs.count),
+              Set(storeIDs).count == storeIDs.count, storeIDs.allSatisfy({ UUID(uuidString: $0) != nil }),
+              (1...64).contains(edits.count), (expectedRevisions?.count ?? 0) <= 128 else {
+            throw ServiceError("Historical edits require a job UUID, 1–8 distinct store UUIDs, and 1–64 edits.")
+        }
+        for edit in edits {
+            if !inspect { try VideoTags.validate([edit.key: edit.value ?? ""]) }
+            let s = edit.selection
+            for id in [s.shardID, s.sourceStoreID, s.cameraID, s.epochID].compactMap({ $0 }) {
+                guard UUID(uuidString: id) != nil else { throw ServiceError("Invalid historical media identity.") }
+            }
+            if s.file != nil || s.shardID != nil {
+                guard (s.file == nil) != (s.shardID == nil), s.start == nil, s.end == nil,
+                      s.file.map({ $0.hasPrefix("/") && $0.utf8.count <= 4096 && !$0.utf8.contains(0)
+                          && !$0.split(separator: "/").contains(where: { $0 == "." || $0 == ".." }) }) ?? true,
+                      s.shardID == nil || s.sourceStoreID != nil else { throw ServiceError("Use an absolute managed file, or sourceStoreID plus shardID, without timestamp boundaries.") }
+                guard (s.allFrames && s.startFrame == nil && s.endFrame == nil)
+                        || (!s.allFrames && (s.startFrame ?? -1) >= 0 && (s.endFrame ?? -1) > s.startFrame!) else {
+                    throw ServiceError("Specify allFrames or a nonempty zero-based [startFrame,endFrame) range.")
+                }
+            } else {
+                guard s.cameraID != nil, s.sourceStoreID == nil, !s.allFrames, s.startFrame == nil, s.endFrame == nil,
+                      let start = s.start, let end = s.end,
+                      start.timestamp.isFinite, end.timestamp.isFinite,
+                      start.timestamp >= 0, end.timestamp >= start.timestamp,
+                      end.timestamp - start.timestamp <= 86400,
+                      end.timestamp < 253402300799,
+                      (0...1_000_000).contains(start.frameOffset), (0...1_000_000).contains(end.frameOffset),
+                      end.timestamp > start.timestamp || end.frameOffset > start.frameOffset else {
+                    throw ServiceError("Time selection requires a camera UUID, finite boundaries up to 24 hours apart, and nonnegative frame offsets.")
+                }
+            }
+        }
+    }
+}
+
+struct HistoricalTagResult: Codable, Equatable, Sendable {
+    let storeID: String
+    let cameraID: String
+    let shardID: String
+    let revision: String
+    let changed: Bool
+    var publication: String // preview | local-complete | s3-queued
+}
+struct HistoricalTagStatus: Codable, Sendable {
+    struct Gap: Codable, Sendable {
+        let storeID: String
+        let cameraID: String
+        let timeline: MediaTimeline
+        let start: Double
+        let end: Double
+    }
+    let jobID: String
+    var state: String // preparing | applying | completed | failed
+    var results: [HistoricalTagResult] = []
+    var gaps: [Gap] = []
+    var error: String? = nil
+    var message: String = "Validating historical edits; no changes committed yet."
+}
+struct HistoricalTagInspection: Codable {
+    let storeID: String
+    let cameraID: String
+    let shardID: String
+    let revision: String
+    let timing: ShardTimingMetadata
+    let endTicks: Int64
+    var frames: Int? = nil
+    let tags: VideoTagTimeline
+}
+enum HistoricalTags {
+    static func revision(_ tags: VideoTagTimeline?) throws -> String {
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        return SHA256.hash(data: try encoder.encode(tags)).map { String(format: "%02x", $0) }.joined()
+    }
+    static func ticks(_ value: Double, anchor: Double, timescale: UInt32, end: Int64) throws -> Int64 {
+        let ticks = (value - anchor) * Double(timescale)
+        guard ticks.isFinite else { throw ServiceError("Invalid tag boundary.") }
+        // A time boundary lies before the first sample whose PTS is >= it.
+        // Account only for floating-point cancellation at Unix-time magnitude.
+        let tolerance = max(value.ulp, anchor.ulp) * Double(timescale) * 2
+        return Int64(max(0, min(Double(end), ceil(ticks - tolerance))))
+    }
+    static func frameBoundary(_ frame: Int, ticks: [Int64], end: Int64) throws -> Int64 {
+        guard frame >= 0, frame <= ticks.count else { throw ServiceError("Frame boundary is outside this finalized shard.") }
+        return frame == ticks.count ? end : ticks[frame]
+    }
+}
+
+// Explicit defaults are part of the IPC/JSON contract (synthesized Decodable
+// does not apply stored-property defaults when a JSON field is absent).
+extension HistoricalTagRequest.Boundary {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        timestamp = try c.decode(Double.self, forKey: .timestamp)
+        frameOffset = try c.decodeIfPresent(Int.self, forKey: .frameOffset) ?? 0
+    }
+}
+extension HistoricalTagRequest.Selection {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        file = try c.decodeIfPresent(String.self, forKey: .file)
+        shardID = try c.decodeIfPresent(String.self, forKey: .shardID)
+        sourceStoreID = try c.decodeIfPresent(String.self, forKey: .sourceStoreID)
+        cameraID = try c.decodeIfPresent(String.self, forKey: .cameraID)
+        timeline = try c.decodeIfPresent(MediaTimeline.self, forKey: .timeline) ?? .canonical
+        epochID = try c.decodeIfPresent(String.self, forKey: .epochID)
+        start = try c.decodeIfPresent(HistoricalTagRequest.Boundary.self, forKey: .start)
+        end = try c.decodeIfPresent(HistoricalTagRequest.Boundary.self, forKey: .end)
+        startFrame = try c.decodeIfPresent(Int.self, forKey: .startFrame)
+        endFrame = try c.decodeIfPresent(Int.self, forKey: .endFrame)
+        allFrames = try c.decodeIfPresent(Bool.self, forKey: .allFrames) ?? false
+    }
+}
+extension HistoricalTagRequest {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        jobID = try c.decode(String.self, forKey: .jobID)
+        storeIDs = try c.decode([String].self, forKey: .storeIDs)
+        edits = try c.decode([Edit].self, forKey: .edits)
+        expectedRevisions = try c.decodeIfPresent([String: String].self, forKey: .expectedRevisions)
+        dryRun = try c.decodeIfPresent(Bool.self, forKey: .dryRun) ?? false
+        inspect = try c.decodeIfPresent(Bool.self, forKey: .inspect) ?? false
+    }
+}

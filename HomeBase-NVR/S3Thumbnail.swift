@@ -11,7 +11,9 @@ struct S3ThumbnailInfo: Codable, Equatable, Sendable {
     let cameraID: String
     let slot: Double
     let timestamp: Double
+    var tags: [String: String]? = nil
     func validate() throws {
+        if let tags { try VideoTags.validate(tags) }
         guard format == "hbnvr-s3-thumbnail", version == 1, UUID(uuidString: storeID) != nil,
               UUID(uuidString: cameraID) != nil, slot.isFinite, timestamp.isFinite,
               slot >= 600, slot < 253402300799, slot.truncatingRemainder(dividingBy: 1200) == 600,
@@ -93,7 +95,10 @@ enum S3Thumbnail {
             prefix: s3.prefix, key: key(prefix: s3.prefix, camera: info.cameraID, slot: info.slot, encrypted: encrypted),
             capturedAt: Date(timeIntervalSince1970: info.slot), size: Int64(bytes.count), sha256: S3ObjectMetadata.hash(bytes),
             encryption: encrypted ? RecordingEncryption.format : nil)
-        metadata.schemaVersion = 2; metadata.thumbnail = info
+        // Embedded JPEG caption carries tags INSIDE encryption, never in its
+        // plaintext spool descriptor. No thumbnail manifest needs a duplicate.
+        var publicInfo = info; publicInfo.tags = nil
+        metadata.schemaVersion = 2; metadata.thumbnail = publicInfo
         return (metadata, bytes)
     }
 }

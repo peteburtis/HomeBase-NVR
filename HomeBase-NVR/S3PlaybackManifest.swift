@@ -10,10 +10,15 @@ struct S3PlaybackShard: Codable, Equatable, Sendable {
     let encryption: String?
     let timing: ShardTimingMetadata
     let endTicks: Int64
+    var tagMetadata: StoredVideoTags? = nil
+    var tagRevision: String? = nil
     var start: Double { timing.time.canonicalUTC }
     var end: Double { start + Double(endTicks) / Double(timing.timescale) }
     func validate(store: RecordingStoreConfiguration) throws {
         try timing.validate()
+        try tagMetadata?.validate()
+        guard tagRevision.map({ UUID(uuidString: $0) != nil }) ?? true else { throw ServiceError("Invalid tag revision.") }
+        guard encryption == nil || tagMetadata?.timeline == nil else { throw ServiceError("Encrypted footage has plaintext tag metadata.") }
         guard id == timing.shardID, timing.storeID == store.id, key.hasPrefix(store.s3!.prefix),
               key.utf8.count <= 1024, size > 0, sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
               encryption == nil || encryption == RecordingEncryption.format,
@@ -146,7 +151,7 @@ final class S3PlaybackPublisher: @unchecked Sendable {
             guard fd >= 0 else { throw ServiceError.posix("Open playback journal record") }; defer { close(fd) }
             var info = stat()
             guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(),
-                  info.st_mode & 0o777 == 0o600, info.st_nlink == 1, (1...65536).contains(info.st_size) else {
+                  info.st_mode & 0o777 == 0o600, info.st_nlink == 1, (1...Int64(S3ObjectMetadata.maximumMetadataBytes)).contains(info.st_size) else {
                 throw ServiceError("Unsafe playback journal record; preserved for inspection.")
             }
             let record = try JSONDecoder().decode(Record.self, from: FileHandle(fileDescriptor: fd, closeOnDealloc: false).readToEnd() ?? Data())
@@ -154,7 +159,9 @@ final class S3PlaybackPublisher: @unchecked Sendable {
             guard leaf == record.shard.id + ".json" else { throw ServiceError("Playback journal identity mismatch.") }
             recovered[record.shard.id] = record
         }
-        entries = recovered; loaded = true
+        entries = recovered
+        try recoverTagEdits()
+        loaded = true
         dirtyAll()
     }
     private func validate(_ record: Record) throws {
@@ -172,11 +179,13 @@ final class S3PlaybackPublisher: @unchecked Sendable {
         do {
             guard let timing = metadata.timing, let endTicks = metadata.endTicks else { throw ServiceError("Incomplete frozen playback timing; footage retained.") }
             if !loaded { try load() }
+            try recoverTagEdits()
             let shard = S3PlaybackShard(id: metadata.id, key: metadata.key, size: metadata.size,
-                sha256: metadata.sha256, encryption: metadata.encryption, timing: timing, endTicks: endTicks)
+                sha256: metadata.sha256, encryption: metadata.encryption, timing: timing, endTicks: endTicks, tagMetadata: metadata.tagMetadata)
             try shard.validate(store: configuration)
             if let existing = entries[shard.id] {
-                guard existing.shard == shard else { throw ServiceError("Conflicting confirmed shard identity in playback journal.") }
+                // A replayed original upload must never roll historical edits back.
+                guard existing.shard == shard || (existing.shard.tagRevision != nil && Self.sameMedia(existing.shard, shard)) else { throw ServiceError("Conflicting confirmed shard identity in playback journal.") }
                 return
             }
             let s3 = configuration.s3!
@@ -188,6 +197,67 @@ final class S3PlaybackPublisher: @unchecked Sendable {
             entries[shard.id] = record
             mark(shard); warning = nil
         } catch { warning = Self.localWarning(error); throw error }
+    }
+    static func sameMedia(_ lhs: S3PlaybackShard, _ rhs: S3PlaybackShard) -> Bool {
+        var a = lhs, b = rhs
+        a.tagMetadata = nil; b.tagMetadata = nil; a.tagRevision = nil; b.tagRevision = nil
+        return a == b
+    }
+    static func tagRevision(_ shard: S3PlaybackShard) throws -> String {
+        if let revision = shard.tagRevision { return revision }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        return S3ObjectMetadata.hash(try encoder.encode(shard.tagMetadata))
+    }
+    struct TagReplacement { let expected: S3PlaybackShard; let replacement: S3PlaybackShard }
+    func editTags(_ changes: [TagReplacement]) throws {
+        if !loaded { try load() }
+        try recoverTagEdits()
+        var records: [Record] = []
+        for change in changes {
+            guard let old = entries[change.expected.id], old.shard == change.expected,
+                  Self.sameMedia(change.expected, change.replacement), change.replacement.tagRevision != nil else {
+                throw ServiceError("S3 metadata changed while preparing tags; reload and retry.")
+            }
+            let record = Record(bucket: old.bucket, region: old.region, prefix: old.prefix,
+                expectedOwner: old.expectedOwner, confirmedAt: old.confirmedAt, shard: change.replacement)
+            try validate(record); records.append(record)
+        }
+        guard !records.isEmpty else { return }
+        let data = try JSONEncoder().encode(records)
+        guard records.count <= 128, data.count <= 16 * 1024 * 1024 else { throw ServiceError("Historical edit batch is too large; split it into smaller batches.") }
+        // Values in this recovery journal retain their frozen encrypted envelope.
+        try SecureFiles.atomicWrite(data, to: path + "/.tag-edit", mode: 0o600)
+        try syncDirectory()
+        try checkpoint("tag-intent")
+        try recoverTagEdits()
+    }
+    private func recoverTagEdits() throws {
+        let journal = path + "/.tag-edit"
+        guard let info = try SecureFiles.info(journal) else { return }
+        guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(), info.st_nlink == 1,
+              info.st_mode & 0o777 == 0o600, (1...16 * 1024 * 1024).contains(info.st_size) else {
+            throw ServiceError("Unsafe historical tag recovery journal; preserved.")
+        }
+        let fd = open(journal, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0 else { throw ServiceError.posix("Read historical tag recovery journal") }
+        defer { close(fd) }
+        var pinned = stat()
+        guard fstat(fd, &pinned) == 0, pinned.st_dev == info.st_dev, pinned.st_ino == info.st_ino else { throw ServiceError("Tag journal changed.") }
+        let data = try FileHandle(fileDescriptor: fd, closeOnDealloc: false).read(upToCount: 16 * 1024 * 1024 + 1) ?? Data()
+        let records = try JSONDecoder().decode([Record].self, from: data)
+        guard records.count <= 128, Set(records.map { $0.shard.id }).count == records.count else { throw ServiceError("Invalid historical tag recovery batch.") }
+        for record in records {
+            try validate(record)
+            guard let old = entries[record.shard.id], Self.sameMedia(old.shard, record.shard) else { throw ServiceError("Tag recovery conflicts with stored media identity.") }
+        }
+        for record in records {
+            try SecureFiles.atomicWrite(try JSONEncoder().encode(record), to: path + "/" + record.shard.id + ".json", mode: 0o600)
+            try checkpoint("tag-record")
+        }
+        try syncDirectory()
+        for record in records { entries[record.shard.id] = record; mark(record.shard) }
+        guard unlink(journal) == 0 else { throw ServiceError.posix("Finish historical tag recovery") }
+        try syncDirectory()
     }
     private func mark(_ shard: S3PlaybackShard) {
         revision &+= 1
@@ -251,7 +321,7 @@ final class S3PlaybackPublisher: @unchecked Sendable {
     }
     func tick() {
         guard !stopped, configuration.s3?.settings.forceSpooling != true, task == nil, now() >= retryAt else { return }
-        do { if !loaded { try load() } } catch { warning = Self.localWarning(error); retryAt = now().addingTimeInterval(60); return }
+        do { if !loaded { try load() }; try recoverTagEdits() } catch { warning = Self.localWarning(error); retryAt = now().addingTimeInterval(60); return }
         let day = Self.day(now().timeIntervalSince1970)
         if today != day {
             let previous = today; today = day

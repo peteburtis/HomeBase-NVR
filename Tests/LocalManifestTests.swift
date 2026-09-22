@@ -117,9 +117,13 @@ final class LocalManifestTests: XCTestCase {
     }
     func testRetainedCompletionInsertsMissingRowAndIsIdempotentWithoutRevertingCameraMetadata() throws {
         let f = try fixture(), db = try f.open(), id = UUID().uuidString
-        let value = try completion(f, timing: timing(f, id: id, start: 100), filename: "2026-09-17_12-00-01.mp4")
+        var value = try completion(f, timing: timing(f, id: id, start: 100), filename: "2026-09-17_12-00-01.mp4")
+        value.tags = try VideoTagsTests().timeline()
         try recorded(f, db, number: 2, start: 200, metadata: .init(name: "New name", homebaseDeviceID: "camera-two", updatedAt: 200))
         try db.completeRetained(value); try db.completeRetained(value)
+        var conflict = value
+        conflict.tags?.changes[0] = .init(ticks: 0, frame: 0, tags: ["changed": "must-not-overwrite"])
+        XCTAssertThrowsError(try db.completeRetained(conflict))
         let rows = try db.recordings()
         XCTAssertEqual(rows.count, 2)
         XCTAssertEqual(rows.first?.id, id); XCTAssertEqual(rows.first?.state, .complete)

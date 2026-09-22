@@ -21,6 +21,7 @@ import termios
 import time
 import threading
 import unittest
+import uuid
 import xml.etree.ElementTree as ET
 
 BINARY = os.path.abspath(sys.argv.pop(1))
@@ -136,6 +137,8 @@ class RTSPFixture(socketserver.StreamRequestHandler):
                 elif method == "DESCRIBE":
                     body = ("v=0\r\na=control:*\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 " + self.server.codec +
                             "/90000\r\na=control:track1\r\n").encode()
+                    if getattr(self.server, "tag_live_fixture", False):
+                        body += b"a=fmtp:96 packetization-mode=1;sprop-parameter-sets=Z0IAH5WoFAFuQA==,aM4G4g==\r\n"
                     extra["Content-Base"] = url + "/"
                     extra["Content-Type"] = "application/sdp"
                 elif method == "SETUP":
@@ -965,6 +968,7 @@ class Integration(unittest.TestCase):
         self.assertTrue(info["supportsThumbnails"])
         self.assertEqual(info["thumbnailFormats"], ["image/jpeg"])
         self.assertEqual(info["maxThumbnailDimension"], 2048)
+        self.assertEqual(info["segmentTagsVersion"], 1)
         return client
 
     def media_send(self, client, request):
@@ -1227,6 +1231,173 @@ class Integration(unittest.TestCase):
                 process.terminate()
                 self.assertEqual(process.wait(timeout=3), 0)
                 self.assertEqual(frames.readline(), b"")
+
+    def test_historical_tag_cli_ipc_batch_and_restart_leave_live_tags_alone(self):
+        directory, process = self.agent()
+        output = self.root / "tagged-history"
+        added = self.cli("store", "add", "--runtime-dir", directory,
+                         input=f"1\nHistory tags\n{output}\n1m\n1w\nyes\nyes\n")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        store_id = self.camera_request(directory, "stores.list")["stores"][0]["ID"]
+        server = self.rtsp_fixture(); server.tag_live_fixture = True
+        camera_id = self.add_stream(directory, server, "History Camera")
+        self.await_streams(directory, lambda s: s and s[0]["frames"] >= 15)
+        self.assertEqual(self.cli("camera", "stop", camera_id, "--runtime-dir", directory).returncode, 0)
+        files = list(output.rglob("*.mp4"))
+        self.assertEqual(len(files), 1)
+        path = files[0].resolve()
+        args = ("--runtime-dir", directory, "--store", store_id, "--file", path, "--all-frames")
+        inspected = self.cli("media", "tag", "inspect", *args)
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        original = json.loads(inspected.stdout)[0]
+        def playback_tags(expected):
+            start = original["timing"]["time"]["canonicalUTC"]
+            end = start + original["endTicks"] / original["timing"]["timescale"]
+            with self.media_open(directory) as client:
+                self.media_send(client, dict(requestID="tagged-history", operation="frames", cameraID=camera_id,
+                                            range=dict(start=start, end=end), includeTags=True))
+                def exact(count):
+                    data = b""
+                    while len(data) < count:
+                        part = client.recv(count - len(data))
+                        self.assertTrue(part, "unexpected EOF")
+                        data += part
+                    return data
+                pending = 0
+                tag_data = None
+                frames = 0
+                frame_count = None
+                while True:
+                    kind, count = struct.unpack("!BI", exact(5))
+                    self.assertGreater(count, 0); self.assertLessEqual(count, 65536)
+                    data = exact(count)
+                    if kind == 2:
+                        self.assertLessEqual(count, pending)
+                        pending -= count
+                        if tag_data is not None:
+                            tag_data += data
+                            if pending == 0:
+                                self.assertEqual(json.loads(tag_data), {} if expected is None else {
+                                    "person.alice": [dict(startFrame=0, endFrame=frame_count, value=expected)]})
+                                tag_data = None
+                        continue
+                    self.assertEqual(kind, 1); self.assertEqual(pending, 0)
+                    message = json.loads(data)
+                    if message["type"] == "segment":
+                        segment = message["segment"]
+                        self.assertEqual(segment["tagRangesVersion"], 1)
+                        pending = segment["tagByteCount"]; frame_count = segment["tagFrameCount"]
+                        tag_data = b""
+                    elif message["type"] == "frame":
+                        self.assertNotIn("tags", message["frame"])
+                        pending = message["frame"]["byteCount"]; frames += 1
+                    elif message["type"] == "end":
+                        self.assertEqual(message["outcome"], "complete", message)
+                        self.assertGreater(frames, 0); self.assertEqual(frames, frame_count)
+                        return
+        snapshot = path.read_bytes()
+        preview = self.cli("media", "tag", "set", *args, "--key", "person.alice", "--value", "present", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertEqual(path.read_bytes(), snapshot)
+        result = self.cli("media", "tag", "set", *args, "--key", "person.alice", "--value", "present",
+                          "--expected-revision", original["revision"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertEqual(status["results"][0]["publication"], "local-complete")
+        playback_tags("present")
+        self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {})
+        stale = self.cli("media", "tag", "remove", *args, "--key", "person.alice", "--expected-revision", original["revision"])
+        self.assertNotEqual(stale.returncode, 0)
+        inspected = json.loads(self.cli("media", "tag", "inspect", *args).stdout)[0]
+        self.assertEqual(inspected["tags"]["overrides"][0]["value"], "present")
+        batch = dict(jobID=str(uuid.uuid4()).upper(), storeIDs=[store_id], edits=[dict(
+            selection=dict(shardID=original["shardID"], sourceStoreID=store_id, allFrames=True), key="person.alice")])
+        removed = self.cli("media", "tag", "apply", "-", "--runtime-dir", directory, input=json.dumps(batch))
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        retry = self.cli("media", "tag", "apply", "-", "--runtime-dir", directory, input=json.dumps(batch))
+        self.assertEqual(retry.stdout, removed.stdout)
+        poll = self.cli("media", "tag", "status", batch["jobID"], "--runtime-dir", directory)
+        self.assertEqual(poll.returncode, 0, poll.stderr)
+        process.terminate(); self.assertEqual(process.wait(timeout=8), 0)
+        self.agent()
+        restored = self.cli("media", "tag", "inspect", *args)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assertNotIn("value", json.loads(restored.stdout)[0]["tags"]["overrides"][0])
+        playback_tags(None)
+        self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {})
+
+    def test_live_tags_are_prospective_persistent_and_do_not_reconnect(self):
+        directory, process = self.agent()
+        server = self.rtsp_fixture(); server.tag_live_fixture = True
+        port = server.server_address[1]
+        camera = dict(SchemaVersion=1, Name="Tagged", Provider="RTSP", IPAddress="127.0.0.1", RTSPPort=port,
+                      RTSPURL=f"rtsp://127.0.0.1:{port}/stream", HomebaseDeviceID="camera-tag-fixture",
+                      VideoProfile=dict(Token="main", Encoding="H264", Width=1280, Height=720),
+                      Credentials=dict(SchemaVersion=1, Username="viewer", Password="stream-secret"))
+        added = self.camera_request(directory, "cameras.add", camera=camera)
+        self.assertNotIn("error", added, added)
+        camera_id = added["camera"]["id"]
+        self.await_streams(directory, lambda s: s and s[0]["frames"] >= 5)
+        snapshot = self.camera_request(directory, "cameras.snapshot")["cameraSnapshot"]
+        self.assertEqual(snapshot["cameras"][0]["liveVideo"]["frameTagsVersion"], 1)
+        connections = server.connections
+        fields = dict(cameraID=camera_id, nvrInstanceID=snapshot["instanceID"], homebaseDeviceID="camera-tag-fixture")
+        with self.connect(directory) as client:
+            client.sendall(json.dumps(dict(protocolVersion=1, operation="live.open", liveProtocolVersion=1, **fields)).encode() + b"\n")
+            with client.makefile("rb") as media:
+                opened = json.loads(media.readline())
+                self.assertNotIn("error", opened, opened)
+                self.assertEqual(opened["liveSession"]["frameTagsVersion"], 1)
+                def frame():
+                    kind, length = struct.unpack("!BI", media.read(5))
+                    self.assertEqual(kind, 1)
+                    value = json.loads(media.read(length))
+                    remaining = value["byteCount"]
+                    while remaining:
+                        kind, length = struct.unpack("!BI", media.read(5))
+                        self.assertEqual(kind, 2)
+                        self.assertEqual(len(media.read(length)), length)
+                        remaining -= length
+                    return value
+                def await_tags(expected):
+                    for _ in range(40):
+                        value = frame()
+                        if value["tags"] == expected:
+                            return value
+                    self.fail("Tag change did not reach the live stream")
+                self.assertEqual(frame()["tags"], {})
+                result = self.cli("camera", "tag", "set", camera_id, "--key", "opaque", "--value", "", "--runtime-dir", directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"opaque": ""})
+                first = await_tags({"opaque": ""})
+                for _ in range(3):
+                    self.assertEqual(frame()["tags"], {"opaque": ""})
+                result = self.camera_request(directory, "cameras.tags.set", **fields, tagKey="opaque", tagValue="changed")
+                self.assertEqual(result["tags"], {"opaque": "changed"})
+                self.assertGreater(await_tags({"opaque": "changed"})["timestamp"], first["timestamp"])
+                path = directory / "cameras" / (camera_id + ".json")
+                inode = path.stat().st_ino
+                self.camera_request(directory, "cameras.tags.set", **fields, tagKey="opaque", tagValue="changed")
+                self.assertEqual(path.stat().st_ino, inode)
+                self.camera_request(directory, "cameras.stop", cameraID=camera_id)
+                self.camera_request(directory, "cameras.tags.set", **fields, tagKey="while-stopped", tagValue="yes")
+                await_tags({"opaque": "changed", "while-stopped": "yes"})
+                self.camera_request(directory, "cameras.tags.remove", **fields, tagKey="while-stopped")
+                await_tags({"opaque": "changed"})
+                self.assertFalse(self.camera_request(directory, "cameras.list")["cameras"][0]["recordingStarted"])
+                # Mutation changes neither recording intent nor the RTSP source.
+                self.assertEqual(server.connections, connections)
+                stale = fields | dict(nvrInstanceID="stale")
+                self.assertIn("error", self.camera_request(directory, "cameras.tags.remove", **stale, tagKey="opaque"))
+                self.assertIn("error", self.camera_request(directory, "cameras.tags.set", **fields, tagKey="opaque", tagValue="x" * 2049))
+                self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {"opaque": "changed"})
+        process.terminate(); self.assertEqual(process.wait(timeout=5), 0)
+        directory, _ = self.agent()
+        self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {"opaque": "changed"})
+        result = self.cli("camera", "tag", "remove", camera_id, "--key", "opaque", "--runtime-dir", directory)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {})
+        self.assertEqual(self.camera_request(directory, "cameras.tags.remove", cameraID=camera_id, tagKey="opaque")["tags"], {})
 
     def test_camera_watch_limit_and_restart_epoch(self):
         directory, process = self.agent()

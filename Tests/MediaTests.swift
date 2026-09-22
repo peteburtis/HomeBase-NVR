@@ -19,7 +19,8 @@ final class MediaTests: XCTestCase {
     func fixture(codec: CMVideoCodecType = kCMVideoCodecType_H264, cameraClock: Bool = true,
                  shard: String = "1m", count: Int = 45, largeFrames: Bool = false,
                  initialCount: Int? = nil, timestampSkewPerFrame: UInt32 = 0,
-                 startUTC: Double? = nil, cameraID: String? = nil) throws -> Fixture {
+                 startUTC: Double? = nil, cameraID: String? = nil,
+                 tags: (Int) -> [String: String] = { _ in [:] }) throws -> Fixture {
         let root = "/private/tmp/hbnvr-media-tests-" + UUID().uuidString
         try SecureFiles.ensureDirectory(root, owner: geteuid(), mode: 0o700)
         addTeardownBlock { try? FileManager.default.removeItem(atPath: root) }
@@ -44,7 +45,7 @@ final class MediaTests: XCTestCase {
             var sample = EncodedMedia(codec: input.codec, clockRate: input.clockRate, parameterSets: input.parameterSets,
                 frame: .init(payload: payload, timestamp: timestamp, keyFrame: input.frame.keyFrame),
                 receivedAt: Date(timeIntervalSince1970: (startUTC ?? base) + 0.4 + offset), receivedUptime: 100 + offset,
-                cameraUTC: cameraClock ? (startUTC ?? base) + offset : nil, ssrc: 42)
+                cameraUTC: cameraClock ? (startUTC ?? base) + offset : nil, ssrc: 42, tags: tags(number))
             sample.time = try timeline.observe(sample); samples.append(sample)
             if initialCount == nil || samples.count <= initialCount! {
                 store.accept(.media(camera: camera, name: "Test Camera", sample))

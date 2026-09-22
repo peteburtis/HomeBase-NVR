@@ -1,6 +1,32 @@
 # HomeBase-NVR / hbnvr
 
-Version **0.18.3** adds bounded retries for local recording manifest failures:
+Version **0.22.0** adds opt-in historical IPC tag maps, once per returned segment.
+Maps cover exact returned frame ranges (including preroll), resolve retroactive
+edits, and treat missing/unknown values as absent. RAM and growing-file requests
+snapshot the writer's tags without waiting for SQLite checkpoints or copying video.
+See [segment tags](MEDIA-PROTOCOL.md#segment-tag-maps-0220). Existing clients are unchanged.
+
+Version 0.21.0 adds historical `media tag set/remove/inspect/apply/status` over
+authenticated IPC. Address finalized footage by managed file/shard and frames,
+or canonical/camera/received timestamps with optional actual-frame offsets.
+Local edits safely replace MP4 metadata and the index; S3 edits update only
+manifests, never video/JPEG objects. Batches, dry runs, revision checks, bounded
+background work, and recovery are described in [historical tags](HISTORICAL-TAGS.md).
+Live tags and Homebase/GUI behavior are unchanged by historical edits.
+
+Version 0.20.0 adds opaque, prospective per-camera string tags. Set/remove
+them with `camera tag`; every shared live frame includes its tag dictionary.
+Tags persist with newly recorded MP4s, local/S3 manifests, and S3 thumbnails.
+No historical files are rewritten by these prospective commands. Homebase tag
+interpretation remains deferred. See [video tags](VIDEO-TAGS.md).
+
+Version 0.19.0 adds authenticated, bounded live H.264 forwarding from the
+existing NVR receiver to Homebase. Viewing never starts a camera connection or
+changes recording intent; slow viewers cannot hold up recording. See
+[shared live video](LIVE-VIDEO.md). Homebase's temporary quality override allows
+existing GUI clients to use the shared feed without an app update.
+
+Version 0.18.3 adds bounded retries for local recording manifest failures:
 known finalized-shard metadata retries for up to one minute, with a 16-entry
 per-store cap and explicit failure/recovery/discard logging. No historical scan
 or video deletion is introduced; see [the retry policy](LOCAL-MANIFEST.md#lifecycle-and-failure-policy).
@@ -60,8 +86,8 @@ MP4 fragments, and finalized recordings. A bounded RAM bridge reaches the latest
 accepted frame and releases history as disk becomes readable, without a second
 payload copy or changing recording durability. Absolute canonical/camera/
 received ranges and live-/now-relative ranges are supported, with explicit gaps
-and keyframe preroll. Homebase consumption, S3-only playback, continuous live
-forwarding, and frame-reference requests remain future work. See the
+and keyframe preroll. Continuous live forwarding is now separate from history
+requests; frame-reference requests remain future work. See the
 [media wire contract](MEDIA-PROTOCOL.md).
 Version 0.13.0 adds `playback.snapshot` / `playback.watch` over the authenticated
 control IPC: discover stores, frame-reading capability, camera membership, and

@@ -76,7 +76,40 @@ enum ResourceSelection {
 
 struct Camera: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Configure cameras and persist streaming/recording controls. No sudo.",
-        subcommands: [Add.self, CameraList.self, CameraChange.self, Remove.self, CameraEnable.self, CameraDisable.self, CameraStart.self, CameraStop.self])
+        subcommands: [Add.self, CameraList.self, CameraChange.self, Remove.self, CameraEnable.self, CameraDisable.self, CameraStart.self, CameraStop.self, CameraTag.self])
+}
+struct CameraTag: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "tag", abstract: "Read or change opaque tags for future frames only. Changes persist; historical footage is never edited.",
+        subcommands: [CameraTagList.self, CameraTagSet.self, CameraTagRemove.self])
+}
+enum CameraTagCommand {
+    static func run(_ operation: String, target: CameraTarget, key: String? = nil, value: String? = nil) throws {
+        let (connection, camera) = try target.selected()
+        let reply = try connection.send(Request(protocolVersion: 1, operation: "cameras.tags." + operation,
+            cameraID: camera.id, tagKey: key, tagValue: value))
+        guard let tags = reply.tags else { throw ServiceError("Agent did not confirm tags; update HBNVR before using this command.") }
+        // JSON escapes arbitrary strings safely, including terminal control characters.
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+        print(String(decoding: try encoder.encode(tags), as: UTF8.self))
+    }
+}
+struct CameraTagList: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "list", abstract: "Show the current tag dictionary as JSON.")
+    @OptionGroup var target: CameraTarget
+    func run() throws { try command { try CameraTagCommand.run("get", target: target) } }
+}
+struct CameraTagSet: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "set", abstract: "Set one tag for subsequent frames; preserve other keys. Empty values are valid.")
+    @OptionGroup var target: CameraTarget
+    @Option var key: String
+    @Option var value: String
+    func run() throws { try command { try CameraTagCommand.run("set", target: target, key: key, value: value) } }
+}
+struct CameraTagRemove: ParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "remove", abstract: "Stop applying one tag to subsequent frames. Does not erase historical tags.")
+    @OptionGroup var target: CameraTarget
+    @Option var key: String
+    func run() throws { try command { try CameraTagCommand.run("remove", target: target, key: key) } }
 }
 struct CameraTarget: ParsableArguments {
     @Option(help: "Local agent runtime directory; omit for the installed service.") var runtimeDir: String?

@@ -37,7 +37,9 @@ enum S3RepairMedia {
     /// re-encoding; sample timestamps provide the exclusive end of the shard.
     static func inspect(_ bytes: Data, candidate: S3RepairCandidate, store: RecordingStoreConfiguration,
                         passwords: [String]) async throws -> S3ShardMetadata {
-        let source = S3RepairMemoryAsset(data: try plaintext(bytes, candidate: candidate, passwords: passwords))
+        let decoded = try plaintext(bytes, candidate: candidate, passwords: passwords)
+        let tags = try VideoTagMP4.read(decoded.data)
+        let source = S3RepairMemoryAsset(data: decoded.data)
         return try await withTaskCancellationHandler {
             defer { source.cancel() }
             let (timing, track) = try await inspectHeader(source)
@@ -46,21 +48,27 @@ enum S3RepairMedia {
             let end = try sampleEnd(source, track: track, timing: timing)
             try Task.checkCancellation()
             let s3 = store.s3!
-            let metadata = S3ShardMetadata(id: timing.shardID, storeID: store.id, cameraID: timing.cameraID,
+            var metadata = S3ShardMetadata(id: timing.shardID, storeID: store.id, cameraID: timing.cameraID,
                 bucket: s3.bucket, region: s3.region, expectedOwner: s3.expectedOwner, prefix: s3.prefix,
                 key: candidate.object.key, capturedAt: Date(timeIntervalSince1970: timing.time.canonicalUTC),
                 size: Int64(bytes.count), sha256: S3ShardMetadata.hash(bytes),
                 encryption: candidate.encrypted ? RecordingEncryption.format : nil, timing: timing, endTicks: end)
+            if let tags {
+                // Preserve confidentiality even when repairing an encrypted old
+                // object into a store whose current encryption setting changed.
+                metadata.tagMetadata = try StoredVideoTags.freeze(tags, password: decoded.password)
+            }
             try S3PlaybackShard(id: metadata.id, key: metadata.key, size: metadata.size, sha256: metadata.sha256,
-                encryption: metadata.encryption, timing: timing, endTicks: end).validate(store: store)
+                encryption: metadata.encryption, timing: timing, endTicks: end, tagMetadata: metadata.tagMetadata).validate(store: store)
             return metadata
         } onCancel: { source.cancel() }
     }
-    private static func plaintext(_ bytes: Data, candidate: S3RepairCandidate, passwords: [String]) throws -> Data {
+    private static func plaintext(_ bytes: Data, candidate: S3RepairCandidate, passwords: [String]) throws -> (data: Data, password: String?) {
         try Task.checkCancellation()
         guard bytes.count == candidate.object.size else { throw S3RepairReadFailure.size(expected: candidate.object.size, actual: bytes.count) }
         guard bytes.count <= AWSS3RepairReader.maximumObjectBytes else { throw S3RepairSkip.oversized }
         let plaintext: Data
+        var usedPassword: String?
         if candidate.encrypted {
             guard bytes.starts(with: RecordingEncryption.magic),
                   (try? RecordingEncryption.validateEnvelopeHeader(Data(bytes.prefix(RecordingEncryption.headerSize)), size: Int64(bytes.count))) != nil else {
@@ -69,7 +77,7 @@ enum S3RepairMedia {
             var opened: Data?
             for password in passwords {
                 try Task.checkCancellation()
-                if let result = try? RecordingEncryption.decrypt(bytes, password: password) { opened = result; break }
+                if let result = try? RecordingEncryption.decrypt(bytes, password: password) { opened = result; usedPassword = password; break }
             }
             guard let opened else { throw S3RepairFailure.password }
             plaintext = opened
@@ -77,7 +85,7 @@ enum S3RepairMedia {
             guard !bytes.starts(with: RecordingEncryption.magic) else { throw S3RepairSkip.unexpected }
             plaintext = bytes
         }
-        return plaintext
+        return (plaintext, usedPassword)
     }
     /// Reuse the already downloaded object. Decode only selected keyframes,
     /// handing each finished JPEG directly to the shared upload pool.
@@ -85,7 +93,9 @@ enum S3RepairMedia {
                            passwords: [String], metadata: S3ObjectMetadata, slots: [Double], cancellation: Cancellation,
                            accept: (S3ObjectMetadata, Data) async throws -> Void) async throws {
         guard !slots.isEmpty else { return }
-        let source = S3RepairMemoryAsset(data: try plaintext(bytes, candidate: candidate, passwords: passwords))
+        let decoded = try plaintext(bytes, candidate: candidate, passwords: passwords)
+        let tags = try VideoTagMP4.read(decoded.data)
+        let source = S3RepairMemoryAsset(data: decoded.data)
         try await withTaskCancellationHandler {
             defer { source.cancel() }
             let (timing, track) = try await inspectHeader(source)
@@ -99,13 +109,14 @@ enum S3RepairMedia {
             defer { reader.cancelReading() }
             let wanted = slots.sorted()
             var index = 0, keyframe: CMSampleBuffer?, keyTime = 0.0
+            var keyTicks: Int64 = 0
             func emit(until time: Double, inclusive: Bool = false) async throws {
                 while index < wanted.count, wanted[index] < time || (inclusive && wanted[index] == time) {
                     try Task.checkCancellation()
                     guard !cancellation.isStopped else { throw CancellationError() }
                     let slot = wanted[index]; index += 1
                     guard let keyframe, keyTime <= slot, slot - keyTime <= 120 else { continue }
-                    let info = S3ThumbnailInfo(storeID: store.id, cameraID: candidate.cameraID, slot: slot, timestamp: keyTime)
+                    let info = S3ThumbnailInfo(storeID: store.id, cameraID: candidate.cameraID, slot: slot, timestamp: keyTime, tags: tags?.tags(at: keyTicks))
                     let (object, data) = try S3Thumbnail.render(keyframe, info: info, store: store, cancellation: cancellation)
                     try await accept(object, data)
                 }
@@ -118,7 +129,10 @@ enum S3RepairMedia {
                 let time = timing.time.canonicalUTC + CMTimeGetSeconds(pts)
                 try await emit(until: time)
                 let attributes = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[String: Any]]
-                if attributes?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool != true { keyframe = sample; keyTime = time }
+                if attributes?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool != true {
+                    keyframe = sample; keyTime = time
+                    keyTicks = CMTimeConvertScale(pts, timescale: Int32(timing.timescale), method: .default).value
+                }
                 try await emit(until: time, inclusive: true)
             }
             if index < wanted.count {
@@ -186,7 +200,7 @@ enum S3RepairMedia {
 }
 
 /// Same RAM-only AVFoundation loading strategy as the GUI S3 reader.
-private final class S3RepairMemoryAsset: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+final class S3RepairMemoryAsset: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
     let asset: AVURLAsset
     private let data: Data
     private let queue = DispatchQueue(label: "hbnvr.repair.media")

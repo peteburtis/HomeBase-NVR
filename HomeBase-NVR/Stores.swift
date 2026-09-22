@@ -107,19 +107,22 @@ struct EncodedMedia: Sendable {
     let cameraClock: CameraClockEvidence?
     let ssrc: UInt32?
     var time: RecordingTime?
+    var tags: [String: String] = [:]
     init(codec: String, clockRate: UInt32, parameterSets: [Data], frame: EncodedVideoFrame,
          receivedAt: Date = Date(), receivedUptime: TimeInterval = ProcessInfo.processInfo.systemUptime,
-         cameraUTC: Double? = nil, ssrc: UInt32? = nil, time: RecordingTime? = nil, cameraClock: CameraClockEvidence? = nil) {
+         cameraUTC: Double? = nil, ssrc: UInt32? = nil, time: RecordingTime? = nil, cameraClock: CameraClockEvidence? = nil,
+         tags: [String: String] = [:]) {
         self.codec = codec; self.clockRate = clockRate; self.parameterSets = parameterSets; self.frame = frame
         self.receivedAt = receivedAt; self.receivedUptime = receivedUptime
         self.cameraUTC = cameraUTC; self.ssrc = ssrc; self.time = time
         self.cameraClock = cameraClock
+        self.tags = tags
     }
 }
 enum RecordingEvent: Sendable {
     case media(camera: String, name: String, EncodedMedia, homebaseDeviceID: String? = nil)
     case end(camera: String)
-    var bytes: Int { if case .media(_, _, let media, _) = self { return media.frame.payload.count }; return 0 }
+    var bytes: Int { if case .media(_, _, let media, _) = self { return media.frame.payload.count + VideoTags.maximumJSONBytes }; return 0 }
 }
 struct LocalStoreStatus: Codable {
     var retryingDestination: Bool
@@ -220,6 +223,16 @@ final class RecordingStoreManager: @unchecked Sendable {
         lock.lock(); let store = destinations[config.id] as? S3RecordingStore; lock.unlock()
         guard let store else { throw ServiceError("The S3 store is unavailable. Resolve its startup/storage error before repairing metadata.") }
         return store.repairSink(expected: config, cameras: cameras, cameraStillExists: cameraStillExists)
+    }
+    func historicalS3(_ id: String) throws -> S3RecordingStore {
+        lock.lock(); defer { lock.unlock() }
+        guard let value = destinations[id] as? S3RecordingStore else { throw ServiceError("S3 store is unavailable.") }
+        return value
+    }
+    func historicalLocal(_ id: String) throws -> LocalRecordingStore {
+        lock.lock(); defer { lock.unlock() }
+        guard let value = destinations[id] as? LocalRecordingStore else { throw ServiceError("Local store is unavailable.") }
+        return value
     }
     func accept(_ event: RecordingEvent) {
         lock.lock(); let values = Array(destinations.values); lock.unlock()

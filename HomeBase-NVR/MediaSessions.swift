@@ -20,7 +20,8 @@ enum MediaResponse {
             try emit(end)
             return
         }
-        let sources = try provider.catalog(camera: request.cameraID, range: resolved.range, timeline: request.timeline, work: work)
+        let sources = try provider.catalog(camera: request.cameraID, range: resolved.range, timeline: request.timeline, work: work,
+                                          includeTags: request.includeTags)
         let pieces = try LocalMediaProvider.plan(sources, range: resolved.range, work: work)
         var coverage: [MediaRange] = [], frames: UInt64 = 0
         if request.operation == "availability" {
@@ -99,7 +100,7 @@ private final class MediaSink {
         let data = try JSONEncoder().encode(message)
         broken = true
         try MediaWire.write(data, type: MediaWire.json, fd: fd, work: work)
-        broken = false; pendingBytes = message.frame?.byteCount ?? message.thumbnail?.byteCount ?? 0
+        broken = false; pendingBytes = message.frame?.byteCount ?? message.thumbnail?.byteCount ?? message.segment?.tagByteCount ?? 0
     }
     func bytes(_ data: Data) throws {
         guard !broken, !data.isEmpty, data.count <= pendingBytes else { throw ServiceError(.invalidMessage, "Invalid frame payload.") }

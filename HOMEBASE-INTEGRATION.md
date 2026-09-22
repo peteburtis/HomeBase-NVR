@@ -46,6 +46,11 @@ capabilities anew; retention of the published control applies within that Homeba
 
 ## Wire contract
 
+Since 0.19.0, camera snapshots also advertise optional `liveVideo` profile
+capabilities, and `live.open` taps the existing receiver on a dedicated connection.
+See [shared live video](LIVE-VIDEO.md). Recording controls and playback discovery
+remain separate; neither viewing nor closing a viewer changes recording intent.
+
 Protocol version remains `1`; these are additive operations using the existing
 newline-delimited JSON transport and 64-KiB frame limit. Snapshots contain no camera
 credentials, endpoint URLs, AWS credentials, or store details.

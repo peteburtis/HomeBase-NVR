@@ -314,6 +314,27 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
 
     // Also callable by deterministic tests; all maintenance stays on the store worker.
     func performMaintenance() { queue.async { [self] in maintain() } }
+    func commitHistorical(directory: LocalRecordingLayout.Directory, edits: [LocalTagFile.Pending],
+                          revisions: [String: String]) throws {
+        try queue.sync {
+            guard !finished, let identity = try LocalRecordingLayout.identity(in: directory.fd), identity.storeID == configuration.id else {
+                throw ServiceError("Store stopped or recording directory changed during tag edit.")
+            }
+            do {
+                let index: LocalRecordingManifest
+                if let existing = manifests[directory.path] { index = existing }
+                else {
+                    index = try LocalRecordingManifest(directory: directory, identity: identity, owner: configuration.ownerUID, recoverInterrupted: false)
+                    manifests[directory.path] = index
+                }
+                try index.commitTagEdits(edits, revisions: revisions)
+                report("Historical tags committed for \(edits.count) finalized shards.", camera: identity.cameraID)
+            } catch {
+                report("Historical tag commit needs attention; staged files and durable intents preserved. \(message(error))", camera: identity.cameraID)
+                throw error
+            }
+        }
+    }
     private func maintain() {
         lock.lock(); let stopping = finished; lock.unlock()
         guard !stopping else { return }
@@ -330,6 +351,10 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         }
         guard hooks.now() >= nextRetention else { return }
         nextRetention = hooks.now() + 30
+        for index in manifests.values {
+            do { try index.recoverTagEdits() }
+            catch { report("Historical tag recovery will retry; files preserved. \(message(error))") }
+        }
         do { try LocalRecordingLayout.verify(path: path, fd: directoryFD, owner: configuration.ownerUID) }
         catch {
             // A removed/replaced mount must be reopened and validated, never used
@@ -556,13 +581,13 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         }
         if let seed, let file = writer.finalizedFile, let directory = track.directory {
             let completion = LocalRecordingManifest.Completion(seed: seed, endTicks: writer.endTicks,
-                frames: writer.sampleCount, file: file)
+                frames: writer.sampleCount, file: file, tags: writer.tagTimeline)
             let recovering = track.indexRetry.message != nil
             do {
                 try hooks.before(.completeManifest, track.camera)
                 if let recordingID, let manifest = track.manifest {
                     try manifest.complete(id: recordingID, filename: writer.finalName,
-                                          endTicks: writer.endTicks, frames: writer.sampleCount)
+                                          endTicks: writer.endTicks, frames: writer.sampleCount, tags: writer.tagTimeline)
                     try hooks.before(.manifestCommitted, track.camera)
                 } else {
                     try writeRetainedManifest(completion, path: directory.path)
@@ -655,13 +680,15 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             track.lastManifestCheckpoint = hooks.now()
         }
         try hooks.before(.append, camera)
-        try track.writer!.append(media.frame)
+        if try track.writer!.append(media.frame, tags: media.tags) {
+            report("Tag metadata limit reached; remaining shard tags are explicitly unknown. Video recording continues.", camera: camera)
+        }
         track.retry.message = nil
         let now = hooks.now()
         if now - track.lastManifestCheckpoint >= 5, let id = track.recordingID, let writer = track.writer {
             do {
                 try hooks.before(.checkpointManifest, camera)
-                try track.manifest!.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount)
+                try track.manifest!.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount, tags: writer.tagTimeline)
             } catch { indexFailed(error, track: track) }
             track.lastManifestCheckpoint = now
         }
@@ -762,6 +789,8 @@ final class MP4Shard {
     private var last: UInt32
     private var ticks: Int64 = 0
     private var samples = 0
+    private var tagAccumulator = VideoTagAccumulator()
+    var tagTimeline: VideoTagTimeline { tagAccumulator.timeline }
     private var lastDuration: Int64 = 6000
     private var syncFD: Int32 = -1
     private var lastSync: TimeInterval = 0
@@ -817,7 +846,7 @@ final class MP4Shard {
         return format
     }
     func elapsed(_ timestamp: UInt32) -> Double { Double(ticks + Int64(Int32(bitPattern: timestamp &- last))) / Double(clock) }
-    func append(_ frame: EncodedVideoFrame) throws {
+    @discardableResult func append(_ frame: EncodedVideoFrame, tags: [String: String] = [:]) throws -> Bool {
         let delta = Int64(Int32(bitPattern: frame.timestamp &- last))
         guard samples == 0 || delta > 0 else { throw ServiceError("This stream reorders presentation timestamps; recording requires a no-B-frame camera profile in this increment.") }
         if samples > 0 { ticks += delta; lastDuration = delta }; last = frame.timestamp
@@ -836,9 +865,11 @@ final class MP4Shard {
             CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(), Unmanaged.passUnretained(frame.keyFrame ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
         }
         guard input.append(sample) else { throw writerFailure("append video") }
-        ramTail?.append(block: block, pts: ticks, duration: lastDuration, key: frame.keyFrame)
+        let overflow = try tagAccumulator.append(tags, ticks: ticks, frame: Int64(samples))
+        ramTail?.append(block: block, pts: ticks, duration: lastDuration, key: frame.keyFrame, tags: tagTimeline)
         samples += 1
         try checkpoint()
+        return overflow
     }
     private func checkpoint() throws {
         let now = ProcessInfo.processInfo.systemUptime
@@ -886,6 +917,7 @@ final class MP4Shard {
         guard fd >= 0 else { throw ServiceError.posix("Open completed recording") }
         defer { close(fd) }
         // Inherited requester/daemon ACLs are retained; no group/other POSIX access.
+        try VideoTagMP4.append(tagTimeline, fd: fd)
         guard fchmod(fd, 0o600) == 0, futimens(fd, nil) == 0, fsync(fd) == 0 else { throw ServiceError.posix("Secure completed recording") }
         guard renameatx_np(directoryFD, temporaryName, directoryFD, finalName, UInt32(RENAME_EXCL)) == 0 else { throw ServiceError.posix("Publish completed recording") }
         guard fsync(directoryFD) == 0 else { throw ServiceError.posix("Persist completed recording name") }

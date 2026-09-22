@@ -6,7 +6,7 @@ import SQLite3
 /// Owned by one local-store worker. Readers use separate read-only connections.
 final class LocalRecordingManifest {
     static let filename = ".hbnvr-manifest.sqlite"
-    static let schemaVersion: Int64 = 2
+    static let schemaVersion: Int64 = 4
     private static let applicationID: Int64 = 0x48424e4d // HBNM
     enum State: String { case recording, complete, interrupted }
     /// Last recorded identity, independent of configuration and directory names.
@@ -45,7 +45,7 @@ final class LocalRecordingManifest {
         let timing: ShardTimingMetadata
         let camera: CameraMetadata
     }
-    struct FileIdentity: Equatable {
+    struct FileIdentity: Codable, Equatable {
         let device: Int64
         let inode: Int64
         let size: Int64
@@ -58,6 +58,7 @@ final class LocalRecordingManifest {
         let endTicks: Int64
         let frames: Int64
         let file: FileIdentity
+        var tags: VideoTagTimeline? = nil
     }
     struct Interval: Equatable {
         let start: Double
@@ -130,7 +131,7 @@ final class LocalRecordingManifest {
                             file_size INTEGER NOT NULL DEFAULT 0,
                             camera_utc REAL, received_utc REAL NOT NULL,
                             canonical_source TEXT NOT NULL CHECK(canonical_source IN ('camera','received')),
-                            timing_json TEXT NOT NULL)
+                            timing_json TEXT NOT NULL, tags_json TEXT)
                         """)
                     try execute("CREATE INDEX recording_time ON recordings(start_utc)")
                     try createCameraMetadata()
@@ -139,7 +140,7 @@ final class LocalRecordingManifest {
             }
             let version = try scalar("PRAGMA user_version")
             guard try scalar("PRAGMA application_id") == Self.applicationID,
-                  [1, Self.schemaVersion].contains(version) else {
+                  [1, 2, 3, Self.schemaVersion].contains(version) else {
                 throw ServiceError("Unsupported local manifest format; existing database and recordings were preserved.")
             }
             let identityStatement = try prepare("SELECT store_id, camera_id FROM identity WHERE singleton=1")
@@ -150,13 +151,16 @@ final class LocalRecordingManifest {
                 throw ServiceError("Local manifest belongs to a different camera or store; it was not changed.")
             }
             if !readOnly {
-                if version == 1 {
+                if version < Self.schemaVersion {
                     // Add identity only; never infer or backfill recording times.
                     try transaction {
-                        try createCameraMetadata()
+                        if version == 1 { try createCameraMetadata() }
+                        if version < 3 { try execute("ALTER TABLE recordings ADD COLUMN tags_json TEXT") }
                         try execute("PRAGMA user_version=\(Self.schemaVersion)")
                     }
                 }
+                try execute("CREATE TABLE IF NOT EXISTS tag_edits (shard_id TEXT PRIMARY KEY, pending_json TEXT NOT NULL)")
+                try recoverTagEdits()
                 // A previous process's accepted frames are not proof of a safely
                 // finalized container. Never promote them by inspecting old media.
                 if recoverInterrupted {
@@ -221,8 +225,17 @@ final class LocalRecordingManifest {
 
     /// Batched accepted-frame progress; recording rows are NOT advertised as
     /// readable coverage. AVAssetWriter may still hold these samples in memory.
-    func progress(id: String, endTicks: Int64, frames: Int64) throws {
-        try transaction { try updateProgress(id: id, endTicks: endTicks, frames: frames) }
+    func progress(id: String, endTicks: Int64, frames: Int64, tags: VideoTagTimeline? = nil) throws {
+        try transaction {
+            try updateProgress(id: id, endTicks: endTicks, frames: frames)
+            try updateTags(id: id, tags: tags)
+        }
+    }
+    private func updateTags(id: String, tags: VideoTagTimeline?) throws {
+        guard let tags else { return }
+        try tags.validate()
+        try execute("UPDATE recordings SET tags_json=? WHERE id=?",
+            [.text(String(decoding: try JSONEncoder().encode(tags), as: UTF8.self)), .text(id)])
     }
     private func updateProgress(id: String, endTicks: Int64, frames: Int64) throws {
         guard endTicks > 0, frames > 0 else { throw ServiceError("Invalid local recording progress.") }
@@ -232,7 +245,7 @@ final class LocalRecordingManifest {
                     [.integer(endTicks), .integer(frames), .text(id), .integer(frames)])
         guard sqlite3_changes(database) == 1 else { throw ServiceError("Local manifest recording state changed; recording was not indexed.") }
     }
-    func complete(id: String, filename: String, endTicks: Int64, frames: Int64) throws {
+    func complete(id: String, filename: String, endTicks: Int64, frames: Int64, tags: VideoTagTimeline? = nil) throws {
         guard validLeaf(filename) else { throw ServiceError("Invalid local recording filename.") }
         var info = stat()
         guard fstatat(directory.fd, filename, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw ServiceError.posix("Inspect finalized recording") }
@@ -240,6 +253,7 @@ final class LocalRecordingManifest {
         guard info.st_size > 0 else { throw ServiceError("Finalized recording is empty.") }
         try transaction {
             try updateProgress(id: id, endTicks: endTicks, frames: frames)
+            try updateTags(id: id, tags: tags)
             try execute("UPDATE recordings SET filename=final_filename,state='complete',file_device=?,file_inode=?,file_size=? WHERE id=? AND final_filename=?",
                         [.integer(Int64(info.st_dev)), .integer(Int64(bitPattern: info.st_ino)), .integer(info.st_size), .text(id), .text(filename)])
             guard sqlite3_changes(database) == 1 else { throw ServiceError("Finalized filename does not match the local manifest.") }
@@ -282,7 +296,16 @@ final class LocalRecordingManifest {
                           row.device == value.file.device, row.inode == value.file.inode, row.size == value.file.size else {
                         throw ServiceError("Manifest retry conflicts with a completed recording; index was preserved.")
                     }
-                    return // The earlier commit succeeded, even if its acknowledgment did not.
+                    // The earlier commit succeeded, including its tag transaction.
+                    if let tags = value.tags {
+                        let statement = try prepare("SELECT tags_json FROM recordings WHERE id=?", [.text(timing.shardID)])
+                        defer { sqlite3_finalize(statement) }
+                        guard sqlite3_step(statement) == SQLITE_ROW,
+                              let old = try? JSONDecoder().decode(VideoTagTimeline.self, from: Data(string(statement, 0).utf8)), old == tags else {
+                            throw ServiceError("Manifest retry conflicts with completed tags; index was preserved.")
+                        }
+                    }
+                    return
                 }
                 try execute("UPDATE recordings SET filename=final_filename,state='complete',end_ticks=?,frames=?,file_device=?,file_inode=?,file_size=? WHERE id=?",
                     [.integer(value.endTicks), .integer(value.frames), .integer(value.file.device),
@@ -298,6 +321,7 @@ final class LocalRecordingManifest {
                           .integer(value.file.inode), .integer(value.file.size), timing.time.cameraUTC.map(Value.real) ?? .null,
                           .real(timing.time.receivedUTC), .text(timing.time.canonicalSource.rawValue), .text(try timing.json())])
             }
+            try updateTags(id: timing.shardID, tags: value.tags)
             // Replaying an older shard must not undo a newer camera rename/binding.
             try execute("""
                 INSERT INTO camera_metadata VALUES (1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET
@@ -313,6 +337,114 @@ final class LocalRecordingManifest {
         try transaction { try execute("DELETE FROM recordings WHERE filename=? OR final_filename=?", [.text(filename), .text(filename)]) }
     }
     func recordings() throws -> [Recording] { try readRecordings() }
+    func historicalRecordings(id: String? = nil, filename: String? = nil, range: MediaRange? = nil,
+                              timeline: MediaTimeline = .canonical) throws -> [Recording] {
+        var predicates: [String] = [], values: [Value] = []
+        if let id { predicates.append("id=?"); values.append(.text(id)) }
+        if let filename { predicates.append("filename=?"); values.append(.text(filename)) }
+        if let range {
+            predicates.append("\(timeline.column) IS NOT NULL AND \(timeline.column)<? AND (state='recording' OR \(timeline.column)+CAST(end_ticks AS REAL)/timescale>?)")
+            values += [.real(range.end), .real(range.start)]
+        }
+        var rows: [Recording] = []
+        try visitRecordings(Self.recordingSelect + (predicates.isEmpty ? "" : " WHERE " + predicates.joined(separator: " AND ")),
+                            values, limit: 129) { rows.append($0); return true }
+        return rows
+    }
+    func historicalTags(id: String) throws -> VideoTagTimeline? {
+        try checkFiles()
+        guard try scalar("PRAGMA user_version") >= 3 else { return nil }
+        let statement = try prepare("SELECT tags_json FROM recordings WHERE id=?", [.text(id)])
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw ServiceError("Recording no longer exists in manifest.") }
+        if sqlite3_column_type(statement, 0) == SQLITE_NULL { return nil }
+        let value = try JSONDecoder().decode(VideoTagTimeline.self, from: Data(string(statement, 0).utf8))
+        try value.validate(); return value
+    }
+    /// A single SQLite snapshot couples the tag value to the exact finalized
+    /// inode already pinned by the reader. A concurrent replacement is retried,
+    /// never paired with tags from another revision. Legacy rows mean no values.
+    func playbackTags(matching row: Recording) throws -> VideoTagTimeline? {
+        try checkFiles()
+        let column = try scalar("PRAGMA user_version") >= 3 ? "tags_json" : "NULL"
+        let statement = try prepare("SELECT file_device,file_inode,file_size,state,\(column) FROM recordings WHERE id=?", [.text(row.id)])
+        defer { sqlite3_finalize(statement) }
+        let code = sqlite3_step(statement)
+        guard code == SQLITE_ROW else {
+            if code != SQLITE_DONE { throw failure("read playback tags", code) }
+            throw ServiceError(.unavailable, "Recording disappeared before its tags were captured.")
+        }
+        guard row.state == .complete, string(statement, 3) == State.complete.rawValue,
+              row.device == sqlite3_column_int64(statement, 0), row.inode == sqlite3_column_int64(statement, 1),
+              row.size == sqlite3_column_int64(statement, 2) else {
+            throw ServiceError(.unavailable, "Recording tag revision changed; retry the range.")
+        }
+        if sqlite3_column_type(statement, 4) == SQLITE_NULL { return nil }
+        guard sqlite3_column_bytes(statement, 4) <= VideoTagTimeline.maximumBytes else { throw ServiceError("Oversized playback tags.") }
+        let value = try JSONDecoder().decode(VideoTagTimeline.self, from: Data(string(statement, 4).utf8))
+        try value.validate(); return value
+    }
+    /// Commit the intent before any rename. Recovery handles crashes on either
+    /// side of rename without ever adopting a replaced or unrelated file.
+    func commitTagEdits(_ pending: [LocalTagFile.Pending], revisions: [String: String]) throws {
+        try transaction {
+            for edit in pending {
+                guard let row = try historicalRecordings(id: edit.shardID).first, row.state == .complete,
+                      row.filename == edit.filename,
+                      row.device == edit.oldFile.device, row.inode == edit.oldFile.inode, row.size == edit.oldFile.size,
+                      try HistoricalTags.revision(historicalTags(id: edit.shardID)) == revisions[edit.shardID] else {
+                    throw ServiceError("Recording or tags changed before commit; retry with a fresh revision.")
+                }
+                try execute("INSERT INTO tag_edits VALUES (?,?)", [.text(edit.shardID), .text(String(decoding: try JSONEncoder().encode(edit), as: UTF8.self))])
+            }
+        }
+        try recoverTagEdits()
+    }
+    func recoverTagEdits() throws {
+        guard !readOnly else { return }
+        try checkFiles()
+        let statement = try prepare("SELECT pending_json FROM tag_edits LIMIT 129")
+        var edits: [LocalTagFile.Pending] = []
+        do {
+            defer { sqlite3_finalize(statement) }
+            var code = sqlite3_step(statement)
+            while code == SQLITE_ROW {
+                edits.append(try JSONDecoder().decode(LocalTagFile.Pending.self, from: Data(string(statement, 0).utf8)))
+                code = sqlite3_step(statement)
+            }
+            guard code == SQLITE_DONE else { throw failure("read pending tags", code) }
+        }
+        guard edits.count <= 128 else { throw ServiceError("Too many pending local tag edits; files preserved.") }
+        for edit in edits {
+            try checkFiles()
+            try edit.tags.validate()
+            guard validLeaf(edit.filename), edit.stagedName.range(of: "^\\.hbnvr-tags-[A-Fa-f0-9-]{36}-[A-Fa-f0-9-]{36}-[A-Fa-f0-9-]{36}\\.tmp$", options: .regularExpression) != nil,
+                  UUID(uuidString: edit.shardID) != nil else { throw ServiceError("Invalid pending tag edit.") }
+            guard let row = try historicalRecordings(id: edit.shardID).first, row.state == .complete,
+                  row.filename == edit.filename,
+                  (row.device == edit.oldFile.device && row.inode == edit.oldFile.inode && row.size == edit.oldFile.size)
+                    || (row.device == edit.newFile.device && row.inode == edit.newFile.inode && row.size == edit.newFile.size) else {
+                throw ServiceError("Pending tag edit manifest identity changed; files preserved.")
+            }
+            try LocalRecordingLayout.verify(path: directory.path, fd: directory.fd, owner: owner)
+            var current = stat(), staged = stat()
+            guard fstatat(directory.fd, edit.filename, &current, AT_SYMLINK_NOFOLLOW) == 0 else { throw ServiceError("Pending tag edit recording is missing; files preserved.") }
+            if !LocalTagFile.matches(current, edit.newFile) {
+                guard LocalTagFile.matches(current, edit.oldFile),
+                      fstatat(directory.fd, edit.stagedName, &staged, AT_SYMLINK_NOFOLLOW) == 0,
+                      LocalTagFile.matches(staged, edit.newFile) else { throw ServiceError("Pending tag edit file identity changed; files preserved.") }
+                guard renameat(directory.fd, edit.stagedName, directory.fd, edit.filename) == 0 else { throw ServiceError.posix("Publish edited recording") }
+            }
+            guard fsync(directory.fd) == 0 else { throw ServiceError.posix("Persist edited recording") }
+            try transaction {
+                try execute("UPDATE recordings SET file_device=?,file_inode=?,file_size=?,tags_json=? WHERE id=? AND state='complete' AND filename=?",
+                    [.integer(edit.newFile.device), .integer(edit.newFile.inode), .integer(edit.newFile.size),
+                     .text(String(decoding: try JSONEncoder().encode(edit.tags), as: UTF8.self)), .text(edit.shardID), .text(edit.filename)])
+                guard sqlite3_changes(database) == 1 else { throw ServiceError("Pending tag edit lost its manifest row; file preserved.") }
+                try execute("DELETE FROM tag_edits WHERE shard_id=?", [.text(edit.shardID)])
+            }
+        }
+    }
     func playbackRecordings(from start: Double, to end: Double, timeline: MediaTimeline) throws -> [Recording] {
         try readRecordings(from: start, to: end, timeline: timeline, limit: MediaLimits.candidates)
     }

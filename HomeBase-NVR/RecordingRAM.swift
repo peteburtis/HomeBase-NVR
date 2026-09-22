@@ -54,15 +54,21 @@ final class RecordingRAMCache: @unchecked Sendable {
         pressured = warning
         if warning { for tail in tails.values { drop(tail, count: tail.frames.count) } }
     }
-    fileprivate func append(_ tail: RecordingRAMTail, block: CMBlockBuffer, pts: Int64, duration: Int64, key: Bool) {
+    fileprivate func append(_ tail: RecordingRAMTail, block: CMBlockBuffer, pts: Int64, duration: Int64, key: Bool,
+                            tags: VideoTagTimeline?) {
         lock.lock(); defer { lock.unlock() }
-        guard !tail.closed, !pressured, key || !tail.frames.isEmpty else { return }
+        guard !tail.closed else { return }
+        // Publish metadata/frontier even when video RAM is pressured or retired.
+        // Swift COW shares the writer's bounded timeline; no second video copy.
+        let frame = tail.acceptedFrames
+        tail.acceptedFrames += 1; tail.endTicks = pts + duration; tail.tags = tags
+        guard !pressured, key || !tail.frames.isEmpty else { return }
         let size = CMBlockBufferGetDataLength(block)
         guard size > 0, size <= limits.tailBytes, size <= limits.totalBytes else {
             drop(tail, count: tail.frames.count); return
         }
         ordinal &+= 1
-        tail.frames.append(RecordingRAMTail.Sample(block: block, pts: pts, duration: duration, key: key, bytes: size, ordinal: ordinal))
+        tail.frames.append(RecordingRAMTail.Sample(block: block, pts: pts, duration: duration, key: key, bytes: size, ordinal: ordinal, frame: frame))
         tail.bytes += size; bytes += size
         while let first = tail.frames.first,
               tail.bytes > limits.tailBytes || tail.frames.count > limits.tailFrames
@@ -92,13 +98,20 @@ final class RecordingRAMCache: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard let tail = tails[row.id], tail.timing == row.timing, !tail.closed,
               !tail.frames.isEmpty else { return nil }
-        return RecordingRAMTail.Snapshot(timing: tail.timing, codec: tail.codec, sets: tail.sets,
+        return RecordingRAMTail.Snapshot(timing: tail.timing, codec: tail.codec, sets: tail.sets, tags: tail.tags,
             frames: tail.frames.enumerated().map { index, sample in
                 // The next PTS settles the preceding sample duration, just as the
                 // MP4 sample table does. Only the newest duration is provisional.
                 let duration = index + 1 < tail.frames.count ? tail.frames[index + 1].pts - sample.pts : sample.duration
-                return .init(sample: sample, pts: sample.pts, duration: duration, key: sample.key, bytes: sample.bytes)
+                return .init(sample: sample, pts: sample.pts, duration: duration, key: sample.key, bytes: sample.bytes, frame: sample.frame)
             })
+    }
+    /// Active disk readers need the writer's current timeline, not SQLite's
+    /// periodic checkpoint. Capture BEFORE inspecting the readable disk prefix.
+    func tagSnapshot(row: LocalRecordingManifest.Recording) -> RecordingRAMTail.Tags? {
+        lock.lock(); defer { lock.unlock() }
+        guard let tail = tails[row.id], tail.timing == row.timing, !tail.closed, tail.acceptedFrames > 0 else { return nil }
+        return .init(timeline: tail.tags, endTicks: tail.endTicks, frames: tail.acceptedFrames)
     }
     func advanceDisk(shard: String, through ticks: Int64) {
         lock.lock(); defer { lock.unlock() }
@@ -121,8 +134,9 @@ final class RecordingRAMTail: @unchecked Sendable {
         let key: Bool
         let bytes: Int
         let ordinal: UInt64
-        init(block: CMBlockBuffer, pts: Int64, duration: Int64, key: Bool, bytes: Int, ordinal: UInt64) {
-            self.block = block; self.pts = pts; self.duration = duration; self.key = key; self.bytes = bytes; self.ordinal = ordinal
+        let frame: Int64
+        init(block: CMBlockBuffer, pts: Int64, duration: Int64, key: Bool, bytes: Int, ordinal: UInt64, frame: Int64) {
+            self.block = block; self.pts = pts; self.duration = duration; self.key = key; self.bytes = bytes; self.ordinal = ordinal; self.frame = frame
         }
     }
     struct Frame {
@@ -130,14 +144,21 @@ final class RecordingRAMTail: @unchecked Sendable {
         let pts: Int64, duration: Int64
         let key: Bool
         let bytes: Int
+        let frame: Int64
     }
     struct Snapshot {
         let timing: ShardTimingMetadata
         let codec: String
         let sets: [Data]
+        let tags: VideoTagTimeline?
         let frames: [Frame]
         var startTicks: Int64 { frames[0].pts }
         var endTicks: Int64 { frames.last!.pts + frames.last!.duration }
+    }
+    struct Tags {
+        let timeline: VideoTagTimeline?
+        let endTicks: Int64
+        let frames: Int64
     }
     fileprivate let cache: RecordingRAMCache
     fileprivate let timing: ShardTimingMetadata
@@ -146,6 +167,9 @@ final class RecordingRAMTail: @unchecked Sendable {
     fileprivate var frames: [Sample] = []
     fileprivate var bytes = 0
     fileprivate var closed = false
+    fileprivate var acceptedFrames: Int64 = 0
+    fileprivate var endTicks: Int64 = 0
+    fileprivate var tags: VideoTagTimeline?
     private weak var file: GrowingMediaFile?
     private var lastPrefix: Int64 = 0
     fileprivate init(cache: RecordingRAMCache, timing: ShardTimingMetadata, codec: String, sets: [Data]) {
@@ -154,8 +178,8 @@ final class RecordingRAMTail: @unchecked Sendable {
     // The writer closes its registration explicitly after manifest publication
     // (also on destruction/failure). Reader snapshots never retain this owner.
     func close() { cache.close(self) }
-    func append(block: CMBlockBuffer, pts: Int64, duration: Int64, key: Bool) {
-        cache.append(self, block: block, pts: pts, duration: duration, key: key)
+    func append(block: CMBlockBuffer, pts: Int64, duration: Int64, key: Bool, tags: VideoTagTimeline? = nil) {
+        cache.append(self, block: block, pts: pts, duration: duration, key: key, tags: tags)
     }
     func attach(_ file: GrowingMediaFile) { cache.lock.lock(); self.file = file; cache.lock.unlock() }
     fileprivate func inspectDisk() {

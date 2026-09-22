@@ -70,9 +70,12 @@ final class S3ThumbnailTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: root) }
         var c = try helper.config(); c.s3?.clientEncryption = .init(password: "thumbnail-test-password")
         let camera = UUID().uuidString, media = try fixture(c, camera: camera).first!
-        let info = S3ThumbnailInfo(storeID: c.id, cameraID: camera, slot: slot, timestamp: media.time!.canonicalUTC)
+        let info = S3ThumbnailInfo(storeID: c.id, cameraID: camera, slot: slot, timestamp: media.time!.canonicalUTC,
+            tags: ["private-note": "keep-inside-ciphertext", "long": String(repeating: "é", count: 1024), "other": String(repeating: "x", count: 2048)])
         let sample = try S3Thumbnail.sample(media, sets: media.parameterSets)
         let (object, bytes) = try S3Thumbnail.render(sample, info: info, store: c)
+        XCTAssertNil(object.thumbnail?.tags)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(object), as: UTF8.self).contains("keep-inside-ciphertext"))
         XCTAssertEqual(object.schemaVersion, 2); XCTAssertNil(object.timing); XCTAssertEqual(object.contentType, "application/octet-stream")
         XCTAssertTrue(bytes.starts(with: RecordingEncryption.magic))
         let jpeg = try RecordingEncryption.decrypt(bytes, password: "thumbnail-test-password")

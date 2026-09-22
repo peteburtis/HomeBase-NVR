@@ -74,6 +74,7 @@ struct S3SpoolFileIdentity: Sendable {
 /// A frozen upload object. Video-specific timing is optional; all object kinds
 /// share the same queues, checksums, retries, and durable spool.
 struct S3ObjectMetadata: Codable, Equatable, Sendable {
+    static let maximumMetadataBytes = 1024 * 1024
     var schemaVersion = 1
     let id: String
     let storeID: String
@@ -92,11 +93,15 @@ struct S3ObjectMetadata: Codable, Equatable, Sendable {
     var timing: ShardTimingMetadata? = nil
     var endTicks: Int64? = nil
     var thumbnail: S3ThumbnailInfo? = nil
+    var tagMetadata: StoredVideoTags? = nil
     var payloadFileName: String { (thumbnail == nil ? "video.mp4" : "thumbnail.jpg") + (encryption == nil ? "" : ".hbnvr") }
     var contentType: String { encryption != nil ? "application/octet-stream" : (thumbnail != nil ? "image/jpeg" : (key.hasSuffix(".mp4") ? "video/mp4" : (key.hasSuffix(".json") ? "application/json" : "text/plain"))) }
     func validateKind() throws {
+        try tagMetadata?.validate()
+        guard encryption == nil || tagMetadata?.timeline == nil else { throw ServiceError("Encrypted recording tags must not be plaintext in spool metadata.") }
         if let thumbnail {
             try thumbnail.validate()
+            guard thumbnail.tags == nil, tagMetadata == nil else { throw ServiceError("Thumbnail tags belong inside the JPEG, not its spool descriptor.") }
             guard schemaVersion == 2, timing == nil, endTicks == nil, thumbnail.storeID == storeID, thumbnail.cameraID == cameraID,
                   capturedAt.timeIntervalSince1970 == thumbnail.slot, size > 0,
                   encryption == nil || encryption == RecordingEncryption.format,
@@ -360,11 +365,12 @@ final class S3Spool {
         try validateLocation()
         bytes = try Self.directoryContents(path).reduce(0) { try $0 + usage(path + "/" + $1) }
     }
-    func hasCapacity(for size: Int64 = 1) -> Bool {
+    func hasCapacity(for size: Int64 = 1, metadataBytes: Int64 = 65536) -> Bool {
         guard size >= 0, (try? validateLocation()) != nil, let free = try? freeSpace(path) else { return false }
-        guard settings.spoolLimitBytes >= bytes, settings.spoolLimitBytes - bytes >= 65536,
-              free >= settings.minimumFreeBytes, free - settings.minimumFreeBytes >= 65536 else { return false }
-        return size <= settings.spoolLimitBytes - bytes - 65536 && size <= free - settings.minimumFreeBytes - 65536
+        let overhead = max(65536, metadataBytes)
+        guard settings.spoolLimitBytes >= bytes, settings.spoolLimitBytes - bytes >= overhead,
+              free >= settings.minimumFreeBytes, free - settings.minimumFreeBytes >= overhead else { return false }
+        return size <= settings.spoolLimitBytes - bytes - overhead && size <= free - settings.minimumFreeBytes - overhead
     }
     func noteReadFailure(_ id: String, _ message: String) { readErrors[id] = message }
     func scan(retryOnly: Bool = false, excluding: Set<String> = []) throws {
@@ -390,9 +396,9 @@ final class S3Spool {
                 try access.validateDirectory(directory)
                 let manifestFD = try Self.openFile(directory + "/metadata.json", access: access); defer { close(manifestFD) }
                 var manifestInfo = stat()
-                guard fstat(manifestFD, &manifestInfo) == 0, manifestInfo.st_size <= 65536 else { throw ServiceError("Invalid spool metadata size.") }
-                let manifest = try FileHandle(fileDescriptor: manifestFD, closeOnDealloc: false).read(upToCount: 65537) ?? Data()
-                guard manifest.count <= 65536 else { throw ServiceError("Oversized spool metadata.") }
+                guard fstat(manifestFD, &manifestInfo) == 0, manifestInfo.st_size <= S3ObjectMetadata.maximumMetadataBytes else { throw ServiceError("Invalid spool metadata size.") }
+                let manifest = try FileHandle(fileDescriptor: manifestFD, closeOnDealloc: false).read(upToCount: S3ObjectMetadata.maximumMetadataBytes + 1) ?? Data()
+                guard manifest.count <= S3ObjectMetadata.maximumMetadataBytes else { throw ServiceError("Oversized spool metadata.") }
                 let metadata = try JSONDecoder().decode(S3ObjectMetadata.self, from: manifest)
                 try S3Configuration(bucket: metadata.bucket, region: metadata.region, prefix: metadata.prefix, expectedOwner: metadata.expectedOwner).validate()
                 try metadata.validateKind()
@@ -470,12 +476,15 @@ final class S3Spool {
             readErrors[metadata.id + ".staging"] = nil; try syncDirectory(path)
         }
         try refreshUsage()
-        guard hasCapacity(for: metadata.size) else { throw ServiceError("S3 spool quota or free-space reserve exhausted; new recording to this store is suspended.") }
+        let descriptor = try JSONEncoder().encode(metadata)
+        guard descriptor.count <= S3ObjectMetadata.maximumMetadataBytes else { throw ServiceError("Oversized spool metadata; RAM retained.") }
+        let overhead = max(65536, Int64(descriptor.count) + 4096)
+        guard hasCapacity(for: metadata.size, metadataBytes: overhead) else { throw ServiceError("S3 spool quota or free-space reserve exhausted; new recording to this store is suspended.") }
         // Reserve the volume headroom across concurrent stores in this process.
         // Unrelated processes can still consume free space; write failures remain
         // explicit and retain the RAM owner.
-        let volume = try Self.reserve(path: path, bytes: metadata.size + 65536, free: freeSpace, minimum: settings.minimumFreeBytes)
-        defer { Self.release(volume: volume, bytes: metadata.size + 65536) }
+        let volume = try Self.reserve(path: path, bytes: metadata.size + overhead, free: freeSpace, minimum: settings.minimumFreeBytes)
+        defer { Self.release(volume: volume, bytes: metadata.size + overhead) }
         try checkpoint("before-stage")
         // Anchor mutations to the opened directory, even if a mount/path changes
         // between its validation and the syscall. Never follow a fallback path.
@@ -491,7 +500,7 @@ final class S3Spool {
         try checkpoint("reserved")
         try write(data, to: stage + "/" + metadata.payloadFileName)
         try checkpoint("payload")
-        try write(JSONEncoder().encode(metadata), to: stage + "/metadata.json")
+        try write(descriptor, to: stage + "/metadata.json")
         try checkpoint("metadata")
         try syncDirectory(stage)
         try checkpoint("staged")
