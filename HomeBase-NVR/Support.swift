@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 import MachO
 
-enum BuildInfo { static let version = "0.22.0" }
+enum BuildInfo { static let version = "0.22.2" }
 
 enum FailureCode: Int32, Codable {
     case failure = 1, unavailable = 3, permission = 4, incompatible = 5, timeout = 6, invalidMessage = 7
@@ -42,6 +42,17 @@ enum Processes {
 }
 
 enum SecureFiles {
+    /// Read by pinned descriptor. Darwin reports ENOENT for an absent ACL
+    /// property even on an existing file; do not confuse it with denied access.
+    /// The caller owns the returned ACL and must acl_free it.
+    static func readACL(_ fd: Int32) throws -> acl_t {
+        if let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) { return acl }
+        guard errno == ENOENT else { throw ServiceError.posix("Read filesystem ACL") }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_nlink > 0 else { throw ServiceError("Cannot read ACL of a missing filesystem object.") }
+        guard let acl = acl_init(0) else { throw ServiceError.posix("Allocate empty filesystem ACL") }
+        return acl
+    }
     static func validateSystemAncestors(of path: String) throws {
         var parent = URL(fileURLWithPath: path).deletingLastPathComponent()
         while true {

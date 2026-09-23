@@ -494,10 +494,16 @@ class Integration(unittest.TestCase):
         self.assertEqual(store["RetentionPeriod"], "1M")
         self.assertTrue(store["Enabled"])
         store_id = store["ID"]
+        # Local agent is both requester and daemon: private POSIX ownership is
+        # sufficient after removing setup ACLs, including across edit/restart.
+        subprocess.run(["/bin/chmod", "-N", str(output)], check=True)
         self.assertNotEqual(self.cli("store", "spool", store_id, "--on", "--runtime-dir", directory).returncode, 0)
-        for action in ["disable", "disable", "enable", "enable"]:
-            result = self.cli("store", action, store_id, "--runtime-dir", directory)
-            self.assertEqual(result.returncode, 0, result.stderr)
+        for acl in [None, "group:everyone allow readattr,readsecurity"]:
+            if acl:
+                subprocess.run(["/bin/chmod", "+a", acl, str(output)], check=True)
+            for action in ["disable", "disable", "enable", "enable"]:
+                result = self.cli("store", action, store_id, "--runtime-dir", directory)
+                self.assertEqual(result.returncode, 0, result.stderr)
         changed = self.cli("store", "change", store_id, "--runtime-dir", directory, input="Renamed\n\n2s\n1w\nno\nyes\n")
         self.assertEqual(changed.returncode, 0, changed.stderr)
         process.terminate(); process.wait(timeout=4)

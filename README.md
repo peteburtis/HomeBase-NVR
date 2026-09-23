@@ -1,6 +1,14 @@
 # HomeBase-NVR / hbnvr
 
-Version **0.22.0** adds opt-in historical IPC tag maps, once per returned segment.
+Version **0.22.2** permits metadata-only ACL entries such as
+`everyone allow readattr,readsecurity`, without allowing unrelated accounts to
+list directories, traverse them, read recordings, or read extended attributes.
+
+Version 0.22.1 permits daemon-only recording directories: installing-user
+filesystem access is optional, and new directories/tag rewrites do not restore
+removed user permissions. S3 spool/private-data checks already use daemon access.
+
+Version 0.22.0 adds opt-in historical IPC tag maps, once per returned segment.
 Maps cover exact returned frame ranges (including preroll), resolve retroactive
 edits, and treat missing/unknown values as absent. RAM and growing-file requests
 snapshot the writer's tags without waiting for SQLite checkpoints or copying video.
@@ -553,10 +561,27 @@ access; root retains administrative access. The directory remains owned by its
 creator; daemon-created subdirectories/files belong to the daemon. This is
 filesystem access protection, not video encryption.
 
+These are setup defaults, not a requirement to retain requester access. The
+requester's ACL may be removed or reduced, and requester-owned directories may
+have their owner mode bits removed while retaining the daemon ACL. Daemon-owned
+directories with mode 0700 need no ACL at all. Validation requires daemon access
+and private ownership (requester or daemon, no group/other mode bits or unrelated
+data-access ACL grants), never a minimum level of requester access. Other principals
+may have metadata-only allow ACLs limited to `readattr` and `readsecurity`, including
+the `everyone` entry Finder can leave behind. These do not count toward daemon
+access and do not permit reading extended attributes. New camera directories
+inherit the current parent ACL policy without adding requester permissions;
+tag rewrites preserve the original file's ACL. Removing access from an existing
+tree is the administrator's responsibility: changing a parent ACL does not
+retroactively strip existing descendant ACLs. IPC authorization is unchanged;
+an authorized controller can still request footage through the daemon.
+
 Setup does not broaden ancestor permissions or silently adopt an existing directory
 with unrelated permissions. Existing destinations must already match the private
-ownership/ACL policy; otherwise choose a new directory. The parent must exist and
-be accessible to both accounts. `~/NVR` avoids Documents/Desktop privacy controls,
+ownership/ACL policy; otherwise choose a new directory. The parent must exist;
+the requesting account needs access only when creating a new destination. A
+pre-created daemon-only destination can be added or edited without CLI filesystem
+access; the daemon validates it before saving. `~/NVR` avoids Documents/Desktop privacy controls,
 but customized home permissions and macOS privacy rules can still deny daemon
 access. Such failures are reported, not bypassed. No sudo is needed for store setup;
 running add as root is rejected. A failed save may leave the new private directory

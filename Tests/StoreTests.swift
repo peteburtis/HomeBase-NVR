@@ -167,7 +167,9 @@ final class StoreTests: XCTestCase {
         try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid())
         try StoreDirectory.create(path, owner: geteuid(), daemon: geteuid())
         XCTAssertEqual(chmod(path, 0o755), 0)
-        XCTAssertThrowsError(try StoreDirectory.create(path, owner: geteuid(), daemon: geteuid()))
+        // CLI leaves existing destinations alone; only the daemon validates access.
+        try StoreDirectory.create(path, owner: geteuid(), daemon: geteuid())
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid()))
         XCTAssertEqual(try SecureFiles.info(path)!.st_mode & 0o777, 0o755)
         let link = parent + "/link"
         try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: path)
@@ -181,6 +183,158 @@ final class StoreTests: XCTestCase {
         let fd = try StoreDirectory.openDirectory(path); defer { close(fd) }
         try StoreDirectory.validate(fd, owner: geteuid(), daemon: daemon)
         XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid()))
+    }
+    private func otherIdentity() throws -> uid_t {
+        try XCTUnwrap(getpwnam("nobody")).pointee.pw_uid
+    }
+    private func setACL(_ fd: Int32, user: uid_t? = nil, mask: acl_permset_mask_t = 0,
+                        inherited: Bool = false, deny: Bool = false, inheritOnly: Bool = false,
+                        principal: UUID? = nil, append: Bool = false) throws {
+        var acl: acl_t?
+        if append { acl = try SecureFiles.readACL(fd) } else { acl = acl_init(1) }
+        guard acl != nil else { throw ServiceError.posix("Allocate test ACL") }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        if let id = try principal ?? user.map({ try StoreDirectory.identity($0) }) {
+            var entry: acl_entry_t?, uuid = id.uuid
+            XCTAssertEqual(acl_create_entry(&acl, &entry), 0)
+            let value = try XCTUnwrap(entry)
+            XCTAssertEqual(acl_set_tag_type(value, deny ? ACL_EXTENDED_DENY : ACL_EXTENDED_ALLOW), 0)
+            XCTAssertEqual(acl_set_qualifier(value, &uuid), 0)
+            XCTAssertEqual(acl_set_permset_mask_np(value, mask), 0)
+            var flags: acl_flagset_t?
+            XCTAssertEqual(acl_get_flagset_np(UnsafeMutableRawPointer(value), &flags), 0)
+            if inherited {
+                XCTAssertEqual(acl_add_flag_np(flags, ACL_ENTRY_FILE_INHERIT), 0)
+                XCTAssertEqual(acl_add_flag_np(flags, ACL_ENTRY_DIRECTORY_INHERIT), 0)
+            }
+            if inheritOnly { XCTAssertEqual(acl_add_flag_np(flags, ACL_ENTRY_ONLY_INHERIT), 0) }
+        }
+        XCTAssertEqual(acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED), 0)
+    }
+    private func aclMasks(_ fd: Int32) throws -> [acl_permset_mask_t] {
+        let acl = try SecureFiles.readACL(fd)
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var result: [acl_permset_mask_t] = [], entry: acl_entry_t?
+        var next = acl_get_entry(acl, ACL_FIRST_ENTRY.rawValue, &entry)
+        while next == 0, let current = entry {
+            var mask: acl_permset_mask_t = 0
+            XCTAssertEqual(acl_get_permset_mask_np(current, &mask), 0); result.append(mask)
+            next = acl_get_entry(acl, ACL_NEXT_ENTRY.rawValue, &entry)
+        }
+        return result
+    }
+    func testDaemonOnlyDirectoriesAndChildrenNeverRestoreRequesterAccess() throws {
+        let path = try temporary(), admin = try otherIdentity()
+        let fd = try StoreDirectory.openDirectory(path); defer { close(fd) }
+        try setACL(fd)
+        try StoreDirectory.validate(fd, owner: admin, daemon: geteuid())
+        let child = try StoreDirectory.child("nested", parent: fd, owner: admin, daemon: geteuid()); defer { close(child) }
+        XCTAssertTrue(try aclMasks(child).isEmpty)
+        let camera = try LocalRecordingLayout.cameraDirectory(root: path, fd: fd, store: UUID().uuidString,
+            camera: UUID().uuidString, name: "Private camera", owner: admin)
+        XCTAssertTrue(try aclMasks(camera.fd).isEmpty)
+        try LocalRecordingLayout.verify(path: camera.path, fd: camera.fd, owner: admin)
+    }
+    func testReducedRequesterAccessIsOptionalAndNotBroadenedOnNewChildren() throws {
+        let path = try temporary(), admin = try otherIdentity(), read: acl_permset_mask_t = 1 << 1
+        let fd = try StoreDirectory.openDirectory(path); defer { close(fd) }
+        try setACL(fd, user: admin, mask: read, inherited: true)
+        try StoreDirectory.validate(fd, owner: admin, daemon: geteuid())
+        let child = try StoreDirectory.child("nested", parent: fd, owner: admin, daemon: geteuid()); defer { close(child) }
+        XCTAssertEqual(try aclMasks(child), [read])
+        let camera = try LocalRecordingLayout.cameraDirectory(root: path, fd: fd, store: UUID().uuidString,
+            camera: UUID().uuidString, name: "Private camera", owner: admin)
+        XCTAssertEqual(try aclMasks(camera.fd), [read])
+        try setACL(fd, user: admin, mask: read, deny: true)
+        try StoreDirectory.validate(fd, owner: admin, daemon: geteuid())
+    }
+    func testRequesterOwnedDirectoryMayRemoveAllRequesterPermissions() throws {
+        let path = try temporary(), daemon = try otherIdentity()
+        let fd = try StoreDirectory.openDirectory(path); defer { _ = fchmod(fd, 0o700); close(fd) }
+        // A pinned descriptor lets us test the cross-account policy without sudo.
+        let full: acl_permset_mask_t = 0xFEE // Recording data/traversal/attributes/security rights.
+        try setACL(fd, user: daemon, mask: full)
+        XCTAssertEqual(fchmod(fd, 0), 0)
+        try StoreDirectory.validate(fd, owner: geteuid(), daemon: daemon)
+        // Setup does not reopen an existing destination as the CLI user.
+        try StoreDirectory.create(path, owner: geteuid(), daemon: daemon)
+        XCTAssertEqual(try XCTUnwrap(SecureFiles.info(path)).st_mode & 0o777, 0)
+        try setACL(fd, user: daemon, mask: 1 << 1)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: daemon))
+        try setACL(fd, user: daemon, mask: full, inherited: true, inheritOnly: true)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: daemon))
+        try setACL(fd)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: daemon))
+    }
+    func testDaemonPermissionsAndPrivateOwnershipAreStillRequired() throws {
+        XCTAssertThrowsError(try SecureFiles.readACL(-1))
+        let path = try temporary(), admin = try otherIdentity()
+        let fd = try StoreDirectory.openDirectory(path); defer { _ = fchmod(fd, 0o700); close(fd) }
+        try setACL(fd)
+        XCTAssertEqual(fchmod(fd, 0o500), 0)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: admin, daemon: geteuid()))
+        XCTAssertEqual(fchmod(fd, 0o700), 0)
+        try setACL(fd, user: geteuid(), mask: 1 << 2, deny: true)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: admin, daemon: geteuid()))
+        try setACL(fd, user: admin, mask: 1 << 1)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid()))
+        try setACL(fd)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: admin, daemon: admin))
+    }
+    func testFinderEveryoneMetadataACLWorksWithDaemonOnlyAccessAndInheritance() throws {
+        let path = try temporary(), admin = try otherIdentity()
+        let fd = try StoreDirectory.openDirectory(path); defer { _ = fchmod(fd, 0o700); close(fd) }
+        // Exact everyone principal observed in Finder's metadata-only ACL.
+        let everyone = try XCTUnwrap(UUID(uuidString: "ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C"))
+        let metadata: acl_permset_mask_t = (1 << 7) | (1 << 11)
+        try StoreDirectory.restrict(fd, owner: geteuid(), daemon: geteuid(), directory: true)
+        try setACL(fd, mask: metadata, inherited: true, principal: everyone, append: true)
+        XCTAssertEqual(fchmod(fd, 0), 0) // Service-owned, mode 0000, using its ACL.
+        try StoreDirectory.validate(fd, owner: admin, daemon: geteuid())
+        XCTAssertEqual(try aclMasks(fd), [0xFEE, metadata]) // Validation doesn't remove the rule.
+        let child = try StoreDirectory.child("nested", parent: fd, owner: admin, daemon: geteuid()); defer { close(child) }
+        try StoreDirectory.validate(child, owner: admin, daemon: geteuid())
+        XCTAssertEqual(try aclMasks(child), [0xFEE, metadata])
+        let camera = try LocalRecordingLayout.cameraDirectory(root: path, fd: fd, store: UUID().uuidString,
+            camera: UUID().uuidString, name: "Camera", owner: admin)
+        try LocalRecordingLayout.verify(path: camera.path, fd: camera.fd, owner: admin)
+        XCTAssertEqual(try aclMasks(camera.fd), [0xFEE, metadata])
+    }
+    func testMetadataOnlyRulesCannotGrantDataAccessOrReplaceDaemonPermissions() throws {
+        let path = try temporary(), admin = try otherIdentity()
+        let fd = try StoreDirectory.openDirectory(path); defer { _ = fchmod(fd, 0o700); close(fd) }
+        let everyone = try XCTUnwrap(UUID(uuidString: "ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C"))
+        let metadata: acl_permset_mask_t = (1 << 7) | (1 << 11)
+        for principal in [everyone, try StoreDirectory.identity(admin)] {
+            for mask in [acl_permset_mask_t(1 << 7), acl_permset_mask_t(1 << 11), metadata] {
+                try setACL(fd, mask: mask, principal: principal)
+                try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid())
+            }
+            // Every defined non-metadata right must still be rejected, even
+            // when mixed with the allowed rights or applying only to children.
+            for bit in [1, 2, 3, 4, 5, 6, 8, 9, 10, 12, 13, 20] {
+                for inheritOnly in [false, true] {
+                    try setACL(fd, mask: metadata | (UInt64(1) << bit), inherited: inheritOnly,
+                               inheritOnly: inheritOnly, principal: principal)
+                    XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid()), "bit \(bit)")
+                }
+            }
+        }
+        try setACL(fd, mask: metadata, deny: true, principal: everyone)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid()))
+        try setACL(fd, mask: metadata, principal: everyone)
+        XCTAssertEqual(fchmod(fd, 0o500), 0)
+        XCTAssertThrowsError(try StoreDirectory.validate(fd, owner: geteuid(), daemon: geteuid()))
+    }
+    func testCLIPathHandlingDoesNotRequireAccessToExistingDestination() throws {
+        let parent = try temporary(), path = parent + "/hidden", admin = geteuid()
+        try StoreDirectory.create(path, owner: admin, daemon: admin)
+        let fd = try StoreDirectory.openDirectory(parent); defer { _ = fchmod(fd, 0o700); close(fd) }
+        try setACL(fd)
+        XCTAssertEqual(fchmod(fd, 0), 0)
+        XCTAssertEqual(try StoreDirectory.expanded(path), path)
+        XCTAssertEqual(try StoreDirectory.expanded(path, existingPath: path), path)
+        try StoreDirectory.create(path, owner: admin, daemon: admin)
     }
     func testRepositoryOverlapAndRoundTrip() throws {
         let root = try temporary()
@@ -232,6 +386,9 @@ final class StoreTests: XCTestCase {
     }
     func testHEVCFramesProducePlayableRotatedMP4() async throws {
         try await verifyPlayableShards(codec: kCMVideoCodecType_HEVC)
+    }
+    func testDaemonOnlyStoreRecordsRotatesIndexesAndServesPlayback() async throws {
+        try await verifyPlayableShards(codec: kCMVideoCodecType_H264, daemonOnly: true)
     }
     func testInBandParametersAreNotRevertedByStaleSDP() async throws {
         try await verifyPlayableShards(codec: kCMVideoCodecType_H264, staleSDP: true)
@@ -700,9 +857,15 @@ final class StoreTests: XCTestCase {
         try manager.remove(configuration.id)
         XCTAssertTrue(manager.snapshot().isEmpty)
     }
-    private func verifyPlayableShards(codec: CMVideoCodecType, staleSDP: Bool = false) async throws {
+    private func verifyPlayableShards(codec: CMVideoCodecType, staleSDP: Bool = false, daemonOnly: Bool = false) async throws {
         let root = try temporary()
         var configuration = try config(root + "/output"); configuration.shardDuration = "1s"
+        if daemonOnly {
+            configuration.ownerUID = try otherIdentity()
+            configuration.ownerUUID = try StoreDirectory.identity(configuration.ownerUID)
+            let fd = try StoreDirectory.openDirectory(configuration.directory); defer { close(fd) }
+            try setACL(fd)
+        }
         let store = try LocalRecordingStore(configuration: configuration)
         let camera = UUID().uuidString
         let frames = try Self.video(codec: codec)
@@ -732,11 +895,20 @@ final class StoreTests: XCTestCase {
         XCTAssertEqual(files.count, 3)
         let manifestDirectory = LocalRecordingLayout.Directory(path: directory, fd: try StoreDirectory.openDirectory(directory))
         let manifest = try LocalRecordingManifest(directory: manifestDirectory,
-            identity: .init(storeID: configuration.id, cameraID: camera), owner: geteuid(), readOnly: true)
+            identity: .init(storeID: configuration.id, cameraID: camera), owner: configuration.ownerUID, readOnly: true)
         let indexed = try manifest.recordings()
         XCTAssertEqual(Set(indexed.map(\.filename)), Set(files))
         XCTAssertEqual(indexed.reduce(Int64(0)) { $0 + $1.frames }, 45)
         XCTAssertTrue(indexed.allSatisfy { $0.state == .complete && $0.endTicks == 90000 })
+        if daemonOnly {
+            XCTAssertTrue(try aclMasks(manifestDirectory.fd).isEmpty)
+            let scan = PlaybackDiscovery.scan(configuration, work: MediaWork())
+            XCTAssertEqual(scan.state, "available")
+            XCTAssertEqual(scan.cameras[camera]?.metadata?.name, "Test Camera")
+            let provider = LocalMediaProvider(configurations: { [configuration] })
+            XCTAssertEqual(try provider.catalog(camera: camera, range: .init(start: 0, end: Date().timeIntervalSince1970 + 60),
+                timeline: .canonical, work: MediaWork()).count, 3)
+        }
         var decoded = 0
         for file in files {
             XCTAssertTrue(LocalRecordingLayout.isShard(file), file)

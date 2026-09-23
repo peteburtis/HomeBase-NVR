@@ -26,7 +26,7 @@ enum StoreUI {
     static func edit(_ current: RecordingStoreConfiguration, isNew: Bool = false, advanced: Bool = false) throws -> RecordingStoreConfiguration {
         var draft = current
         draft.name = try CameraPrompt.line("Store name", default: current.name)
-        if draft.type == "Local" { draft.directory = try StoreDirectory.expanded(CameraPrompt.line("Local directory", default: current.directory)) }
+        if draft.type == "Local" { draft.directory = try StoreDirectory.expanded(CameraPrompt.line("Local directory", default: current.directory), existingPath: isNew ? nil : current.directory) }
         else if isNew {
             var s3 = draft.s3!
             s3.bucket = try CameraPrompt.line("Existing S3 bucket")

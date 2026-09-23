@@ -36,7 +36,13 @@ enum LocalTagFile {
         guard output >= 0 else { throw ServiceError.posix("Stage recording tag edit") }
         var ready = false
         defer { close(output); if !ready { _ = unlinkat(dir.fd, leaf, 0) } }
-        try StoreDirectory.restrict(output, owner: source.owner, daemon: geteuid(), directory: false)
+        // A replacement must preserve this file's access policy, not restore
+        // requester rights from initial setup or from the parent directory.
+        let acl = try SecureFiles.readACL(input)
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        guard fchmod(output, 0o600) == 0, acl_set_fd_np(output, acl, ACL_TYPE_EXTENDED) == 0 else {
+            throw ServiceError.posix("Preserve recording file permissions")
+        }
         func read(_ offset: Int64, _ length: Int) throws -> Data {
             var data = Data(count: length), done = 0
             while done < length {

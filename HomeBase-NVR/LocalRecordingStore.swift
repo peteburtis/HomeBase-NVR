@@ -53,7 +53,10 @@ enum LocalRecordingLayout {
                 let child = openat(fd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 guard child >= 0 else { throw ServiceError.posix("Open camera recording directory") }
                 let directory = Directory(path: root + "/" + leaf, fd: child)
-                try StoreDirectory.restrict(child, owner: owner, daemon: geteuid(), directory: true)
+                // Keep inherited access policy; never restore requester rights
+                // that were deliberately removed from the recording root.
+                guard fchmod(child, 0o700) == 0 else { throw ServiceError.posix("Set camera directory mode") }
+                try StoreDirectory.validate(child, owner: owner, daemon: geteuid())
                 let file = openat(child, markerName, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
                 guard file >= 0 else { throw ServiceError.posix("Create camera directory identity") }
                 defer { close(file) }
@@ -143,7 +146,7 @@ enum MP4WriterWait {
 }
 
 /// Best-effort bounded diagnostic history, independent of SQLite. Called only on
-/// the store worker. Files inherit the recording root's private controller ACLs.
+/// the store worker. Files inherit the recording root's current private ACL policy.
 enum LocalRecordingErrorLog {
     static let filename = ".hbnvr-errors.log"
     static let limit = 1_048_576

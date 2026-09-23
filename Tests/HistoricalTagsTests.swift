@@ -104,12 +104,24 @@ final class HistoricalTagsTests: XCTestCase {
         for codec in [kCMVideoCodecType_H264, kCMVideoCodecType_HEVC] {
             let f = try fixture(codec: codec), (dir, db) = try f.index(), row = try XCTUnwrap(db.recordings().first)
             let path = dir.path + "/" + row.filename, old = try Data(contentsOf: URL(fileURLWithPath: path))
+            // Remove the file's ACL while leaving the parent setup ACL intact.
+            // Replacing the MP4 must not restore that removed access.
+            let acl = try XCTUnwrap(acl_init(0))
+            XCTAssertEqual(acl_set_file(path, ACL_TYPE_EXTENDED, acl), 0)
+            acl_free(UnsafeMutableRawPointer(acl))
             let oldTags = try XCTUnwrap(db.historicalTags(id: row.id)), prefix = old.dropLast(try VideoTagMP4.box(oldTags).count)
             let selection = HistoricalTagRequest.Selection(file: path, startFrame: 3, endFrame: 9)
             let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [f.configs[0].id], edits: [.init(selection: selection, key: "recognized", value: "alice")])
             let (result, _) = try await f.engine().run(request) { _ in }
             XCTAssertEqual(result.state, "completed"); XCTAssertEqual(result.results.first?.publication, "local-complete")
             let new = try Data(contentsOf: URL(fileURLWithPath: path)), tags = try XCTUnwrap(VideoTagMP4.read(new))
+            let replacedFile = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            XCTAssertGreaterThanOrEqual(replacedFile, 0)
+            defer { close(replacedFile) }
+            let replacedACL = try SecureFiles.readACL(replacedFile)
+            var entry: acl_entry_t?
+            XCTAssertNotEqual(acl_get_entry(replacedACL, ACL_FIRST_ENTRY.rawValue, &entry), 0)
+            acl_free(UnsafeMutableRawPointer(replacedACL))
             XCTAssertEqual(new.dropLast(try VideoTagMP4.box(tags).count), prefix)
             XCTAssertEqual(tags.tags(at: 18000)?["recognized"], "alice")
             XCTAssertNil(tags.tags(at: 12000)?["recognized"])
