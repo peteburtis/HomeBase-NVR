@@ -36,6 +36,7 @@ struct LiveVideoFrameHeader: Codable {
     let keyFrame: Bool
     let parameterSets: [Data]
     let byteCount: Int
+    var cameraUTC: Double? = nil
     var tags: [String: String] = [:]
 }
 
@@ -175,7 +176,8 @@ private final class LiveVideoSubscriber: @unchecked Sendable {
                 try work.check()
                 guard let media else { continue }
                 let header = LiveVideoFrameHeader(timestamp: media.frame.timestamp, clockRate: media.clockRate,
-                    keyFrame: media.frame.keyFrame, parameterSets: media.parameterSets, byteCount: media.frame.payload.count, tags: media.tags)
+                    keyFrame: media.frame.keyFrame, parameterSets: media.parameterSets, byteCount: media.frame.payload.count,
+                    cameraUTC: media.cameraUTC.flatMap { $0.isFinite && abs($0) < 1e11 ? $0 : nil }, tags: media.tags)
                 try MediaWire.write(JSONEncoder().encode(header), type: MediaWire.json, fd: fd, work: work)
                 var offset = 0
                 while offset < media.frame.payload.count {

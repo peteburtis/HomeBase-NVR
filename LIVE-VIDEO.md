@@ -50,6 +50,15 @@ or stable frame references. Homebase extends/converts them to its existing
 90-kHz media clock. Parameter sets accompany every frame. Subscription begins
 at the next keyframe, not a retained GOP. Closing the socket unsubscribes.
 
+Frame headers may also contain optional `cameraUTC`, a finite Unix-seconds
+sampling time mapped from the camera's RTP/RTCP clock. This is the receiver's
+validated camera mapping, **not** recording `canonicalUTC` or `receivedUTC`.
+Missing/stale/unusable mappings omit the field. Older Homebase versions ignore
+this additive JSON property; recording, AVCC bytes, and RTP timestamps are
+unchanged. Updated Homebase can forward it to opted-in live viewers for bounded
+cross-camera alignment. This requires an updated NVR binary; installing or
+restarting the daemon remains a separate explicit action.
+
 `frameTagsVersion: 1` promises a complete `tags` dictionary on every frame,
 including `{}` when no keys apply. Older servers omit the capability/field:
 that is unknown metadata, not a trustworthy empty map. No tag deltas or separate

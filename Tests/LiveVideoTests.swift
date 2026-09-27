@@ -93,6 +93,24 @@ final class LiveVideoTests: XCTestCase {
         hub.accept(.media(camera: "b", name: "", media()))
         XCTAssertEqual(try JSONDecoder().decode(LiveVideoFrameHeader.self, from: readRecord(b[1], type: 1)).timestamp, 1234)
     }
+    func testLiveHeaderCarriesCameraTimeNotCanonicalTimeAndAllowsMissingClock() throws {
+        let hub = LiveVideoSessions(), fds = try sockets()
+        defer { hub.stop(); close(fds[1]) }
+        try hub.open(fds[0], camera: "a", profile: profile, deadline: ProcessInfo.processInfo.systemUptime + 2, authorize: { true })
+        _ = try SocketIO.read(fd: fds[1], deadline: ProcessInfo.processInfo.systemUptime + 2)
+        let base = media()
+        let sample = EncodedMedia(codec: base.codec, clockRate: base.clockRate, parameterSets: base.parameterSets,
+            frame: base.frame, cameraUTC: 1234.5,
+            time: RecordingTime(cameraUTC: 1234.5, receivedUTC: 9000, canonicalUTC: 9000, canonicalSource: .received, epochID: "test"))
+        hub.accept(.media(camera: "a", name: "", sample))
+        let header = try JSONDecoder().decode(LiveVideoFrameHeader.self, from: readRecord(fds[1], type: 1))
+        XCTAssertEqual(header.cameraUTC, 1234.5)
+        _ = try readRecord(fds[1], type: 2)
+        hub.accept(.media(camera: "a", name: "", base))
+        XCTAssertNil(try JSONDecoder().decode(LiveVideoFrameHeader.self, from: readRecord(fds[1], type: 1)).cameraUTC)
+        let legacy = Data(#"{"type":"frame","timestamp":1,"clockRate":90000,"keyFrame":true,"parameterSets":[],"byteCount":1,"tags":{}}"#.utf8)
+        XCTAssertNil(try JSONDecoder().decode(LiveVideoFrameHeader.self, from: legacy).cameraUTC)
+    }
     func testAdmissionDeniedOrStoppedDoesNotTakeOwnership() throws {
         let fds = try sockets(), hub = LiveVideoSessions()
         defer { close(fds[0]); close(fds[1]) }
