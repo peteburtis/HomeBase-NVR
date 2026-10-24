@@ -13,7 +13,7 @@ enum MediaResponse {
         if request.operation == "neighbors" {
             var message = MediaMessage(type: "neighbors", requestID: request.requestID)
             message.neighbors = try provider.neighbors(camera: request.cameraID, range: resolved.range,
-                timeline: request.timeline, work: work)
+                timeline: request.timeline, work: work, excludeTagKeys: request.excludeTagKeys)
             try emit(message)
             var end = MediaMessage(type: "end", requestID: request.requestID)
             end.outcome = "complete"; end.frames = 0

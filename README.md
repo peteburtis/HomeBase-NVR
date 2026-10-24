@@ -1,6 +1,10 @@
 # HomeBase-NVR / hbnvr
 
-Version **0.22.2** permits metadata-only ACL entries such as
+Version **0.23.0** includes the selected keyframe's opaque tags in local thumbnail
+responses across finalized recordings, growing files, and RAM, including historical
+edits and exact sample boundaries. HBNVR does not interpret tags or hide video.
+
+Version 0.22.2 permits metadata-only ACL entries such as
 `everyone allow readattr,readsecurity`, without allowing unrelated accounts to
 list directories, traverse them, read recordings, or read extended attributes.
 
@@ -278,6 +282,10 @@ parent directories; it does not silently change permissions on existing director
 New installations remain disabled. `start` enables boot startup and starts the service;
 `stop` disables boot startup and stops it. Upgrades restart an enabled service and
 preserve disabled state. Lifecycle commands require sudo and are serialized by a lock.
+After requesting shutdown, lifecycle commands wait up to 75 seconds for launchd to
+remove the old job and for the daemon to release its process lock. An upgrade does
+not replace the executable or plist until both checks succeed; a shutdown timeout
+or inspection failure leaves those files intact and reports an error.
 `start` and an installation that restarts the service wait for a successful authenticated
 IPC status reply before reporting success. They allow up to 35 seconds, including
 connection attempts, to accommodate launchd's restart throttle. An already-ready
@@ -851,8 +859,11 @@ requests. Its deadlines and video framing are separate from ordinary command IPC
 see [media protocol v1](MEDIA-PROTOCOL.md).
 
 System clients can reach the socket (0666), but the daemon checks kernel-provided
-peer credentials **before reading requests**. Only root or the configured controller
-with its matching local account UUID is authorized. A reused numeric UID is not enough.
+peer credentials **before reading requests**. Root, the running daemon's effective
+UID (normally `_hbnvr`), or the configured controller with its matching local
+account UUID is authorized. A reused controller UID alone is not enough. Scripts
+running as the daemon account can use the same control socket without changing the
+configured controller.
 The surrounding directory prevents clients from replacing the socket. Local agents
 authorize only their own UID and use a private 0600 socket. No identity in request
 JSON is trusted.
@@ -889,7 +900,8 @@ no sudo. Do not reboot or log out automatically as part of the test suite.
 
 1. Install and confirm the job remains disabled. Start it, then run `status` as the
    installing user. Confirm its PID runs as `_hbnvr`.
-2. Run `status` as a different ordinary account: expect exit 4. Root status should succeed.
+2. Run `status` as a different ordinary account: expect exit 4. Root status and
+   `sudo -u _hbnvr /usr/local/bin/hbnvr status` should succeed.
 3. Send SIGKILL to the **NVR PID returned by status** as root. After the 30-second
    restart throttle, verify a new PID and successful status.
 4. Install an upgrade while running; verify a new PID and unchanged controller identity.

@@ -312,6 +312,101 @@ indexed readable sources, not a promise against later deletion or a damaged code
 Clients fetch `frames` normally at the returned interval's start; preceding-keyframe
 preroll remains the frame reader's job. No filenames or filesystem dates are used.
 
+### Tag-filtered neighbors
+
+The optional media-open capability is **`supportsTagFilteredNeighbors: true`**.
+It extends `neighbors` with **`excludeTagKeys`**, an array of arbitrary tag-key
+strings; media protocol version remains 1. Negotiate it on each new connection.
+Omitting the field or sending null selects an empty array, preserving ordinary
+recording navigation. A nonempty filter is valid only on `neighbors`; `includeTags: true` remains
+frames-only. At most 32 distinct nonempty keys of at most 256 UTF-8 bytes each
+are accepted. Duplicate keys and invalid types are rejected.
+
+Exact request shape (optional `timeline`, `relativeTo`, and `excludeTagKeys`):
+
+```json
+{"requestID":"filtered-1","operation":"neighbors","cameraID":"11111111-1111-1111-1111-111111111111","timeline":"canonical","range":{"start":1800000005,"end":1800000005.001},"excludeTagKeys":["review.skip","workflow.private"]}
+```
+
+A sample is excluded if **any** requested key is present in its effective tags.
+Values are opaque strings: `"false"` and `""` both count as present. No key has a
+reserved meaning, and unrequested keys never affect navigation. HBNVR does not
+define a hidden state, a veil, or application-specific tag policy. Clients own
+that policy and choose the keys to send; the filter is not access control.
+
+`timeline` is `canonical` (default), `camera`, or `received`; `relativeTo` may be
+`now` or `live` with nonpositive offsets. Omit it for absolute Unix seconds. The
+existing request-ID, camera UUID, finite increasing range and 24-hour excluded
+range limits apply. The search itself may cross arbitrarily many days, within the
+existing bounded scan/deadline limits.
+
+Successful response shape (one JSON record per message, no binary payload):
+
+```json
+{"type":"begin","requestID":"filtered-1","cameraID":"11111111-1111-1111-1111-111111111111","timeline":"canonical","range":{"start":1800000005,"end":1800000005.001}}
+{"type":"neighbors","requestID":"filtered-1","neighbors":{"previous":{"start":1800000000,"end":1800000002},"next":{"start":1800000010,"end":1800000012}}}
+{"type":"end","requestID":"filtered-1","outcome":"complete","frames":0}
+```
+
+For relative requests, `begin` also includes numeric `anchor`, and its `range` is
+resolved absolute time. Each neighbor is `{ "start": number, "end": number }` in
+the selected timeline. `previous` and `next` are independently optional and omitted
+when absent; an empty result is `"neighbors": {}`. Neither uses JSON `null`.
+
+The query range may be a tiny interval within excluded footage or a gap. Each
+side searches for the nearest matching recording interval, so matching A →
+excluded → missing → excluded → matching B returns A and B from anywhere in the
+unavailable middle. Gaps and any number of fully excluded recordings are skipped
+in either direction. Overlapping recordings are compared by filtered bounds,
+not just their whole-recording order, using the same source precedence as playback.
+
+Returned intervals are half-open `[start,end)`, with `previous.end <= range.start`
+and `next.start >= range.end`. Within a recording, runs split at actual sample
+presentation times where effective presence of a selected key changes. Historical
+edits between samples take effect at the first sample at or after the edit's
+boundary. Prospective changes use exact sample ordinals, preserving MP4 clock
+rounding semantics. A final run ends at the captured readable frontier. Intervals
+are clipped to the excluded range and readable source coverage; adjacent RAM/disk
+pieces of one recording are merged. They need not extend across recording-file
+boundaries. Seek to an interval's `start` (or another point strictly before its
+exclusive `end`); boundaries are not necessarily keyframes. Frame playback still
+decodes preceding-keyframe preroll and clips its presentation normally.
+
+The filter reuses the exact `includeTags` projection: prospective state changes,
+historical overrides and explicit removals all apply; removal does not restore
+an older embedded value. Legacy/missing metadata and unknown portions have no
+public tag values, matching tagged playback.
+
+The search reads identity-matched SQLite tag metadata and MP4 sample-table timing
+through sample cursors, or captured RAM timing/tag metadata. It never enumerates
+encoded frame payloads, decodes video, downloads recordings, or changes recordings,
+tags, configuration or authorization. Supported sources are finalized local MP4s,
+readable fragments in growing `.mp4.recording` files, and resident local RAM tails
+in the selected first local store, including retained history when recording is
+disabled. S3 and spool data are not searched.
+
+Only `end` with `outcome: complete` confirms absence. An error is a terminal
+`{"type":"end","requestID":"filtered-1","outcome":"error","code":3,"error":"..."}`
+(the code varies: unavailable 3, permission 4, incompatible 5, timeout 6, invalid
+request/scan limit 7). EOF, cancellation, malformed metadata, unavailable sample
+indexes, revision changes and exhausted bounds must not be shown as archive ends.
+No neighbor record is emitted until both directions finish. The per-recording
+sample bound is 1,000,000; existing 10,000-row scan, 4096-root-entry and 300-second
+request limits apply. A result describes a captured snapshot, not a guarantee
+against later deletion, active-tail eviction or codec damage.
+
+Application bridges may translate their own higher-level requests and capabilities
+to this generic operation. They must negotiate `supportsTagFilteredNeighbors`
+before sending nonempty `excludeTagKeys`; an older server may ignore unknown fields.
+Reconnect after an NVR upgrade to renegotiate.
+
+Direct S3 readers must implement their desired filtering themselves. S3 manifests'
+`tagMetadata` is authoritative (including removals and encrypted metadata); never
+fall back to stale embedded MP4 tags. Current manifests lack a per-sample PTS map,
+so exact frame-ordinal/PTS parity needs bounded container sample-table reads or
+additional sample-timing metadata. Reading entire video objects to search hours
+of history is not required or supported by this local API.
+
 Every JSON response has `type` and `requestID`. Unused fields are omitted.
 
 | Type | Additional fields and meaning |
@@ -578,3 +673,11 @@ cameras to exercise the public `media.open` handshake, limits, reuse, malformed
 requests, command isolation, shutdown, and live anchors with recording stopped or
 the camera disabled. No installed daemon, real camera footage, or AWS access is
 needed. Build and run the existing test suite and subprocess smoke suite normally.
+
+### Thumbnail tags (0.23.0)
+
+`thumbnail.tags` is the actual selected keyframe's effective string dictionary,
+resolved with the same exact-frame projection as `includeTags` frame requests.
+It incorporates historical edits across finalized, active-disk, and RAM sources.
+Unknown/legacy metadata projects to no values. Tags remain opaque to HBNVR;
+clients choose their presentation. JPEG bytes and framing are unchanged.

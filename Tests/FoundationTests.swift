@@ -7,14 +7,22 @@ final class FoundationTests: XCTestCase {
     func testLocalAuthorizationOnlyAcceptsAgentUser() {
         let auth = Authorization.local(501)
         XCTAssertTrue(auth.permits(uid: 501)); XCTAssertFalse(auth.permits(uid: 502)); XCTAssertFalse(auth.permits(uid: 0))
+        XCTAssertFalse(auth.permits(uid: 502, daemonUID: 502))
     }
     func testInstalledAuthorizationUsesUIDAndUUID() {
         let auth = Authorization.installed(owner)
-        XCTAssertTrue(auth.permits(uid: 0))
-        XCTAssertTrue(auth.permits(uid: 501, lookup: { _ in self.owner }))
-        XCTAssertFalse(auth.permits(uid: 502, lookup: { _ in self.owner }))
-        XCTAssertFalse(auth.permits(uid: 501, lookup: { Controller(uid: $0, accountUUID: UUID()) }))
-        XCTAssertFalse(auth.permits(uid: 501, lookup: { _ in throw ServiceError("lookup failed") }))
+        XCTAssertTrue(auth.permits(uid: 0, daemonUID: 400))
+        XCTAssertTrue(auth.permits(uid: 501, daemonUID: 400, lookup: { _ in self.owner }))
+        XCTAssertFalse(auth.permits(uid: 502, daemonUID: 400, lookup: { _ in self.owner }))
+        XCTAssertFalse(auth.permits(uid: 501, daemonUID: 400, lookup: { Controller(uid: $0, accountUUID: UUID()) }))
+        XCTAssertFalse(auth.permits(uid: 501, daemonUID: 400, lookup: { _ in throw ServiceError("lookup failed") }))
+    }
+    func testInstalledAuthorizationAcceptsDaemonUIDWithoutAccountLookup() {
+        let auth = Authorization.installed(owner)
+        XCTAssertTrue(auth.permits(uid: 400, daemonUID: 400, lookup: { _ in
+            XCTFail("The daemon's own UID does not need a controller identity lookup.")
+            throw ServiceError("lookup failed")
+        }))
     }
     func testInstallerSelectsSudoUser() throws {
         let result = try Accounts.initialOwner(explicit: nil, sudoUID: "501", byUID: { XCTAssertEqual($0, 501); return self.owner })
@@ -91,6 +99,21 @@ final class FoundationTests: XCTestCase {
         let data = try SocketIO.read(fd: pair[1], deadline: ProcessInfo.processInfo.systemUptime + 1)
         XCTAssertEqual(try JSONDecoder().decode(Reply.self, from: data).code, .permission)
     }
+    func testActualPeerCredentialsAcceptInstalledDaemonUser() throws {
+        var pair = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(socketpair(AF_UNIX, SOCK_STREAM, 0, &pair), 0)
+        defer { pair.forEach { close($0) } }
+        let controller = Controller(uid: geteuid() + 1, accountUUID: UUID())
+        let server = AgentServer(directory: "/unused", authorization: .installed(controller), system: false)
+        let request = Request(protocolVersion: 1, operation: "status")
+        try SocketIO.write(JSONEncoder().encode(request), fd: pair[1], deadline: ProcessInfo.processInfo.systemUptime + 1)
+        server.handle(pair[0], started: ProcessInfo.processInfo.systemUptime)
+        let data = try SocketIO.read(fd: pair[1], deadline: ProcessInfo.processInfo.systemUptime + 1)
+        let reply = try JSONDecoder().decode(Reply.self, from: data)
+        XCTAssertNil(reply.error); XCTAssertNil(reply.code)
+        XCTAssertEqual(reply.status?.ready, true)
+        XCTAssertEqual(reply.status?.pid, getpid())
+    }
     final class DirectoryMock {
         var records: [String: [String: String]] = [:]
         var writes: [[String]] = []
@@ -163,17 +186,32 @@ final class FoundationTests: XCTestCase {
         var loaded = false, disabled = false
         var commands: [[String]] = []
         var fail: String?
+        var removalPrints = 0, removalNeverCompletes = false
+        var removalInspectionFailure: Int32?
+        private(set) var removing = false
         func run(_ path: String, _ args: [String]) throws -> ProcessResult {
             XCTAssertEqual(path, "/bin/launchctl")
             commands.append(args)
             if args.first == fail { return ProcessResult(status: 1, output: "injected failure") }
             switch args[0] {
-            case "print": return ProcessResult(status: loaded ? 0 : 113, output: "")
+            case "print":
+                if removing {
+                    if let status = removalInspectionFailure { return ProcessResult(status: status, output: "injected inspection failure") }
+                    if removalNeverCompletes { return ProcessResult(status: 0, output: "removal pending") }
+                    if removalPrints > 0 { removalPrints -= 1; return ProcessResult(status: 0, output: "removal pending") }
+                    loaded = false; removing = false
+                }
+                return ProcessResult(status: loaded ? 0 : 113, output: "")
             case "print-disabled": return ProcessResult(status: 0, output: "disabled services = {\n\t\"\(Paths.label)\" => \(disabled ? "disabled" : "enabled")\n}")
             case "disable": disabled = true
             case "enable": disabled = false
-            case "bootstrap", "kickstart": loaded = true
-            case "bootout": loaded = false
+            case "bootstrap":
+                guard !loaded else { return ProcessResult(status: 5, output: "Bootstrap failed: 5: Input/output error") }
+                loaded = true
+            case "kickstart": loaded = true
+            case "bootout":
+                removing = removalPrints > 0 || removalNeverCompletes || removalInspectionFailure != nil
+                if !removing { loaded = false }
             default: XCTFail("Unexpected launchctl command")
             }
             return ProcessResult(status: 0, output: "")
@@ -216,6 +254,115 @@ final class FoundationTests: XCTestCase {
         XCTAssertTrue(mock.loaded); XCTAssertFalse(mock.disabled)
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.authorization)), before)
         XCTAssertTrue(mock.commands.contains { $0.first == "bootout" })
+    }
+    func testUpgradeWaitsForLaunchdRemovalWithMissingOrReleasedLockAndPreservesBootPolicy() throws {
+        for hasLock in [false, true] {
+            for wasDisabled in [false, true] {
+                let mock = LaunchMock()
+                var (root, installer) = try fixture(mock)
+                defer { try? FileManager.default.removeItem(atPath: root) }
+                try installer.install(owner: nil); try installer.start()
+                if hasLock { try SecureFiles.atomicWrite(Data(), to: installer.paths.runtime + "/agent.lock", mode: 0o600) }
+                mock.disabled = wasDisabled; mock.removalPrints = 3
+                try Data("replacement binary".utf8).write(to: URL(fileURLWithPath: root + "/source"))
+                installer.embedded = { Data("replacement plist".utf8) }
+                let paths = installer.paths
+                var time: TimeInterval = 0, sleeps = 0
+                installer.now = { time }
+                installer.sleep = { interval in
+                    time += interval; sleeps += 1
+                    do {
+                        let binary = try Data(contentsOf: URL(fileURLWithPath: paths.binary))
+                        let plist = try Data(contentsOf: URL(fileURLWithPath: paths.plist))
+                        XCTAssertEqual(binary, Data("binary".utf8))
+                        XCTAssertEqual(plist, Data("plist".utf8))
+                    } catch { XCTFail("Could not inspect installation while waiting: \(error)") }
+                }
+                XCTAssertTrue(try installer.install(owner: nil))
+                XCTAssertEqual(sleeps, 3)
+                XCTAssertTrue(mock.loaded); XCTAssertFalse(mock.removing)
+                XCTAssertEqual(mock.disabled, wasDisabled)
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.binary)), Data("replacement binary".utf8))
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.plist)), Data("replacement plist".utf8))
+            }
+        }
+    }
+    func testUpgradeRemovalTimeoutPreservesInstallationAndDoesNotBootstrap() throws {
+        let mock = LaunchMock()
+        var (root, installer) = try fixture(mock)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        try installer.install(owner: nil); try installer.start()
+        mock.removalNeverCompletes = true
+        try Data("replacement binary".utf8).write(to: URL(fileURLWithPath: root + "/source"))
+        installer.embedded = { Data("replacement plist".utf8) }
+        let bootstraps = mock.commands.filter { $0.first == "bootstrap" }.count
+        var time: TimeInterval = 0
+        installer.now = { time }; installer.sleep = { _ in time += 25 }
+        XCTAssertThrowsError(try installer.install(owner: nil)) { XCTAssertEqual(($0 as? ServiceError)?.code, .timeout) }
+        XCTAssertEqual(time, 75)
+        XCTAssertEqual(mock.commands.filter { $0.first == "bootstrap" }.count, bootstraps)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.binary)), Data("binary".utf8))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.plist)), Data("plist".utf8))
+    }
+    func testUpgradeRemovalInspectionFailurePreservesInstallationAndDoesNotBootstrap() throws {
+        let mock = LaunchMock()
+        var (root, installer) = try fixture(mock)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        try installer.install(owner: nil); try installer.start()
+        mock.removalInspectionFailure = 77
+        try Data("replacement binary".utf8).write(to: URL(fileURLWithPath: root + "/source"))
+        installer.embedded = { Data("replacement plist".utf8) }
+        installer.sleep = { _ in XCTFail("An inspection failure must not be treated as absence or retried.") }
+        let bootstraps = mock.commands.filter { $0.first == "bootstrap" }.count
+        XCTAssertThrowsError(try installer.install(owner: nil)) { error in
+            XCTAssertEqual((error as? ServiceError)?.code, .failure)
+            XCTAssertTrue((error as? ServiceError)?.message.contains("77") == true)
+        }
+        XCTAssertEqual(mock.commands.filter { $0.first == "bootstrap" }.count, bootstraps)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.binary)), Data("binary".utf8))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.plist)), Data("plist".utf8))
+    }
+    func testUpgradeWaitsForRuntimeLockAfterLaunchdRemoval() throws {
+        let mock = LaunchMock()
+        var (root, installer) = try fixture(mock)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        try installer.install(owner: nil); try installer.start()
+        let fd = open(installer.paths.runtime + "/agent.lock", O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw ServiceError.posix("Create fixture lock") }
+        defer { close(fd) }
+        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0)
+        mock.removalPrints = 2
+        var time: TimeInterval = 0, sleeps = 0
+        installer.now = { time }
+        installer.sleep = { interval in
+            time += interval; sleeps += 1
+            if !mock.removing { XCTAssertEqual(flock(fd, LOCK_UN), 0) }
+        }
+        XCTAssertTrue(try installer.install(owner: nil))
+        XCTAssertEqual(sleeps, 3)
+        XCTAssertTrue(mock.loaded)
+    }
+    func testUpgradeRemovalAndRuntimeLockShareTimeoutAndPreserveInstallation() throws {
+        let mock = LaunchMock()
+        var (root, installer) = try fixture(mock)
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        try installer.install(owner: nil); try installer.start()
+        let fd = open(installer.paths.runtime + "/agent.lock", O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        guard fd >= 0 else { throw ServiceError.posix("Create fixture lock") }
+        defer { close(fd) }
+        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0)
+        mock.removalPrints = 1
+        try Data("replacement binary".utf8).write(to: URL(fileURLWithPath: root + "/source"))
+        installer.embedded = { Data("replacement plist".utf8) }
+        let bootstraps = mock.commands.filter { $0.first == "bootstrap" }.count
+        var time: TimeInterval = 0
+        installer.now = { time }; installer.sleep = { _ in time += 25 }
+        XCTAssertThrowsError(try installer.install(owner: nil)) { XCTAssertEqual(($0 as? ServiceError)?.code, .timeout) }
+        XCTAssertEqual(time, 75)
+        XCTAssertFalse(mock.loaded)
+        XCTAssertEqual(mock.commands.filter { $0.first == "bootstrap" }.count, bootstraps)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.binary)), Data("binary".utf8))
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: installer.paths.plist)), Data("plist".utf8))
     }
     func testStoppedUpgradeDoesNotStartService() throws {
         let mock = LaunchMock(), (root, installer) = try fixture(mock)

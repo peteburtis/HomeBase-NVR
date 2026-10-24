@@ -9,10 +9,11 @@ the existing recording-control subscription below or implement its Homebase cons
 Homebase's camera module automatically connects to the installed NVR at
 `/Library/Application Support/HomeBase-NVR/run/control.sock`. No configuration,
 pairing, XPC service, shared credential files, or background CLI subprocess is needed.
-The NVR authenticates Homebase's process using the same kernel peer UID and recorded
-account UUID as CLI access. Run Homebase as the installing/authorized user. Homebase
-also checks that the socket peer is the `_hbnvr` account before sending requests.
-Root remains authorized by the existing NVR administration policy.
+The NVR authenticates Homebase's process using the same kernel peer credentials as
+CLI access. Run Homebase as the installing/authorized user (whose UID and recorded
+account UUID must match) or as the running daemon's effective UID (normally `_hbnvr`).
+Homebase also checks that the socket peer is the `_hbnvr` account before sending
+requests. Root remains authorized by the existing NVR administration policy.
 
 ## Control semantics
 

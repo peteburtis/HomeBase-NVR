@@ -12,6 +12,8 @@ struct Installer {
     var chooseOwner: (Controller?, String?, String?) throws -> Controller = { try Accounts.selectOwner(existing: $0, explicit: $1, sudoUID: $2) }
     var fileOwner: uid_t = 0
     var waitUntilReady: (String) throws -> Void = { try AgentReadiness.wait(directory: $0) }
+    var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    var sleep: (TimeInterval) -> Void = Thread.sleep(forTimeInterval:)
 
     private var service: String { "system/" + Paths.label }
     private func locked(_ body: () throws -> Void) throws {
@@ -56,7 +58,15 @@ struct Installer {
     }
     private func stopLoaded() throws {
         if try loaded() { try launch(["bootout", service]) }
-        // bootout removes the job; wait for the previous process to release its runtime lock before an upgrade.
+        // bootout initiates removal asynchronously. The daemon can release its lock before
+        // launchd removes the job, and bootstrapping during that interval fails with EIO.
+        let deadline = now() + 75
+        while try loaded() {
+            guard now() < deadline else { throw ServiceError(.timeout, "launchd did not remove the previous agent; refusing to replace its installation.") }
+            sleep(0.05)
+        }
+        // Also wait for any previous process to release its runtime lock, even if launchd
+        // no longer has a job. A missing lock does not bypass the removal check above.
         let lockPath = paths.runtime + "/agent.lock"
         guard try SecureFiles.info(lockPath) != nil else { return }
         let fd = open(lockPath, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
@@ -64,11 +74,10 @@ struct Installer {
         defer { close(fd) }
         var s = stat()
         guard fstat(fd, &s) == 0, s.st_mode & S_IFMT == S_IFREG, s.st_nlink == 1 else { throw ServiceError("Invalid daemon lock.") }
-        let deadline = ProcessInfo.processInfo.systemUptime + 75
         while flock(fd, LOCK_EX | LOCK_NB) != 0 {
             guard errno == EWOULDBLOCK || errno == EAGAIN else { throw ServiceError.posix("Check daemon lock") }
-            guard ProcessInfo.processInfo.systemUptime < deadline else { throw ServiceError(.timeout, "Previous agent did not stop; refusing to replace its installation.") }
-            Thread.sleep(forTimeInterval: 0.05)
+            guard now() < deadline else { throw ServiceError(.timeout, "Previous agent did not stop; refusing to replace its installation.") }
+            sleep(0.05)
         }
     }
     private func requireInstalled() throws {

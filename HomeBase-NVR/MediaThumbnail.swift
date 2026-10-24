@@ -42,6 +42,7 @@ struct MediaThumbnail: Codable {
     let presentationTicks: Int64
     let timescale: UInt32
     let keyFrame: Bool
+    var tags: [String: String]? = nil
 }
 
 enum MediaThumbnailResponse {
@@ -61,24 +62,24 @@ enum MediaThumbnailResponse {
         // A point must actually be covered. Do not manufacture a thumbnail for
         // a gap by walking backwards into arbitrary old footage.
         let range = MediaRange(start: resolved.timestamp, end: resolved.timestamp.nextUp)
-        let sources = try provider.catalog(camera: request.cameraID, range: range, timeline: request.selectedTimeline, work: work)
+        let sources = try provider.catalog(camera: request.cameraID, range: range, timeline: request.selectedTimeline, work: work, includeTags: true)
         let pieces = try LocalMediaProvider.plan(sources, range: range, work: work)
         var result: (MediaThumbnail, Data)?
         for piece in pieces {
             try work.check()
             let query = MediaRequest(requestID: request.requestID, operation: "frames", cameraID: request.cameraID,
-                timeline: request.selectedTimeline, range: range)
+                timeline: request.selectedTimeline, range: range, includeTags: true)
             // Reuse precisely the frame reader's validated source and preceding
             // keyframe selection. It returns after one sample, with no GOP replay.
             _ = try LocalMediaReader.read(piece, number: 0, request: query, work: work,
-                emit: { _ in }, bytes: { _ in }, keyframe: { sample, segment in
+                emit: { _ in }, bytes: { _ in }, keyframe: { sample, segment, tags in
                     let image = try ThumbnailJPEG.render(sample, size: request.size, work: work)
                     let pts = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(sample),
                         timescale: Int32(segment.timescale), method: .default).value
                     let timestamp = request.selectedTimeline.anchor(segment.time)! + Double(pts) / Double(segment.timescale)
                     result = (MediaThumbnail(mimeType: "image/jpeg", width: image.width, height: image.height,
                         byteCount: image.data.count, timestamp: timestamp, time: segment.time,
-                        presentationTicks: pts, timescale: segment.timescale, keyFrame: true), image.data)
+                        presentationTicks: pts, timescale: segment.timescale, keyFrame: true, tags: tags), image.data)
                 })
             if result != nil { break }
         }

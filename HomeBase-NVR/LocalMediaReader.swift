@@ -28,28 +28,54 @@ final class LocalMediaProvider {
          ram: RecordingRAMCache? = .shared) {
         self.configurations = configurations; self.live = live; self.now = now; self.ram = ram
     }
-    func catalog(camera: String, range: MediaRange, timeline: MediaTimeline, work: MediaWork, includeTags: Bool = false) throws -> [Source] {
+    func catalog(camera: String, range: MediaRange, timeline: MediaTimeline, work: MediaWork, includeTags: Bool = false, strictIdentity: Bool = false) throws -> [Source] {
         var result: [Source] = []
         try visitIndexes(camera: camera, work: work) { directory, config, index in
             for row in try index.playbackRecordings(from: range.start, to: range.end, timeline: timeline) {
-                result += try sources(row: row, directory: directory, owner: config.ownerUID, timeline: timeline, work: work, includeTags: includeTags)
+                result += try sources(row: row, directory: directory, owner: config.ownerUID, timeline: timeline, work: work, includeTags: includeTags, strictIdentity: strictIdentity)
                     .filter { $0.range.end > range.start && $0.range.start < range.end }
                 guard result.count <= MediaLimits.candidates else { throw ServiceError(.invalidMessage, "Too many recording shards; request a smaller time range.") }
             }
         }
         return result
     }
-    func neighbors(camera: String, range: MediaRange, timeline: MediaTimeline, work: MediaWork) throws -> MediaNeighbors {
+    func neighbors(camera: String, range: MediaRange, timeline: MediaTimeline, work: MediaWork, excludeTagKeys: [String] = []) throws -> MediaNeighbors {
+        let filtering = !excludeTagKeys.isEmpty
         var result = MediaNeighbors()
         try visitIndexes(camera: camera, work: work) { directory, config, index in
             for previous in [true, false] {
                 let point = previous ? range.start : range.end
                 try index.visitNeighbors(at: point, previous: previous, timeline: timeline, work: work) { row in
-                    let candidates = try self.sources(row: row, directory: directory, owner: config.ownerUID, timeline: timeline, work: work)
+                    // SQL orders whole recordings, not their filtered subranges.
+                    // An overlapping recording may contain a closer matching run.
+                    // Stop only when its unfiltered bound cannot beat our result.
+                    if filtering, row.state == .complete, let anchor = timeline.anchor(row.timing.time) {
+                        let end = anchor + Double(row.endTicks) / Double(row.timescale)
+                        if previous, let best = result.previous, min(point, end) < best.end { return false }
+                        if !previous, let best = result.next, max(point, anchor) > best.start { return false }
+                    }
+                    let candidates = try self.sources(row: row, directory: directory, owner: config.ownerUID,
+                        timeline: timeline, work: work, includeTags: filtering, strictIdentity: filtering)
+                    let intervals: [MediaRange]
+                    if filtering {
+                        let whole = MediaRange(start: candidates.map(\.range.start).min() ?? point,
+                            end: candidates.map(\.range.end).max() ?? point)
+                        // Match frame playback's precedence across ALL overlapping
+                        // rows, not just disk/RAM copies of this row. In particular,
+                        // an older same-epoch shard can mask this row's matching head.
+                        let overlapping = whole.end > whole.start ? try self.catalog(camera: camera,
+                            range: whole, timeline: timeline, work: work, includeTags: true, strictIdentity: true) : []
+                        let pieces = try Self.plan(overlapping, range: whole, work: work).filter {
+                            $0.source.row.id == row.id && $0.source.directory.path == directory.path
+                        }
+                        intervals = try MediaRange.merged(pieces.flatMap {
+                            try LocalMediaReader.filteredIntervals($0, timeline: timeline, excludeTagKeys: excludeTagKeys, work: work)
+                        })
+                    } else { intervals = candidates.map(\.range) }
                     var found = false
-                    for source in candidates {
-                        let clipped = MediaRange(start: previous ? source.range.start : max(point, source.range.start),
-                            end: previous ? min(point, source.range.end) : source.range.end)
+                    for interval in intervals {
+                        let clipped = MediaRange(start: previous ? interval.start : max(point, interval.start),
+                            end: previous ? min(point, interval.end) : interval.end)
                         guard clipped.end > clipped.start else { continue }
                         found = true
                         if previous {
@@ -62,19 +88,22 @@ final class LocalMediaProvider {
                     }
                     // Active rows are ordered ahead of completed ones regardless
                     // of their wall times. Always compare one readable complete row.
-                    return row.state == .recording || !found
+                    return filtering || row.state == .recording || !found
                 }
             }
         }
         return result
     }
     private func sources(row: LocalRecordingManifest.Recording, directory: LocalRecordingLayout.Directory,
-                         owner: uid_t, timeline: MediaTimeline, work: MediaWork, includeTags: Bool = false) throws -> [Source] {
+                         owner: uid_t, timeline: MediaTimeline, work: MediaWork, includeTags: Bool = false, strictIdentity: Bool = false) throws -> [Source] {
         try work.check()
         guard let anchor = timeline.anchor(row.timing.time) else { return [] }
         var info = stat(), result: [Source] = []
         let exists = fstatat(directory.fd, row.filename, &info, AT_SYMLINK_NOFOLLOW) == 0
         if !exists, errno != ENOENT { throw ServiceError.posix("Inspect indexed video") }
+        if strictIdentity, exists, row.state == .complete, !Self.matches(info, row: row) {
+            throw ServiceError(.unavailable, "Indexed recording changed or is inaccessible; retry neighbors.")
+        }
         if row.state == .recording {
             // Metadata remains available even when RAM video is disabled for
             // this provider or evicted. Never infer current tags from SQLite.
@@ -273,6 +302,68 @@ private final class MediaAssetInspection: @unchecked Sendable {
 }
 
 enum LocalMediaReader {
+    /// Inspect sample-table timing only: no AVAssetReader, sample buffers, video
+    /// payloads, or decode. The same effective tag projection as frame playback
+    /// maps prospective sample ordinals and historical PTS overrides exactly.
+    static func filteredIntervals(_ piece: LocalMediaProvider.Piece, timeline: MediaTimeline,
+                                  excludeTagKeys: [String], work: MediaWork) throws -> [MediaRange] {
+        let source = piece.source, row = source.row
+        guard let anchor = timeline.anchor(row.timing.time) else { return [] }
+        let scale = Double(row.timescale)
+        var points: [MediaTagRanges.Point] = []
+        let tags: VideoTagTimeline?
+        if let memory = source.memory {
+            tags = memory.tags
+            points = memory.frames.map { .init(ticks: $0.pts, frame: $0.frame) }
+        } else {
+            let pinned = try PinnedMediaAsset(source: source, work: work)
+            defer { withExtendedLifetime(pinned) {} }
+            let (track, embedded, _) = try pinned.inspect()
+            guard embedded == row.timing else { throw ServiceError(.unavailable, "Recording timing does not match its index.") }
+            if row.state == .complete {
+                let index = try LocalRecordingManifest(directory: source.directory,
+                    identity: .init(storeID: row.timing.storeID, cameraID: row.timing.cameraID), owner: source.owner, readOnly: true)
+                tags = try index.playbackTags(matching: row)
+            } else {
+                guard let snapshot = source.activeTags else { throw ServiceError(.unavailable, "Active tag snapshot is unavailable; retry neighbors.") }
+                tags = snapshot.timeline
+            }
+            guard let cursor = track.makeSampleCursorAtFirstSampleInDecodeOrder() else {
+                throw ServiceError(.unavailable, "Recording sample timing is unavailable.")
+            }
+            repeat {
+                try pinned.check()
+                let time = cursor.presentationTimeStamp
+                let converted = CMTimeConvertScale(time, timescale: Int32(row.timescale), method: .default)
+                guard time.isNumeric, converted.isNumeric, converted.value >= 0 else {
+                    throw ServiceError(.unavailable, "Invalid recording sample time.")
+                }
+                if converted.value >= source.endTicks { break }
+                if let frontier = source.activeTags, points.count >= frontier.frames { break }
+                guard points.count < MediaLimits.taggedFrames,
+                      points.last.map({ converted.value > $0.ticks }) ?? true else {
+                    throw ServiceError(.unavailable, "Recording sample timing is unordered or exceeds the metadata limit.")
+                }
+                points.append(.init(ticks: converted.value, frame: Int64(points.count)))
+            } while cursor.stepInDecodeOrder(byCount: 1) == 1
+            try pinned.check()
+            guard row.state != .complete || points.count == row.frames else {
+                throw ServiceError(.unavailable, "Recording sample count does not match its manifest.")
+            }
+        }
+        guard let first = points.first else { throw ServiceError(.unavailable, "Recording has no readable sample timing.") }
+        let effectiveTags = try MediaTagRanges.build(tags, points: points, work: work)
+        let excludedSpans = excludeTagKeys.flatMap { effectiveTags[$0] ?? [] }
+        // A transition begins at its sample PTS, even when an override falls
+        // between samples. The final sample ends at the captured readable frontier.
+        let coverage = MediaRange(start: max(piece.range.start, anchor + Double(first.ticks) / scale), end: piece.range.end)
+        let excluded = excludedSpans.map { span in
+            MediaRange(start: anchor + Double(points[span.startFrame].ticks) / scale,
+                end: span.endFrame < points.count ? anchor + Double(points[span.endFrame].ticks) / scale : source.range.end)
+        }
+        try work.check()
+        return coverage.subtracting(excluded)
+    }
     static func frameTicks(_ source: LocalMediaProvider.Source, work: MediaWork) throws -> [Int64] {
         let pinned = try PinnedMediaAsset(source: source, work: work)
         let (track, timing, _) = try pinned.inspect()
@@ -310,7 +401,7 @@ enum LocalMediaReader {
     /// applies backpressure only here, never to camera reception or store writers.
     static func read(_ piece: LocalMediaProvider.Piece, number: Int, request: MediaRequest, work: MediaWork,
                      emit: (MediaMessage) throws -> Void, bytes: (Data) throws -> Void,
-                     keyframe: ((CMSampleBuffer, MediaSegment) throws -> Void)? = nil) throws -> Result {
+                     keyframe: ((CMSampleBuffer, MediaSegment, [String: String]) throws -> Void)? = nil) throws -> Result {
         if let memory = piece.source.memory {
             return try readRAM(memory, range: piece.range, number: number, request: request, work: work, emit: emit, bytes: bytes, keyframe: keyframe)
         }
@@ -320,7 +411,7 @@ enum LocalMediaReader {
         let (track, embedded, _) = try pinned.inspect()
         try pinned.check()
         guard embedded == row.timing else { throw ServiceError(.unavailable, "Recording timing does not match its index.") }
-        let includeTags = request.includeTags && keyframe == nil
+        let includeTags = request.includeTags
         let tagTimeline: VideoTagTimeline?
         if includeTags, row.state == .complete {
             let index = try LocalRecordingManifest(directory: source.directory,
@@ -426,7 +517,8 @@ enum LocalMediaReader {
                 if let keyframe {
                     let decode = CMSampleBufferGetDecodeTimeStamp(sample)
                     if decode.isNumeric, try ticks(decode) != pts { throw ServiceError("Reordered video is not supported.") }
-                    try keyframe(sample, segment)
+                    let tags = try MediaTagRanges.build(tagTimeline, points: Array(points.prefix(1)), work: work)
+                    try keyframe(sample, segment, tags.compactMapValues { $0.first?.value })
                     return Result(coverage: [], frames: 1)
                 }
                 try MediaTagRanges.emit(segment, tags: tagPayload, frameCount: points.count, requestID: request.requestID,
@@ -485,13 +577,13 @@ enum LocalMediaReader {
     private static func readRAM(_ memory: RecordingRAMTail.Snapshot, range: MediaRange, number: Int,
                                 request: MediaRequest, work: MediaWork,
                                 emit: (MediaMessage) throws -> Void, bytes: (Data) throws -> Void,
-                                keyframe: ((CMSampleBuffer, MediaSegment) throws -> Void)?) throws -> Result {
+                                keyframe: ((CMSampleBuffer, MediaSegment, [String: String]) throws -> Void)?) throws -> Result {
         guard let anchor = request.timeline.anchor(memory.timing.time) else { return Result(coverage: [], frames: 0) }
         let scale = Double(memory.timing.timescale)
         let key = memory.frames.lastIndex { $0.key && anchor + Double($0.pts) / scale <= range.start }
             ?? memory.frames.firstIndex { $0.key && anchor + Double($0.pts) / scale < range.end }
         guard let key else { return Result(coverage: [], frames: 0) }
-        let includeTags = request.includeTags && keyframe == nil
+        let includeTags = request.includeTags
         let points = includeTags ? memory.frames[key...].prefix { anchor + Double($0.pts) / scale < range.end }
             .map { MediaTagRanges.Point(ticks: $0.pts, frame: $0.frame) } : []
         let tagPayload = includeTags ? try MediaTagRanges.encode(memory.tags, points: points, work: work) : nil
@@ -519,7 +611,8 @@ enum LocalMediaReader {
                         formatDescription: format, sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
                         sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &buffer) == noErr,
                         let buffer else { throw ServiceError("Cannot read resident keyframe.") }
-                    try keyframe(buffer, message.segment!)
+                    let tags = try MediaTagRanges.build(memory.tags, points: [.init(ticks: frame.pts, frame: frame.frame)], work: work)
+                    try keyframe(buffer, message.segment!, tags.compactMapValues { $0.first?.value })
                     return Result(coverage: [], frames: 1)
                 }
                 try MediaTagRanges.emit(message.segment!, tags: tagPayload, frameCount: points.count, requestID: request.requestID,

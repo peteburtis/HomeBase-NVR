@@ -41,12 +41,14 @@ struct MediaRequest: Codable {
     let range: MediaRange // Unix seconds for absolute; signed seconds for relative
     var relativeTo: String? = nil // nil (absolute) | live | now
     var includeTags = false
-    enum CodingKeys: String, CodingKey { case requestID, operation, cameraID, timeline, range, relativeTo, includeTags }
+    /// Generic any-of key-presence filter; tag names and values remain opaque.
+    var excludeTagKeys: [String] = []
+    enum CodingKeys: String, CodingKey { case requestID, operation, cameraID, timeline, range, relativeTo, includeTags, excludeTagKeys }
     init(requestID: String, operation: String, cameraID: String, timeline: MediaTimeline = .canonical,
-         range: MediaRange, relativeTo: String? = nil, includeTags: Bool = false) {
+         range: MediaRange, relativeTo: String? = nil, includeTags: Bool = false, excludeTagKeys: [String] = []) {
         self.requestID = requestID; self.operation = operation; self.cameraID = cameraID
         self.timeline = timeline; self.range = range; self.relativeTo = relativeTo
-        self.includeTags = includeTags
+        self.includeTags = includeTags; self.excludeTagKeys = excludeTagKeys
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -57,6 +59,7 @@ struct MediaRequest: Codable {
         range = try c.decode(MediaRange.self, forKey: .range)
         relativeTo = try c.decodeIfPresent(String.self, forKey: .relativeTo)
         includeTags = try c.decodeIfPresent(Bool.self, forKey: .includeTags) ?? false
+        excludeTagKeys = try c.decodeIfPresent([String].self, forKey: .excludeTagKeys) ?? []
     }
     func resolve(now: Double, live: RecordingTime?) throws -> (range: MediaRange, anchor: Double?) {
         guard CameraConfiguration.printable(requestID, limit: 64), requestID.utf8.count <= 64,
@@ -65,6 +68,11 @@ struct MediaRequest: Codable {
               range.end - range.start <= MediaLimits.maximumRangeSeconds,
               !includeTags || operation == "frames" else {
             throw ServiceError(.invalidMessage, "Expected a camera UUID, request ID, frames/availability/neighbors operation, and finite range of at most 24 hours.")
+        }
+        guard excludeTagKeys.isEmpty || operation == "neighbors",
+              excludeTagKeys.count <= 32, Set(excludeTagKeys).count == excludeTagKeys.count,
+              excludeTagKeys.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 }) else {
+            throw ServiceError(.invalidMessage, "excludeTagKeys requires at most 32 distinct nonempty keys of at most 256 UTF-8 bytes, and is valid only for neighbors.")
         }
         let anchor = try MediaTimeSelection.anchor(relativeTo: relativeTo, timeline: timeline, now: now, live: live)
         if relativeTo != nil, range.end > 0 { throw ServiceError(.invalidMessage, "Relative ranges must end at or before their anchor.") }
@@ -114,6 +122,7 @@ struct MediaSessionInfo: Codable {
     var maxThumbnailDimension = 2048
     var maxThumbnailBytes = 8 * 1024 * 1024
     var supportsNeighbors = true
+    var supportsTagFilteredNeighbors = true
     var supportsKeepalive = true
     var discovery = "playback.snapshot"
     var discoveryWatch = "playback.watch"

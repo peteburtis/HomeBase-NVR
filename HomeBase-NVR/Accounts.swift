@@ -8,11 +8,13 @@ struct Controller: Codable, Equatable {
 enum Authorization {
     case local(uid_t)
     case installed(Controller)
-    func permits(uid: uid_t, lookup: (uid_t) throws -> Controller = Accounts.lookup(uid:)) -> Bool {
+    func permits(uid: uid_t, daemonUID: uid_t = geteuid(), lookup: (uid_t) throws -> Controller = Accounts.lookup(uid:)) -> Bool {
         switch self {
         case .local(let owner): return uid == owner
         case .installed(let owner):
-            if uid == 0 { return true }
+            // The daemon account already owns its private configuration and credentials.
+            // Both UIDs come from the OS, never from the request or socket file owner.
+            if uid == 0 || uid == daemonUID { return true }
             return uid == owner.uid && (try? lookup(uid)) == owner
         }
     }

@@ -14,6 +14,23 @@ final class ThumbnailTests: XCTestCase {
         try MediaThumbnailResponse.run(query, provider: provider, work: MediaWork(), emit: { messages.append($0) }, bytes: { data.append($0) })
         return (messages, data)
     }
+    func testThumbnailsCarrySelectedKeyframeTagsForFinalizedDiskGrowingAndRAM() throws {
+        let fixtures = MediaTests()
+        for active in [false, true] {
+            let f = try fixtures.fixture(count: 180, initialCount: active ? 180 : nil,
+                tags: { ["homebase.hidden": String($0)] })
+            defer { _ = f.store.finish(timeout: 10); try? FileManager.default.removeItem(atPath: f.root) }
+            if active { Thread.sleep(forTimeInterval: 0.15) }
+            for (provider, offset) in active ? [(f.provider, 1.6), (f.ramProvider, 11.6)] : [(f.provider, 1.6)] {
+                let point = fixtures.base + offset
+                let (messages, _) = try response(query(f.camera, at: point), provider: provider)
+                let thumbnail = try XCTUnwrap(messages.compactMap(\.thumbnail).first)
+                let ordinal = Int((thumbnail.timestamp - fixtures.base) * 15.0 + 0.01)
+                XCTAssertEqual(thumbnail.tags, ["homebase.hidden": String(ordinal)])
+            }
+        }
+    }
+
     func testPointsShareTimelineAndAnchorRulesAndRejectInvalidInput() throws {
         let id = UUID().uuidString
         for timeline in [MediaTimeline.canonical, .camera, .received] {
