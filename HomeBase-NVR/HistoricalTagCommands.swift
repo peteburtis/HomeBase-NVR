@@ -5,12 +5,11 @@ struct Media: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Inspect and annotate recorded media without changing live tags.", subcommands: [MediaTag.self])
 }
 struct MediaTag: ParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "tag", abstract: "Edit finalized history. Local MP4/index updates; S3 manifests only.",
+    static let configuration = CommandConfiguration(commandName: "tag", abstract: "Edit footage tags across every retained copy, including recordings in progress.",
         subcommands: [MediaTagSet.self, MediaTagRemove.self, MediaTagInspect.self, MediaTagApply.self, MediaTagStatus.self])
 }
 struct HistoricalTagOptions: ParsableArguments {
     @Option(help: "Local agent runtime directory; omit for the installed service.") var runtimeDir: String?
-    @Option(help: "Target store name/UUID; repeat to explicitly edit matching footage in more stores. Omit for a picker.") var store: [String] = []
     @Option(help: "Managed local recording file; absolute path. Not an arbitrary MP4 import.") var file: String?
     @Option(help: "Shard UUID; requires --source-store.") var shard: String?
     @Option(help: "Source store name/UUID for the shard reference.") var sourceStore: String?
@@ -22,11 +21,10 @@ struct HistoricalTagOptions: ParsableArguments {
     @Option(help: "Advance start by this many actual frames; never crosses a recording gap or clock discontinuity.") var fromFrame: Int = 0
     @Option(help: "Advance end by this many actual frames.") var toFrame: Int = 0
     @Option(help: "Zero-based start:end frame range within --file or --shard; end is exclusive.") var frames: String?
-    @Flag(help: "Select the entire finalized file/shard.") var allFrames = false
-    @Flag(help: "Validate and report revisions without changing anything.") var dryRun = false
-    @Option(help: "Optional expected revision; valid only when editing one selected shard in one store.") var expectedRevision: String?
+    @Flag(help: "Select all currently recorded frames in the source file/shard.") var allFrames = false
+    @Flag(help: "Validate and report footage ranges without changing anything.") var dryRun = false
     @Option(help: "Optional job UUID for safe retries within this daemon session.") var jobID: String?
-    @Flag(help: "Prompt for temporary GetObject credentials if exact remote frame addressing needs them. Never saved.") var readCredentials = false
+    @Flag(help: "Prompt for temporary GetObject credentials for remote frames or overlapping-boundary verification. Never saved.") var readCredentials = false
     @Flag(help: "Prompt for the original metadata/media encryption password. Never saved.") var encryptionPassword = false
 
     func selection(_ connection: CameraConnection, stores: [RecordingStoreConfiguration]) throws -> HistoricalTagRequest.Selection {
@@ -49,19 +47,10 @@ struct HistoricalTagOptions: ParsableArguments {
     }
     func execute(key: String, value: String?, inspect: Bool = false) throws {
         let connection = try CameraConnection(runtimeDir: runtimeDir), stores = try StoreUI.list(connection)
-        let ids = try store.isEmpty ? [HistoricalTagCLI.store(nil, stores: stores).id] : store.map { try HistoricalTagCLI.store($0, stores: stores).id }
         let selection = try selection(connection, stores: stores)
-        var request = HistoricalTagRequest(jobID: jobID ?? UUID().uuidString, storeIDs: ids,
+        let request = HistoricalTagRequest(jobID: jobID ?? UUID().uuidString,
             edits: [.init(selection: selection, key: key, value: value)], dryRun: dryRun, inspect: inspect)
         let secrets = try HistoricalTagCLI.secrets(read: readCredentials, encryption: encryptionPassword)
-        if let expectedRevision {
-            // Resolve a file's identity with read-only inspection, never by its name.
-            let probe = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: ids, edits: request.edits, inspect: true)
-            let data = try HistoricalTagCLI.run(probe, connection: connection, credentials: secrets.0, password: secrets.1, printResult: false)
-            let values = try JSONDecoder().decode([HistoricalTagInspection].self, from: data ?? Data())
-            guard values.count == 1, let item = values.first else { throw ServiceError("--expected-revision requires exactly one shard; use batch JSON for per-shard revisions.") }
-            request.expectedRevisions = [item.storeID + "/" + item.shardID: expectedRevision]
-        }
         _ = try HistoricalTagCLI.run(request, connection: connection, credentials: secrets.0, password: secrets.1)
     }
 }
@@ -79,12 +68,12 @@ struct MediaTagRemove: ParsableCommand {
     func run() throws { try command { try options.execute(key: key, value: nil) } }
 }
 struct MediaTagInspect: ParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "inspect", abstract: "Print shard identities, revisions, timing, and authoritative tag timelines as JSON.")
+    static let configuration = CommandConfiguration(commandName: "inspect", abstract: "Print footage time ranges and their authoritative tag state as JSON.")
     @OptionGroup var options: HistoricalTagOptions
     func run() throws { try command { try options.execute(key: "", value: nil, inspect: true) } }
 }
 struct MediaTagApply: ParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "apply", abstract: "Apply a bounded HistoricalTagRequest JSON batch from a file or stdin (-). Store/camera references in JSON are UUIDs.")
+    static let configuration = CommandConfiguration(commandName: "apply", abstract: "Apply a bounded HistoricalTagRequest JSON batch from a file or stdin (-). Camera and optional source references in JSON are UUIDs.")
     @Argument var input: String = "-"
     @Option var runtimeDir: String?
     @Flag var dryRun = false

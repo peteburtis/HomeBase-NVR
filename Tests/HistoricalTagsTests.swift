@@ -47,9 +47,9 @@ final class HistoricalTagsTests: XCTestCase {
         XCTAssertThrowsError(try frozen.thaw(password: nil))
     }
     func testJSONDefaultsValidationAndNoOverflowOnBadInput() throws {
-        let job = UUID().uuidString, store = UUID().uuidString, camera = UUID().uuidString
+        let job = UUID().uuidString, camera = UUID().uuidString
         let json = """
-        {"jobID":"\(job)","storeIDs":["\(store)"],"edits":[{"selection":{"cameraID":"\(camera)","start":{"timestamp":100},"end":{"timestamp":110}},"key":"test"}]}
+        {"jobID":"\(job)","edits":[{"selection":{"cameraID":"\(camera)","start":{"timestamp":100},"end":{"timestamp":110}},"key":"test"}]}
         """
         let request = try JSONDecoder().decode(HistoricalTagRequest.self, from: Data(json.utf8))
         try request.validate()
@@ -58,11 +58,21 @@ final class HistoricalTagsTests: XCTestCase {
         XCTAssertEqual(request.edits[0].selection.start?.frameOffset, 0)
         XCTAssertNil(request.edits[0].value)
         var bad = request.edits[0].selection; bad.start = .init(timestamp: .infinity)
-        XCTAssertThrowsError(try HistoricalTagRequest(jobID: job, storeIDs: [store], edits: [.init(selection: bad, key: "x")]).validate())
+        XCTAssertThrowsError(try HistoricalTagRequest(jobID: job, edits: [.init(selection: bad, key: "x")]).validate())
         bad = .init(file: "/managed/file.mp4")
-        XCTAssertThrowsError(try HistoricalTagRequest(jobID: job, storeIDs: [store], edits: [.init(selection: bad, key: "x")]).validate())
+        XCTAssertThrowsError(try HistoricalTagRequest(jobID: job, edits: [.init(selection: bad, key: "x")]).validate())
         XCTAssertThrowsError(try HistoricalTags.frameBoundary(Int.max, ticks: [0, 100], end: 200))
         XCTAssertEqual(try HistoricalTags.ticks(1_790_000_000 + 12000.0 / 90000, anchor: 1_790_000_000, timescale: 90000, end: 90000), 12000)
+        let fields = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        for (name, value) in [("storeIDs", [UUID().uuidString] as Any), ("expectedRevisions", ["internal": "revision"] as Any)] {
+            var invalid = fields; invalid[name] = value
+            XCTAssertThrowsError(try JSONDecoder().decode(HistoricalTagRequest.self, from: JSONSerialization.data(withJSONObject: invalid)), name)
+        }
+        var internalRequest = request
+        internalRequest.expectedRevisions = ["internal": "revision"]
+        let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(internalRequest)) as? [String: Any])
+        XCTAssertNil(encoded["storeIDs"])
+        XCTAssertNil(encoded["expectedRevisions"])
     }
 
     struct Fixture {
@@ -80,7 +90,8 @@ final class HistoricalTagsTests: XCTestCase {
             return (directory, try LocalRecordingManifest(directory: directory, identity: .init(storeID: config.id, cameraID: camera), owner: geteuid(), readOnly: true))
         }
     }
-    func fixture(stores: Int = 1, codec: CMVideoCodecType = kCMVideoCodecType_H264) throws -> Fixture {
+    func fixture(stores: Int = 1, codec: CMVideoCodecType = kCMVideoCodecType_H264,
+                 firstStoreGap: Range<Int>? = nil) throws -> Fixture {
         let root = "/private/tmp/hbnvr-history-tags-" + UUID().uuidString
         try SecureFiles.ensureDirectory(root, owner: geteuid(), mode: 0o700)
         let configs = try (0..<stores).map { try StoreTests().config(root + "/store\($0)") }
@@ -88,13 +99,20 @@ final class HistoricalTagsTests: XCTestCase {
         for config in configs { try manager.install(config) }
         let camera = UUID().uuidString, start = Date().timeIntervalSince1970 - 3600
         var timeline = RecordingTimeline(), samples: [EncodedMedia] = []
-        for original in try StoreTests.video(codec: codec) {
+        for (frame, original) in try StoreTests.video(codec: codec).enumerated() {
             let elapsed = Double(original.frame.timestamp) / Double(original.clockRate)
             var sample = EncodedMedia(codec: original.codec, clockRate: original.clockRate, parameterSets: original.parameterSets, frame: original.frame,
                 receivedAt: Date(timeIntervalSince1970: start + elapsed), receivedUptime: 100 + elapsed,
                 cameraUTC: start - 1 + elapsed, ssrc: 42, tags: ["original": "yes"])
             sample.time = try timeline.observe(sample); samples.append(sample)
-            manager.accept(.media(camera: camera, name: "Camera", sample))
+            if let firstStoreGap {
+                for (number, config) in configs.enumerated() {
+                    let store = try manager.historicalLocal(config.id)
+                    if number == 0, firstStoreGap.contains(frame) {
+                        if frame == firstStoreGap.lowerBound { store.accept(.end(camera: camera)) }
+                    } else { store.accept(.media(camera: camera, name: "Camera", sample)) }
+                }
+            } else { manager.accept(.media(camera: camera, name: "Camera", sample)) }
         }
         manager.accept(.end(camera: camera)); try manager.drain(timeout: 30)
         addTeardownBlock { _ = manager.stop(); try? FileManager.default.removeItem(atPath: root) }
@@ -111,7 +129,7 @@ final class HistoricalTagsTests: XCTestCase {
             acl_free(UnsafeMutableRawPointer(acl))
             let oldTags = try XCTUnwrap(db.historicalTags(id: row.id)), prefix = old.dropLast(try VideoTagMP4.box(oldTags).count)
             let selection = HistoricalTagRequest.Selection(file: path, startFrame: 3, endFrame: 9)
-            let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [f.configs[0].id], edits: [.init(selection: selection, key: "recognized", value: "alice")])
+            let request = HistoricalTagRequest(jobID: UUID().uuidString, edits: [.init(selection: selection, key: "recognized", value: "alice")])
             let (result, _) = try await f.engine().run(request) { _ in }
             XCTAssertEqual(result.state, "completed"); XCTAssertEqual(result.results.first?.publication, "local-complete")
             let new = try Data(contentsOf: URL(fileURLWithPath: path)), tags = try XCTUnwrap(VideoTagMP4.read(new))
@@ -136,7 +154,7 @@ final class HistoricalTagsTests: XCTestCase {
             XCTAssertEqual(try LocalMediaReader.frameTicks(source, work: MediaWork()).count, f.samples.count)
         }
     }
-    func testTimestampFrameOffsetsAllTimeBasesAndExplicitCrossStoreMapping() async throws {
+    func testTimestampAndFileFrameSelectionsUpdateAllCopiesAcrossTimeBases() async throws {
         let f = try fixture(stores: 2), (dir, db) = try f.index(), row = try XCTUnwrap(db.recordings().first)
         let (_, other) = try f.index(1), otherRow = try XCTUnwrap(other.recordings().first)
         XCTAssertNotEqual(row.id, otherRow.id)
@@ -144,7 +162,7 @@ final class HistoricalTagsTests: XCTestCase {
             let start = try XCTUnwrap(basis.anchor(row.timing.time))
             let selection = HistoricalTagRequest.Selection(cameraID: f.camera, timeline: basis,
                 start: .init(timestamp: start, frameOffset: 2), end: .init(timestamp: start, frameOffset: 5))
-            let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: f.configs.map(\.id),
+            let request = HistoricalTagRequest(jobID: UUID().uuidString,
                 edits: [.init(selection: selection, key: basis.rawValue, value: "set")])
             let (result, _) = try await f.engine().run(request) { _ in }
             XCTAssertEqual(result.results.count, 2)
@@ -156,26 +174,128 @@ final class HistoricalTagsTests: XCTestCase {
             }
         }
         let selection = HistoricalTagRequest.Selection(file: dir.path + "/" + row.filename, startFrame: 10, endFrame: 15)
-        let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [f.configs[1].id], edits: [.init(selection: selection, key: "cross", value: "yes")])
+        let request = HistoricalTagRequest(jobID: UUID().uuidString, edits: [.init(selection: selection, key: "cross", value: "yes")])
         _ = try await f.engine().run(request) { _ in }
-        XCTAssertNil(try db.historicalTags(id: row.id)?.tags(at: 60000)?["cross"])
+        XCTAssertEqual(try db.historicalTags(id: row.id)?.tags(at: 60000)?["cross"], "yes")
         XCTAssertEqual(try other.historicalTags(id: otherRow.id)?.tags(at: 60000)?["cross"], "yes")
+    }
+    func testNonTickAlignedTimestampEditAndInspectionCoverTheRequestedRange() async throws {
+        let f = try fixture(), (_, index) = try f.index(), row = try XCTUnwrap(index.recordings().first)
+        let start = row.start + 0.123456, end = row.start + 0.223456
+        let selection = HistoricalTagRequest.Selection(cameraID: f.camera,
+            start: .init(timestamp: start), end: .init(timestamp: end))
+        let (status, _) = try await f.engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: selection, key: "fractional", value: "yes")])) { _ in }
+        XCTAssertTrue(status.gaps.isEmpty)
+        let tags = try XCTUnwrap(index.historicalTags(id: row.id))
+        let first = try HistoricalTags.ticks(start, anchor: row.start, timescale: 90000, end: row.endTicks)
+        let last = try HistoricalTags.ticks(end, anchor: row.start, timescale: 90000, end: row.endTicks)
+        XCTAssertNil(tags.tags(at: first - 1)?["fractional"])
+        XCTAssertEqual(tags.tags(at: first)?["fractional"], "yes")
+        XCTAssertEqual(tags.tags(at: last - 1)?["fractional"], "yes")
+        XCTAssertNil(tags.tags(at: last)?["fractional"])
+        let (_, data) = try await f.engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: selection, key: "")], inspect: true)) { _ in }
+        let spans = try JSONDecoder().decode([FootageTagInspection].self, from: XCTUnwrap(data))
+        XCTAssertEqual(spans.count, 1, String(describing: spans))
+        XCTAssertEqual(try XCTUnwrap(spans.first).start, start, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(spans.first).end, end, accuracy: 0.000001)
+        XCTAssertEqual(spans.first?.tags.values["fractional"], "yes")
+    }
+    func testFrameOffsetCanUseAnotherCopyWhenFirstCopyHasAGap() async throws {
+        let f = try fixture(stores: 2, firstStoreGap: 15..<30)
+        let (_, partial) = try f.index(), (_, complete) = try f.index(1)
+        let partialRows = try partial.recordings(), full = try XCTUnwrap(complete.recordings().first)
+        XCTAssertEqual(partialRows.count, 2)
+        XCTAssertLessThan(partialRows[0].end, partialRows[1].start)
+        let selection = HistoricalTagRequest.Selection(cameraID: f.camera,
+            start: .init(timestamp: full.start, frameOffset: 2), end: .init(timestamp: full.start, frameOffset: 20))
+        let (status, _) = try await f.engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: selection, key: "across-gap", value: "yes")])) { _ in }
+        XCTAssertTrue(status.gaps.isEmpty, "The second copy contains the selected footage")
+        let fullTags = try XCTUnwrap(complete.historicalTags(id: full.id))
+        XCTAssertNil(fullTags.tags(at: 6000)?["across-gap"])
+        XCTAssertEqual(fullTags.tags(at: 12000)?["across-gap"], "yes")
+        XCTAssertEqual(fullTags.tags(at: 114000)?["across-gap"], "yes")
+        XCTAssertNil(fullTags.tags(at: 120000)?["across-gap"])
+        let retained = try XCTUnwrap(partial.historicalTags(id: partialRows[0].id))
+        XCTAssertEqual(retained.tags(at: 12000)?["across-gap"], "yes")
+        XCTAssertEqual(retained.tags(at: 84000)?["across-gap"], "yes")
+        XCTAssertNil(try partial.historicalTags(id: partialRows[1].id)?.tags(at: 0)?["across-gap"])
     }
     func testDryRunRevisionConflictAndInvalidBatchNeverChangeFile() async throws {
         let f = try fixture(), (dir, db) = try f.index(), row = try XCTUnwrap(db.recordings().first)
         let path = dir.path + "/" + row.filename, bytes = try Data(contentsOf: URL(fileURLWithPath: path))
         let selection = HistoricalTagRequest.Selection(file: path, allFrames: true)
-        var request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [f.configs[0].id], edits: [.init(selection: selection, key: "x", value: "y")], dryRun: true)
+        var request = HistoricalTagRequest(jobID: UUID().uuidString, edits: [.init(selection: selection, key: "x", value: "y")], dryRun: true)
         let (preview, _) = try await f.engine().run(request) { _ in }
         XCTAssertEqual(preview.results.first?.changed, true)
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
         request.dryRun = false; request.expectedRevisions = [f.configs[0].id + "/" + row.id: "stale"]
         do { _ = try await f.engine().run(request) { _ in }; XCTFail("Expected conflict") } catch {}
         let bad = HistoricalTagRequest.Selection(file: path, startFrame: 0, endFrame: 1_000_000)
-        let batch = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [f.configs[0].id], edits: request.edits + [.init(selection: bad, key: "x", value: "z")])
+        let batch = HistoricalTagRequest(jobID: UUID().uuidString, edits: request.edits + [.init(selection: bad, key: "x", value: "z")])
         do { _ = try await f.engine().run(batch) { _ in }; XCTFail("Expected invalid frame") } catch {}
         XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
         XCTAssertEqual(try db.recordings().first?.inode, row.inode)
+    }
+    func testInspectionMergesCopiesAndAnEmptyDestinationDoesNotPreventEditing() async throws {
+        let f = try fixture(stores: 2), (_, index) = try f.index(), row = try XCTUnwrap(index.recordings().first)
+        let empty = try StoreTests().config(f.root + "/empty")
+        try f.manager.install(empty)
+        func engine() -> HistoricalTagEngine {
+            .init(configs: f.configs + [empty], manager: f.manager,
+                factory: { _, _ in throw ServiceError("Unexpected network access") },
+                credentials: nil, password: nil, cancellation: Cancellation())
+        }
+        let selection = HistoricalTagRequest.Selection(cameraID: f.camera,
+            start: .init(timestamp: row.start), end: .init(timestamp: row.end))
+        let (edited, _) = try await engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: selection, key: "footage", value: "yes")])) { _ in }
+        XCTAssertEqual(edited.results.count, 2)
+        XCTAssertTrue(edited.gaps.isEmpty)
+        let publicStatus = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(edited)) as? [String: Any])
+        let publicResults = try XCTUnwrap(publicStatus["results"] as? [[String: Any]])
+        XCTAssertEqual(publicResults.count, 1, "Acknowledgments do not duplicate coverage for stored copies")
+        XCTAssertTrue(publicResults.allSatisfy { $0["storeID"] == nil && $0["shardID"] == nil })
+        let (_, data) = try await engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: selection, key: "")], inspect: true)) { _ in }
+        let spans = try JSONDecoder().decode([FootageTagInspection].self, from: XCTUnwrap(data))
+        XCTAssertEqual(spans.count, 1, "Copies of the same footage are one logical tag span")
+        XCTAssertEqual(spans.first?.tags.values["footage"], "yes")
+        XCTAssertEqual(try XCTUnwrap(spans.first).start, row.start, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(spans.first).end, row.end, accuracy: 0.000001)
+    }
+    func testConflictingCopyTagsAreUnknownUntilFootageEditReconcilesThem() async throws {
+        let f = try fixture(stores: 2), (directory, index) = try f.index(1)
+        let row = try XCTUnwrap(index.recordings().first)
+        let original = try XCTUnwrap(index.historicalTags(id: row.id))
+        var divergent = original
+        try divergent.apply(.init(start: 0, end: row.endTicks, key: "private", value: "true"))
+        let source = LocalMediaProvider.Source(directory: directory, owner: geteuid(), row: row,
+            range: .init(start: row.start, end: row.end))
+        let pending = try LocalTagFile.stage(source: source, tags: divergent, jobID: UUID().uuidString, work: MediaWork())
+        try f.manager.historicalLocal(f.configs[1].id).commitHistorical(directory: directory,
+            edits: [pending], revisions: [row.id: HistoricalTags.revision(original)])
+        let selection = HistoricalTagRequest.Selection(cameraID: f.camera,
+            start: .init(timestamp: row.start), end: .init(timestamp: row.end))
+        func inspection() async throws -> [FootageTagInspection] {
+            let (_, data) = try await f.engine().run(.init(jobID: UUID().uuidString,
+                edits: [.init(selection: selection, key: "")], inspect: true)) { _ in }
+            return try JSONDecoder().decode([FootageTagInspection].self, from: XCTUnwrap(data))
+        }
+        let before = try await inspection()
+        XCTAssertEqual(before.count, 1)
+        XCTAssertEqual(before.first?.tags.values["original"], "yes")
+        XCTAssertNil(before.first?.tags.values["private"])
+        XCTAssertFalse(try XCTUnwrap(before.first).tags.knownAbsent.contains("private"))
+        XCTAssertFalse(try XCTUnwrap(before.first).tags.complete)
+        _ = try await f.engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: selection, key: "private", value: "true")])) { _ in }
+        let after = try await inspection()
+        XCTAssertEqual(after.count, 1)
+        XCTAssertEqual(after.first?.tags.values["private"], "true")
+        XCTAssertTrue(try XCTUnwrap(after.first).tags.complete)
     }
     func testFrameLookaheadDoesNotRejectAnUnrelatedActiveShard() async throws {
         let f = try fixture(), (_, db) = try f.index(), row = try XCTUnwrap(db.recordings().first)
@@ -190,15 +310,31 @@ final class HistoricalTagsTests: XCTestCase {
         XCTAssertTrue(try db.recordings().contains { $0.state == .recording })
         let selection = HistoricalTagRequest.Selection(cameraID: f.camera,
             start: .init(timestamp: row.start, frameOffset: 2), end: .init(timestamp: row.start, frameOffset: 5))
-        let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [f.configs[0].id], edits: [.init(selection: selection, key: "x", value: "y")])
+        let request = HistoricalTagRequest(jobID: UUID().uuidString, edits: [.init(selection: selection, key: "x", value: "y")])
         let (result, _) = try await f.engine().run(request) { _ in }
         XCTAssertEqual(result.state, "completed")
         XCTAssertTrue(try db.recordings().contains { $0.state == .recording })
-        let bad = HistoricalTagRequest.Selection(cameraID: f.camera, start: .init(timestamp: later.canonicalUTC), end: .init(timestamp: later.canonicalUTC + 1))
-        do {
-            _ = try await f.engine().run(.init(jobID: UUID().uuidString, storeIDs: [f.configs[0].id], edits: [.init(selection: bad, key: "bad", value: "y")])) { _ in }
-            XCTFail("Active media was editable")
-        } catch {}
+        let current = HistoricalTagRequest.Selection(cameraID: f.camera,
+            start: .init(timestamp: later.canonicalUTC), end: .init(timestamp: later.canonicalUTC + 1))
+        let (edited, _) = try await f.engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: current, key: "current", value: "yes")])) { _ in }
+        XCTAssertEqual(edited.state, "completed")
+        let pending = try XCTUnwrap(db.recordings().first { $0.state == .recording })
+        XCTAssertEqual(try db.historicalTags(id: pending.id)?.tags(at: 0)?["current"], "yes")
+        XCTAssertEqual(edited.gaps.count, 1)
+        XCTAssertEqual(try XCTUnwrap(edited.gaps.first).start, later.canonicalUTC + 1.0 / 90000, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(edited.gaps.first).end, later.canonicalUTC + 1, accuracy: 0.000001)
+        let (_, inspectionData) = try await f.engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: current, key: "")], inspect: true)) { _ in }
+        let spans = try JSONDecoder().decode([FootageTagInspection].self, from: XCTUnwrap(inspectionData))
+        XCTAssertEqual(spans.count, 1)
+        XCTAssertEqual(spans.first?.tags.values["current"], "yes")
+        XCTAssertEqual(try XCTUnwrap(spans.first).end, later.canonicalUTC + 1.0 / 90000, accuracy: 0.000001)
+        let frameSelection = HistoricalTagRequest.Selection(shardID: pending.id, sourceStoreID: f.configs[0].id,
+            startFrame: 0, endFrame: 1)
+        _ = try await f.engine().run(.init(jobID: UUID().uuidString,
+            edits: [.init(selection: frameSelection, key: "frame-offset", value: "yes")])) { _ in }
+        XCTAssertEqual(try db.historicalTags(id: pending.id)?.tags(at: 0)?["frame-offset"], "yes")
     }
     func testLocalRecoveryOnBothSidesOfRename() throws {
         for alreadyRenamed in [false, true] {
@@ -259,7 +395,7 @@ final class HistoricalTagsTests: XCTestCase {
         let metadata = S3PlaybackManifestTests().shard(config, camera: camera, at: Date().timeIntervalSince1970 - 120)
         _ = try await sink.merge(metadata, Cancellation())
         let start = metadata.timing!.time.canonicalUTC
-        let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [config.id], edits: [.init(selection: .init(cameraID: camera,
+        let request = HistoricalTagRequest(jobID: UUID().uuidString, edits: [.init(selection: .init(cameraID: camera,
             start: .init(timestamp: start + 5), end: .init(timestamp: start + 10)), key: "person", value: "yes")])
         let engine = HistoricalTagEngine(configs: [config], manager: manager, factory: { _, _ in XCTFail("Unexpected media read"); throw ServiceError("Unexpected read") }, credentials: nil, password: nil, cancellation: Cancellation())
         let (result, _) = try await engine.run(request) { _ in }
@@ -292,7 +428,7 @@ final class HistoricalTagsTests: XCTestCase {
     func testMissingPathAndOversizedEditDoNotChangeManagedFootage() async throws {
         let f = try fixture(), (_, db) = try f.index(), row = try XCTUnwrap(db.recordings().first)
         let selection = HistoricalTagRequest.Selection(file: "/etc/passwd", allFrames: true)
-        let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [f.configs[0].id], edits: [.init(selection: selection, key: "x", value: "y")])
+        let request = HistoricalTagRequest(jobID: UUID().uuidString, edits: [.init(selection: selection, key: "x", value: "y")])
         do { _ = try await f.engine().run(request) { _ in }; XCTFail("Arbitrary path accepted") } catch {}
         var tags = VideoTagTimeline(changes: [.init(ticks: 0, frame: 0, tags: [:])])
         for i in 0..<32 { try tags.apply(.init(start: 0, end: 100, key: "k\(i)", value: "v")) }
@@ -322,7 +458,7 @@ final class HistoricalTagsTests: XCTestCase {
         let sink = try manager.repairSink(config: config, cameras: [camera], cameraStillExists: { _ in true })
         _ = try await sink.merge(metadata, Cancellation())
         let selection = HistoricalTagRequest.Selection(shardID: timing.shardID, sourceStoreID: config.id, startFrame: 2, endFrame: 5)
-        let request = HistoricalTagRequest(jobID: UUID().uuidString, storeIDs: [config.id], edits: [.init(selection: selection, key: "person", value: "alice")])
+        let request = HistoricalTagRequest(jobID: UUID().uuidString, edits: [.init(selection: selection, key: "person", value: "alice")])
         let engine = HistoricalTagEngine(configs: [config], manager: manager, factory: { _, _ in reader }, credentials: nil, password: nil, cancellation: Cancellation())
         _ = try await engine.run(request) { _ in }
         let shard = try XCTUnwrap(manager.historicalS3(config.id).historicalShards().first)

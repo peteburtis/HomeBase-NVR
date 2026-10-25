@@ -1,5 +1,18 @@
 # HomeBase-NVR / hbnvr
 
+Version **0.24.0**: footage tag edits now apply to every matching Local and S3 copy through one
+source/time-range request. Destination store selection is removed. Active
+recordings, queued uploads, and confirmed recordings accept the same API; the
+NVR handles their boundaries internally. File/shard and actual-frame offset
+selectors remain conveniences for locating footage. Inspection returns normalized
+time spans rather than storage identities. See [footage tags](HISTORICAL-TAGS.md).
+
+Version **0.23.1**: historical inspection and tag edits recognize verified estimated-tail
+overlap between adjacent same-epoch shards, while still rejecting ambiguous
+samples and clocks. New local/S3 shards finalize at the actual next keyframe
+boundary with forward sample durations. Existing footage needs no migration;
+see [boundary semantics](HISTORICAL-TAGS.md#frame-and-time-semantics).
+
 Version **0.23.0** includes the selected keyframe's opaque tags in local thumbnail
 responses across finalized recordings, growing files, and RAM, including historical
 edits and exact sample boundaries. HBNVR does not interpret tags or hide video.
@@ -19,11 +32,12 @@ snapshot the writer's tags without waiting for SQLite checkpoints or copying vid
 See [segment tags](MEDIA-PROTOCOL.md#segment-tag-maps-0220). Existing clients are unchanged.
 
 Version 0.21.0 adds historical `media tag set/remove/inspect/apply/status` over
-authenticated IPC. Address finalized footage by managed file/shard and frames,
+authenticated IPC. The current API addresses footage by managed source file/shard and frames,
 or canonical/camera/received timestamps with optional actual-frame offsets.
-Local edits safely replace MP4 metadata and the index; S3 edits update only
-manifests, never video/JPEG objects. Batches, dry runs, revision checks, bounded
-background work, and recovery are described in [historical tags](HISTORICAL-TAGS.md).
+Local edits update active writers or safely replace finalized MP4 metadata and
+the index. S3 edits update active/pending metadata or confirmed manifests while
+finalized video/JPEG objects remain unchanged. Batches, dry runs, bounded work,
+and recovery are described in [footage tags](HISTORICAL-TAGS.md).
 Live tags and Homebase/GUI behavior are unchanged by historical edits.
 
 Version 0.20.0 adds opaque, prospective per-camera string tags. Set/remove

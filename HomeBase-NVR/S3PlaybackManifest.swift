@@ -181,7 +181,8 @@ final class S3PlaybackPublisher: @unchecked Sendable {
             if !loaded { try load() }
             try recoverTagEdits()
             let shard = S3PlaybackShard(id: metadata.id, key: metadata.key, size: metadata.size,
-                sha256: metadata.sha256, encryption: metadata.encryption, timing: timing, endTicks: endTicks, tagMetadata: metadata.tagMetadata)
+                sha256: metadata.sha256, encryption: metadata.encryption, timing: timing, endTicks: endTicks,
+                tagMetadata: metadata.tagMetadata, tagRevision: metadata.tagRevision)
             try shard.validate(store: configuration)
             if let existing = entries[shard.id] {
                 // A replayed original upload must never roll historical edits back.

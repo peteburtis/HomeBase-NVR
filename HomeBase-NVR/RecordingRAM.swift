@@ -181,6 +181,11 @@ final class RecordingRAMTail: @unchecked Sendable {
     func append(block: CMBlockBuffer, pts: Int64, duration: Int64, key: Bool, tags: VideoTagTimeline? = nil) {
         cache.append(self, block: block, pts: pts, duration: duration, key: key, tags: tags)
     }
+    func updateTags(_ tags: VideoTagTimeline) {
+        cache.lock.lock(); defer { cache.lock.unlock() }
+        guard !closed else { return }
+        self.tags = tags
+    }
     func attach(_ file: GrowingMediaFile) { cache.lock.lock(); self.file = file; cache.lock.unlock() }
     fileprivate func inspectDisk() {
         cache.lock.lock(); let file = closed || frames.isEmpty ? nil : self.file, previous = lastPrefix; cache.lock.unlock()

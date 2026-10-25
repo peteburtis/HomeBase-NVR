@@ -1238,6 +1238,93 @@ class Integration(unittest.TestCase):
                 self.assertEqual(process.wait(timeout=3), 0)
                 self.assertEqual(frames.readline(), b"")
 
+    def assert_footage_tags(self, spans, camera_id, key, value):
+        self.assertTrue(spans, "No footage coverage returned")
+        for span in spans:
+            self.assertEqual(set(span), {"cameraID", "timeline", "epochID", "start", "end", "tags"})
+            self.assertEqual(span["cameraID"], camera_id)
+            self.assertEqual(span["timeline"], "canonical")
+            self.assertLess(span["start"], span["end"])
+            self.assertEqual(set(span["tags"]), {"values", "knownAbsent", "complete"})
+            if value is None:
+                self.assertNotIn(key, span["tags"]["values"])
+                self.assertTrue(span["tags"]["complete"] or key in span["tags"]["knownAbsent"])
+            else:
+                self.assertEqual(span["tags"]["values"].get(key), value)
+
+    def test_footage_time_edit_updates_active_local_and_s3_copies_through_restart(self):
+        directory, s3_id, config_path = self.seed_s3_controls()
+        config = json.loads(config_path.read_text())
+        config["SchemaVersion"] = 4
+        config["Enabled"] = True
+        # Existing fixture uses dummy credentials and External lifecycle. Force
+        # spooling also pauses manifest publication, so no AWS calls are made.
+        spool = self.root / "tag-spool"
+        spool.mkdir(mode=0o700)
+        config["S3"]["Advanced"] = dict(ForceSpooling=True, SpoolDirectory=str(spool))
+        config_path.write_text(json.dumps(config)); config_path.chmod(0o600)
+        _, process = self.agent()
+        cloud = self.await_store(directory, lambda status: "s3" in status or status.get("state") == "error")
+        self.assertIn("s3", cloud, cloud)
+        self.assertTrue(cloud["s3"]["spooling"], cloud)
+        self.assertIn("manual", cloud["s3"]["reasons"])
+        self.assertEqual(cloud["s3"]["spoolDirectory"], str(spool.resolve()))
+        output = self.root / "active-tag-local"
+        added = self.cli("store", "add", "--runtime-dir", directory,
+                         input=f"1\nActive tags\n{output}\n1m\n1w\nyes\nyes\n")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        local_id = next(store["ID"] for store in self.camera_request(directory, "stores.list")["stores"]
+                        if store["Type"] == "Local")
+        server = self.rtsp_fixture(); server.tag_live_fixture = True
+        camera_id = self.add_stream(directory, server, "Active footage tags")
+        self.await_streams(directory, lambda streams: streams and streams[0]["frames"] >= 20)
+        connections = server.connections
+        args = ("--runtime-dir", directory, "--camera", camera_id, "--timeline", "canonical")
+        inspected = self.cli("media", "tag", "inspect", *args, "--from", time.time()-30, "--to", time.time())
+        self.assertEqual(inspected.returncode, 0, inspected.stderr)
+        coverage = json.loads(inspected.stdout)
+        self.assert_footage_tags(coverage, camera_id, "person.alice", None)
+        start, end, epoch = coverage[0]["start"], coverage[-1]["end"], coverage[0]["epochID"]
+        self.assertTrue(all(span["epochID"] == epoch for span in coverage))
+        args += ("--from", start, "--to", end, "--epoch", epoch)
+        self.assertFalse(list(output.rglob("*.mp4")), "Fixture should still be recording")
+        self.assertTrue(list(output.rglob("*.mp4.recording")))
+        batch = dict(jobID=str(uuid.uuid4()).upper(), edits=[dict(selection=dict(cameraID=camera_id,
+            timeline="canonical", epochID=epoch, start=dict(timestamp=start), end=dict(timestamp=end)),
+            key="person.alice", value="present")])
+        changed = self.cli("media", "tag", "apply", "-", "--runtime-dir", directory, input=json.dumps(batch))
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        status = json.loads(changed.stdout)
+        self.assertEqual(status["state"], "completed"); self.assertFalse(status["gaps"])
+        self.assertTrue(status["results"])
+        for item in status["results"]:
+            self.assertEqual(set(item), {"cameraID", "timeline", "epochID", "start", "end", "changed"})
+        readback = self.cli("media", "tag", "inspect", *args)
+        self.assertEqual(readback.returncode, 0, readback.stderr)
+        self.assert_footage_tags(json.loads(readback.stdout), camera_id, "person.alice", "present")
+        self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {})
+        self.assertEqual(server.connections, connections)
+        self.assertEqual(self.cli("camera", "stop", camera_id, "--runtime-dir", directory).returncode, 0)
+        self.assertTrue(list(output.rglob("*.mp4")))
+        finalized = self.cli("media", "tag", "inspect", *args)
+        self.assertEqual(finalized.returncode, 0, finalized.stderr)
+        self.assert_footage_tags(json.loads(finalized.stdout), camera_id, "person.alice", "present")
+        # Remove only the Local configuration so the subsequent public query
+        # must resolve the S3 pending copy, rather than being satisfied locally.
+        removed = self.cli("store", "remove", local_id, "--runtime-dir", directory, input="yes\n")
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        process.terminate(); self.assertEqual(process.wait(timeout=8), 0)
+        self.agent()
+        restored = self.cli("media", "tag", "inspect", *args)
+        self.assertEqual(restored.returncode, 0, restored.stderr)
+        self.assert_footage_tags(json.loads(restored.stdout), camera_id, "person.alice", "present")
+        removed_tag = self.cli("media", "tag", "remove", *args, "--key", "person.alice")
+        self.assertEqual(removed_tag.returncode, 0, removed_tag.stderr)
+        cleared = self.cli("media", "tag", "inspect", *args)
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assert_footage_tags(json.loads(cleared.stdout), camera_id, "person.alice", None)
+        self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {})
+
     def test_historical_tag_cli_ipc_batch_and_restart_leave_live_tags_alone(self):
         directory, process = self.agent()
         output = self.root / "tagged-history"
@@ -1252,13 +1339,14 @@ class Integration(unittest.TestCase):
         files = list(output.rglob("*.mp4"))
         self.assertEqual(len(files), 1)
         path = files[0].resolve()
-        args = ("--runtime-dir", directory, "--store", store_id, "--file", path, "--all-frames")
+        args = ("--runtime-dir", directory, "--file", path, "--all-frames")
         inspected = self.cli("media", "tag", "inspect", *args)
         self.assertEqual(inspected.returncode, 0, inspected.stderr)
-        original = json.loads(inspected.stdout)[0]
+        original = json.loads(inspected.stdout)
+        self.assert_footage_tags(original, camera_id, "person.alice", None)
         def playback_tags(expected):
-            start = original["timing"]["time"]["canonicalUTC"]
-            end = start + original["endTicks"] / original["timing"]["timescale"]
+            start = original[0]["start"]
+            end = original[-1]["end"]
             with self.media_open(directory) as client:
                 self.media_send(client, dict(requestID="tagged-history", operation="frames", cameraID=camera_id,
                                             range=dict(start=start, end=end), includeTags=True))
@@ -1305,19 +1393,30 @@ class Integration(unittest.TestCase):
         preview = self.cli("media", "tag", "set", *args, "--key", "person.alice", "--value", "present", "--dry-run")
         self.assertEqual(preview.returncode, 0, preview.stderr)
         self.assertEqual(path.read_bytes(), snapshot)
-        result = self.cli("media", "tag", "set", *args, "--key", "person.alice", "--value", "present",
-                          "--expected-revision", original["revision"])
+        result = self.cli("media", "tag", "set", *args, "--key", "person.alice", "--value", "present")
         self.assertEqual(result.returncode, 0, result.stderr)
         status = json.loads(result.stdout)
-        self.assertEqual(status["results"][0]["publication"], "local-complete")
+        self.assertEqual(status["state"], "completed")
+        self.assertFalse(status["gaps"])
+        self.assertTrue(any(item["changed"] for item in status["results"]))
+        for item in status["results"]:
+            self.assertEqual(set(item), {"cameraID", "timeline", "epochID", "start", "end", "changed"})
+            self.assertEqual(item["cameraID"], camera_id)
         playback_tags("present")
         self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {})
-        stale = self.cli("media", "tag", "remove", *args, "--key", "person.alice", "--expected-revision", original["revision"])
-        self.assertNotEqual(stale.returncode, 0)
-        inspected = json.loads(self.cli("media", "tag", "inspect", *args).stdout)[0]
-        self.assertEqual(inspected["tags"]["overrides"][0]["value"], "present")
-        batch = dict(jobID=str(uuid.uuid4()).upper(), storeIDs=[store_id], edits=[dict(
-            selection=dict(shardID=original["shardID"], sourceStoreID=store_id, allFrames=True), key="person.alice")])
+        # Destination scoping and storage-specific revisions are removed, not
+        # silently ignored. Source file/shard references remain conveniences.
+        for removed_option in [("--store", store_id), ("--expected-revision", "old-revision")]:
+            rejected = self.cli("media", "tag", "remove", *args, "--key", "person.alice", *removed_option)
+            self.assertNotEqual(rejected.returncode, 0)
+        inspected = json.loads(self.cli("media", "tag", "inspect", *args).stdout)
+        self.assert_footage_tags(inspected, camera_id, "person.alice", "present")
+        batch = dict(jobID=str(uuid.uuid4()).upper(), edits=[dict(
+            selection=dict(file=str(path), allFrames=True), key="person.alice")])
+        for removed_field, value in [("storeIDs", [store_id]), ("expectedRevisions", {})]:
+            rejected = self.cli("media", "tag", "apply", "-", "--runtime-dir", directory,
+                                input=json.dumps(batch | {removed_field: value}))
+            self.assertNotEqual(rejected.returncode, 0)
         removed = self.cli("media", "tag", "apply", "-", "--runtime-dir", directory, input=json.dumps(batch))
         self.assertEqual(removed.returncode, 0, removed.stderr)
         retry = self.cli("media", "tag", "apply", "-", "--runtime-dir", directory, input=json.dumps(batch))
@@ -1328,7 +1427,7 @@ class Integration(unittest.TestCase):
         self.agent()
         restored = self.cli("media", "tag", "inspect", *args)
         self.assertEqual(restored.returncode, 0, restored.stderr)
-        self.assertNotIn("value", json.loads(restored.stdout)[0]["tags"]["overrides"][0])
+        self.assert_footage_tags(json.loads(restored.stdout), camera_id, "person.alice", None)
         playback_tags(None)
         self.assertEqual(self.camera_request(directory, "cameras.tags.get", cameraID=camera_id)["tags"], {})
 

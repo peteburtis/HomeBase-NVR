@@ -5,7 +5,7 @@ import Foundation
 final class S3UploadManager: @unchecked Sendable {
     enum Lane { case live, replay, retry }
     final class Work {
-        let metadata: S3ObjectMetadata
+        var metadata: S3ObjectMetadata
         var payload: S3Payload
         var lane: Lane
         let readyAt: Double
@@ -94,6 +94,64 @@ final class S3UploadManager: @unchecked Sendable {
     }
     func containsObject(_ id: String) -> Bool { work[id] != nil }
     var thumbnailKeys: Set<String> { Set(work.values.filter { $0.metadata.thumbnail != nil }.map { $0.metadata.key }) }
+    func pendingTagSnapshots(password: String? = nil, cameraID: String? = nil, shardID: String? = nil,
+                             range: MediaRange? = nil, timeline: MediaTimeline = .canonical,
+                             epochID: String? = nil) throws -> [RecordingTagSnapshot] {
+        try work.values.filter { item in
+            let metadata = item.metadata
+            guard metadata.thumbnail == nil, playback?.entries[metadata.id] == nil,
+                  cameraID == nil || metadata.cameraID == cameraID,
+                  shardID == nil || metadata.id == shardID,
+                  let timing = metadata.timing, let end = metadata.endTicks,
+                  epochID == nil || timing.time.epochID == epochID else { return false }
+            if let range {
+                guard let anchor = timeline.anchor(timing.time) else { return false }
+                return anchor < range.end && anchor + Double(end) / Double(timing.timescale) > range.start
+            }
+            return true
+        }.compactMap { item in
+            guard let timing = item.metadata.timing, let endTicks = item.metadata.endTicks else { return nil }
+            let tags = try item.metadata.tagMetadata?.thaw(password: password ?? configuration.s3?.clientEncryption?.password) ?? .unknown
+            let ticks = item.metadata.frameTicks ?? []
+            return RecordingTagSnapshot(timing: timing, endTicks: endTicks, frames: ticks.count, tags: tags, frameTicks: ticks)
+        }
+    }
+    /// Returns false if delivery already handed this footage to the publisher.
+    /// The caller then commits against that authoritative confirmed copy.
+    func applyPendingTags(_ edit: RecordingTagEdit, work request: MediaWork, password: String? = nil) throws -> Bool {
+        let id = edit.snapshot.timing.shardID
+        guard let item = work[id], playback?.entries[id] == nil else { return false }
+        try request.check()
+        guard item.metadata.timing == edit.snapshot.timing, let endTicks = item.metadata.endTicks,
+              edit.overrides.allSatisfy({ $0.start >= 0 && $0.end <= min(endTicks, edit.snapshot.endTicks) }) else {
+            throw ServiceError("Pending footage changed while preparing tags.")
+        }
+        var timeline = try item.metadata.tagMetadata?.thaw(password: password ?? configuration.s3?.clientEncryption?.password) ?? .unknown
+        for override in edit.overrides { try timeline.apply(override) }
+        var metadata = item.metadata
+        let encrypted = metadata.encryption != nil || metadata.tagMetadata?.encrypted != nil
+            || configuration.s3?.clientEncryption?.enabled == true
+        let key = password ?? configuration.s3?.clientEncryption?.password
+        guard !encrypted || key != nil else { throw ServiceError("Encrypted tag updates require an encryption password; refusing plaintext.") }
+        metadata.tagMetadata = try StoredVideoTags.freeze(timeline, password: encrypted ? key : nil)
+        metadata.tagRevision = UUID().uuidString
+        try metadata.validateKind()
+        // Persist the media owner before acknowledging metadata edits. Existing
+        // in-flight transports retain their immutable original payload view.
+        if case .memory(let data) = item.payload {
+            item.payload = try spool.publish(item.metadata, data: data).payload
+        }
+        do { try spool.replaceTags(metadata) }
+        catch {
+            // Atomic replacement may have succeeded before fsync reported an
+            // error. Never let completion publish an older in-memory snapshot.
+            if let current = spool.entries[id] { item.metadata = current.metadata }
+            throw error
+        }
+        item.metadata = metadata
+        item.persistenceError = nil
+        return true
+    }
     func memoryPressure(_ warning: Bool) { policy.memoryPressure = warning; tick() }
     func tick() {
         let clock = now()
@@ -307,7 +365,7 @@ final class S3UploadManager: @unchecked Sendable {
         result.retrying = work.values.filter { $0.lane == .retry }.count
         result.assemblingBytes = assemblingBytes
         result.residentBytes = work.values.reduce(0) { value, item in
-            let tags = item.metadata.tagMetadata?.residentBytes ?? 0
+            let tags = (item.metadata.tagMetadata?.residentBytes ?? 0) + Int64((item.metadata.frameTicks?.count ?? 0) * 8)
             if case .memory(let data) = item.payload { return value + Int64(data.count) + tags }
             return value + item.activeRAM + tags
         }

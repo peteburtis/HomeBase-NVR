@@ -365,6 +365,9 @@ enum LocalMediaReader {
         return coverage.subtracting(excluded)
     }
     static func frameTicks(_ source: LocalMediaProvider.Source, work: MediaWork) throws -> [Int64] {
+        try frameIndex(source, work: work).ticks
+    }
+    static func frameIndex(_ source: LocalMediaProvider.Source, work: MediaWork) throws -> HistoricalFrameIndex.Index {
         let pinned = try PinnedMediaAsset(source: source, work: work)
         let (track, timing, _) = try pinned.inspect()
         guard timing == source.row.timing, source.row.state == .complete else { throw ServiceError("Frame editing requires a finalized recording with matching embedded timing.") }
@@ -373,9 +376,9 @@ enum LocalMediaReader {
         output.alwaysCopiesSampleData = false
         reader.add(output); guard reader.startReading() else { throw ServiceError("Cannot inspect recording frames.") }
         defer { reader.cancelReading(); withExtendedLifetime(pinned) {} }
-        let ticks = try HistoricalFrameIndex.read(output, reader: reader, timescale: source.row.timing.timescale, end: source.row.endTicks, work: work)
-        guard ticks.count == source.row.frames else { throw ServiceError("Recording frame count does not match its manifest.") }
-        return ticks
+        let index = try HistoricalFrameIndex.readIndex(output, reader: reader, timescale: source.row.timing.timescale, end: source.row.endTicks, work: work)
+        guard index.ticks.count == source.row.frames else { throw ServiceError("Recording frame count does not match its manifest.") }
+        return index
     }
     struct Result { let coverage: [MediaRange]; let frames: UInt64 }
     static func readableEnd(snapshot: GrowingMediaFile.Snapshot, timing: ShardTimingMetadata, work: MediaWork) throws -> Int64 {

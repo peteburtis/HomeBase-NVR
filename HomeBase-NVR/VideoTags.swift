@@ -122,6 +122,15 @@ struct VideoTagAccumulator {
     private(set) var timeline = VideoTagTimeline()
     private var estimatedBytes = 128
     var residentBytes: Int64 { Int64(estimatedBytes) }
+    /// Amend already accepted samples without changing subsequent camera tags.
+    /// Validate the complete replacement before mutating the writer's state.
+    mutating func apply(overrides: [VideoTagTimeline.Override]) throws {
+        var next = timeline
+        for edit in overrides { try next.apply(edit) }
+        let bytes = try JSONEncoder().encode(next).count
+        timeline = next
+        estimatedBytes = bytes + 128
+    }
     /// Returns true only on the first overflow; the caller logs it. Video continues.
     @discardableResult mutating func append(_ tags: [String: String], ticks: Int64, frame: Int64) throws -> Bool {
         guard timeline.unknownFromTicks == nil, timeline.changes.last?.tags != tags else { return false }
@@ -319,6 +328,9 @@ struct StoredVideoTags: Codable, Equatable, Sendable {
         for change in timeline.changes {
             total += 96
             for (key, value) in change.tags { total += key.utf8.count + value.utf8.count + 64 }
+        }
+        for edit in timeline.overrides ?? [] {
+            total += 96 + edit.key.utf8.count + (edit.value?.utf8.count ?? 0)
         }
         return Int64(total)
     }

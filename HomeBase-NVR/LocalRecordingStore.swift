@@ -317,6 +317,66 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
 
     // Also callable by deterministic tests; all maintenance stays on the store worker.
     func performMaintenance() { queue.async { [self] in maintain() } }
+    func pendingTagSnapshots() throws -> [RecordingTagSnapshot] {
+        queue.sync {
+            cameras.values.compactMap { $0.writer?.tagSnapshot() }
+        }
+    }
+    /// The writer queue serializes edits with append and rollover. A recording
+    /// which finalized after inspection is edited here using its normal footer
+    /// transaction; the API caller never needs to detect that transition.
+    func commitPendingTags(_ edits: [RecordingTagEdit], work: MediaWork) throws {
+        try queue.sync {
+            guard !finished else { throw ServiceError("Recording store stopped during tag edit.") }
+            for edit in edits {
+                try work.check()
+                let snapshot = edit.snapshot
+                guard snapshot.timing.storeID == configuration.id, snapshot.endTicks > 0 else {
+                    throw ServiceError("Invalid pending recording tag edit.")
+                }
+                // The newest duration is an estimate. Limit overrides to the
+                // accepted last sample so a shorter next interval stays unedited.
+                let overrides = edit.overrides.compactMap { value -> VideoTagTimeline.Override? in
+                    let end = min(value.end, snapshot.endTicks)
+                    return value.start < end ? .init(start: value.start, end: end, key: value.key, value: value.value) : nil
+                }
+                if let track = cameras[snapshot.timing.cameraID], let writer = track.writer,
+                   writer.tagSnapshot()?.timing == snapshot.timing {
+                    let replacement = try writer.applyingTags(overrides)
+                    guard let id = track.recordingID, let manifest = track.manifest else {
+                        throw ServiceError("Recording metadata is unavailable for tag edit.")
+                    }
+                    try manifest.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount, tags: replacement.timeline)
+                    writer.replaceTags(replacement)
+                    track.lastManifestCheckpoint = hooks.now()
+                } else {
+                    var applied = false
+                    let provider = LocalMediaProvider(configurations: { [self.configuration] })
+                    try provider.visitIndexes(camera: snapshot.timing.cameraID, work: work) { directory, _, reader in
+                        guard let row = try reader.historicalRecordings(id: snapshot.timing.shardID).first else { return }
+                        guard !applied, row.state == .complete, row.timing == snapshot.timing else {
+                            throw ServiceError("Recording is unavailable or changed during tag edit.")
+                        }
+                        let original = try reader.historicalTags(id: row.id)
+                        var tags = original ?? .unknown
+                        for value in overrides { try tags.apply(value) }
+                        if tags != original {
+                            let identity = LocalRecordingLayout.Identity(storeID: configuration.id, cameraID: snapshot.timing.cameraID)
+                            guard let index = try manifest(for: directory, identity: identity, create: false) else {
+                                throw ServiceError("Recording metadata disappeared during tag edit.")
+                            }
+                            let source = LocalMediaProvider.Source(directory: directory, owner: configuration.ownerUID,
+                                row: row, range: .init(start: row.start, end: row.end))
+                            let staged = try LocalTagFile.stage(source: source, tags: tags, jobID: UUID().uuidString, work: work)
+                            try index.commitTagEdits([staged], revisions: [row.id: HistoricalTags.revision(original)])
+                        }
+                        applied = true
+                    }
+                    guard applied else { throw ServiceError("Recording disappeared during tag edit.") }
+                }
+            }
+        }
+    }
     func commitHistorical(directory: LocalRecordingLayout.Directory, edits: [LocalTagFile.Pending],
                           revisions: [String: String]) throws {
         try queue.sync {
@@ -566,7 +626,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         }
         cameras.removeAll()
     }
-    private func finish(_ track: Track) throws {
+    private func finish(_ track: Track, nextTimestamp: UInt32? = nil) throws {
         guard let writer = track.writer else { return }
         track.writer = nil
         let recordingID = track.recordingID; track.recordingID = nil
@@ -574,7 +634,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         defer { lock.lock(); status.activeRecordings -= 1; lock.unlock() }
         do {
             try hooks.before(.finalize, track.camera)
-            try writer.finish()
+            try writer.finish(nextTimestamp: nextTimestamp)
         } catch {
             if let recordingID {
                 do { try track.manifest?.interrupt(id: recordingID) }
@@ -646,7 +706,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
         let observed = try track.clock.observe(media)
         if observed.discontinuity { try finish(track) }
         if let writer = track.writer, media.frame.keyFrame, writer.elapsed(media.frame.timestamp) >= Double(shardSeconds) {
-            try finish(track)
+            try finish(track, nextTimestamp: media.frame.timestamp)
         }
         if track.writer == nil {
             guard media.frame.keyFrame else { return }
@@ -792,8 +852,16 @@ final class MP4Shard {
     private var last: UInt32
     private var ticks: Int64 = 0
     private var samples = 0
+    // Exact sample coordinates for active frame-offset convenience requests.
+    // Metadata has a hard bound independent of recording duration.
+    private var tagFrameTicks: [Int64] = []
     private var tagAccumulator = VideoTagAccumulator()
     var tagTimeline: VideoTagTimeline { tagAccumulator.timeline }
+    // A sample's duration is the NEXT RTP interval. Keep only the newest
+    // block pending so a variable cadence never extrapolates across rollover.
+    // RAM publication/tag accumulation remain immediate for active readers.
+    private struct PendingSample { let block: CMBlockBuffer; let pts: Int64; let key: Bool }
+    private var pendingSample: PendingSample?
     private var lastDuration: Int64 = 6000
     private var syncFD: Int32 = -1
     private var lastSync: TimeInterval = 0
@@ -804,15 +872,31 @@ final class MP4Shard {
     private(set) var finalizedFile: LocalRecordingManifest.FileIdentity?
     var endTicks: Int64 { samples == 0 ? 0 : ticks + lastDuration }
     var sampleCount: Int64 { Int64(samples) }
+    func tagSnapshot() -> RecordingTagSnapshot? {
+        guard let timing, samples > 0 else { return nil }
+        return .init(timing: timing, endTicks: min(endTicks, ticks + 1), frames: samples, tags: tagTimeline,
+            frameTicks: tagFrameTicks.count == samples ? tagFrameTicks : [])
+    }
+    func applyingTags(_ overrides: [VideoTagTimeline.Override]) throws -> VideoTagAccumulator {
+        var next = tagAccumulator
+        try next.apply(overrides: overrides)
+        return next
+    }
+    func replaceTags(_ replacement: VideoTagAccumulator) {
+        tagAccumulator = replacement
+        ramTail?.updateTags(tagTimeline)
+    }
     init(directory: LocalRecordingLayout.Directory, codec: String, sets: [Data], clock: UInt32, firstTimestamp: UInt32, capturedAt: Date = Date(), timing: ShardTimingMetadata? = nil) throws {
         guard clock > 0, clock <= Int32.max else { throw ServiceError("Unsupported video clock rate.") }
         self.clock = Int32(clock); last = firstTimestamp; directoryFD = directory.fd; self.directory = directory; self.timing = timing
-        lastDuration = Int64(clock) / 15
+        lastDuration = max(1, Int64(clock) / 15)
         format = try Self.format(codec: codec, sets: sets)
         finalName = try LocalRecordingLayout.availableStem(in: directory.fd, at: capturedAt) + ".mp4"
         temporaryName = finalName + ".recording"
         writer = try AVAssetWriter(outputURL: URL(fileURLWithPath: directory.path + "/" + temporaryName), fileType: .mp4)
         writer.metadata = try timing?.assetMetadata() ?? []
+        // Keep RTP-tick precision in the MP4, including the final boundary.
+        writer.movieTimeScale = Int32(clock)
         // Stream into a visible file, with recoverable metadata throughout the shard.
         // This is independent of shard duration; never retain a whole shard in RAM.
         writer.movieFragmentInterval = CMTime(seconds: 5, preferredTimescale: 600)
@@ -820,6 +904,7 @@ final class MP4Shard {
         writer.shouldOptimizeForNetworkUse = false
         input = AVAssetWriterInput(mediaType: .video, outputSettings: nil, sourceFormatHint: format)
         input.expectsMediaDataInRealTime = true
+        input.mediaTimeScale = Int32(clock)
         guard writer.canAdd(input) else { throw ServiceError("Camera codec is not supported by the MP4 writer.") }
         writer.add(input)
         guard writer.startWriting() else { throw ServiceError("Could not start MP4 recording; check free space and permissions.") }
@@ -831,7 +916,12 @@ final class MP4Shard {
         readableFile?.invalidate()
         // cancelWriting deletes its output. Even on an error/timeout, leave the
         // visible recording intact and let an already-started finalization finish.
-        if writer.status == .writing, finalization == nil { _ = beginFinalization() }
+        if writer.status == .writing, finalization == nil {
+            // Error teardown must not repeat the explicit 30-second flush wait.
+            // Preserve the committed prefix even when its newest block cannot flush.
+            try? appendPending(duration: lastDuration, waitForReady: false)
+            _ = beginFinalization()
+        }
         if syncFD >= 0 { close(syncFD) }
     }
     static func format(codec: String, sets: [Data]) throws -> CMFormatDescription {
@@ -851,28 +941,41 @@ final class MP4Shard {
     func elapsed(_ timestamp: UInt32) -> Double { Double(ticks + Int64(Int32(bitPattern: timestamp &- last))) / Double(clock) }
     @discardableResult func append(_ frame: EncodedVideoFrame, tags: [String: String] = [:]) throws -> Bool {
         let delta = Int64(Int32(bitPattern: frame.timestamp &- last))
-        guard samples == 0 || delta > 0 else { throw ServiceError("This stream reorders presentation timestamps; recording requires a no-B-frame camera profile in this increment.") }
-        if samples > 0 { ticks += delta; lastDuration = delta }; last = frame.timestamp
-        try MP4WriterWait.untilReady(
-            ready: { self.input.isReadyForMoreMediaData },
-            failure: { self.writer.status == .writing ? nil : self.writerFailure("accept video") },
-            timeoutMessage: "Local MP4 writer remained backpressured for 30 seconds; reception continues. Queued video may be unrecorded; a new shard will be retried automatically.")
+        guard finalization == nil, samples == 0 || delta > 0 else { throw ServiceError("This stream reorders presentation timestamps; recording requires a no-B-frame camera profile in this increment.") }
+        if samples > 0 {
+            try appendPending(duration: delta)
+            ticks += delta; lastDuration = delta
+        }
+        last = frame.timestamp
         var block: CMBlockBuffer?
         guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: frame.payload.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: frame.payload.count, flags: 0, blockBufferOut: &block) == noErr, let block else { throw ServiceError("Could not allocate encoded sample.") }
         let copied = frame.payload.withUnsafeBytes { CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: $0.count) }
-        var timing = CMSampleTimingInfo(duration: CMTime(value: lastDuration, timescale: clock), presentationTimeStamp: CMTime(value: ticks, timescale: clock), decodeTimeStamp: .invalid)
-        var size = frame.payload.count, sample: CMSampleBuffer?
-        guard copied == noErr, CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format, sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr, let sample else { throw ServiceError("Could not create encoded sample.") }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
-            let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(), Unmanaged.passUnretained(frame.keyFrame ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
-        }
-        guard input.append(sample) else { throw writerFailure("append video") }
+        guard copied == noErr else { throw ServiceError("Could not copy encoded sample.") }
+        pendingSample = PendingSample(block: block, pts: ticks, key: frame.keyFrame)
         let overflow = try tagAccumulator.append(tags, ticks: ticks, frame: Int64(samples))
         ramTail?.append(block: block, pts: ticks, duration: lastDuration, key: frame.keyFrame, tags: tagTimeline)
         samples += 1
+        if tagFrameTicks.count < MediaLimits.taggedFrames { tagFrameTicks.append(ticks) }
         try checkpoint()
         return overflow
+    }
+    private func appendPending(duration: Int64, waitForReady: Bool = true) throws {
+        guard let pending = pendingSample else { return }
+        if waitForReady {
+            try MP4WriterWait.untilReady(
+                ready: { self.input.isReadyForMoreMediaData },
+                failure: { self.writer.status == .writing ? nil : self.writerFailure("accept video") },
+                timeoutMessage: "Local MP4 writer remained backpressured for 30 seconds; reception continues. Queued video may be unrecorded; a new shard will be retried automatically.")
+        } else if writer.status != .writing || !input.isReadyForMoreMediaData { return }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: duration, timescale: clock), presentationTimeStamp: CMTime(value: pending.pts, timescale: clock), decodeTimeStamp: .invalid)
+        var size = CMBlockBufferGetDataLength(pending.block), sample: CMSampleBuffer?
+        guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: pending.block, formatDescription: format, sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr, let sample else { throw ServiceError("Could not create encoded sample.") }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
+            let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(), Unmanaged.passUnretained(pending.key ? kCFBooleanFalse : kCFBooleanTrue).toOpaque())
+        }
+        guard input.append(sample) else { throw writerFailure("append video") }
+        pendingSample = nil
     }
     private func checkpoint() throws {
         let now = ProcessInfo.processInfo.systemUptime
@@ -909,7 +1012,16 @@ final class MP4Shard {
         }
         return done
     }
-    func finish() throws {
+    func finish(nextTimestamp: UInt32? = nil) throws {
+        if finalization == nil {
+            if let nextTimestamp {
+                let interval = Int64(Int32(bitPattern: nextTimestamp &- last))
+                guard samples > 0, interval > 0 else { throw ServiceError("Invalid recording shard boundary.") }
+                lastDuration = interval
+            }
+            try appendPending(duration: lastDuration)
+            writer.endSession(atSourceTime: CMTime(value: endTicks, timescale: clock))
+        }
         let done = beginFinalization()
         try MP4WriterWait.untilReady(
             ready: { done.wait(timeout: .now()) == .success },

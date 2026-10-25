@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 
 /// Mutating history is separate from camera tags and never changes live state.
-/// All ranges are half open. Store selection is independent of the coordinates.
+/// All ranges are half open. Every matching storage copy reflects the edit.
 struct HistoricalTagRequest: Codable, Equatable, Sendable {
     struct Boundary: Codable, Equatable, Sendable {
         let timestamp: Double
@@ -27,16 +27,16 @@ struct HistoricalTagRequest: Codable, Equatable, Sendable {
         var value: String? = nil // nil removes; empty string is a value.
     }
     let jobID: String
-    let storeIDs: [String]
     let edits: [Edit]
-    var expectedRevisions: [String: String]? = nil // "storeUUID/shardUUID": opaque revision
+    // Internal optimistic checks; never accepted from the public footage API.
+    var expectedRevisions: [String: String]? = nil
     var dryRun: Bool = false
     var inspect: Bool = false
+    enum CodingKeys: String, CodingKey { case jobID, edits, dryRun, inspect }
     func validate() throws {
-        guard UUID(uuidString: jobID) != nil, (1...8).contains(storeIDs.count),
-              Set(storeIDs).count == storeIDs.count, storeIDs.allSatisfy({ UUID(uuidString: $0) != nil }),
-              (1...64).contains(edits.count), (expectedRevisions?.count ?? 0) <= 128 else {
-            throw ServiceError("Historical edits require a job UUID, 1–8 distinct store UUIDs, and 1–64 edits.")
+        guard UUID(uuidString: jobID) != nil, (1...64).contains(edits.count),
+              (expectedRevisions?.count ?? 0) <= 128 else {
+            throw ServiceError("Footage edits require a job UUID and 1–64 edits.")
         }
         for edit in edits {
             if !inspect { try VideoTags.validate([edit.key: edit.value ?? ""]) }
@@ -75,11 +75,29 @@ struct HistoricalTagResult: Codable, Equatable, Sendable {
     let shardID: String
     let revision: String
     let changed: Bool
-    var publication: String // preview | local-complete | s3-queued
+    var publication: String // internal storage result, not exposed on the wire
+    var timeline: MediaTimeline = .canonical
+    var epochID: String = ""
+    var start: Double = 0
+    var end: Double = 0
+
+    enum CodingKeys: String, CodingKey { case cameraID, timeline, epochID, start, end, changed }
+    init(storeID: String, cameraID: String, shardID: String, revision: String, changed: Bool,
+         publication: String, timeline: MediaTimeline = .canonical, epochID: String = "", start: Double = 0, end: Double = 0) {
+        self.storeID=storeID; self.cameraID=cameraID; self.shardID=shardID; self.revision=revision
+        self.changed=changed; self.publication=publication; self.timeline=timeline; self.epochID=epochID
+        self.start=start; self.end=end
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(storeID: "", cameraID: try c.decode(String.self, forKey: .cameraID), shardID: "", revision: "",
+            changed: try c.decode(Bool.self, forKey: .changed), publication: "",
+            timeline: try c.decode(MediaTimeline.self, forKey: .timeline), epochID: try c.decode(String.self, forKey: .epochID),
+            start: try c.decode(Double.self, forKey: .start), end: try c.decode(Double.self, forKey: .end))
+    }
 }
 struct HistoricalTagStatus: Codable, Sendable {
     struct Gap: Codable, Sendable {
-        let storeID: String
         let cameraID: String
         let timeline: MediaTimeline
         let start: Double
@@ -88,19 +106,20 @@ struct HistoricalTagStatus: Codable, Sendable {
     let jobID: String
     var state: String // preparing | applying | completed | failed
     var results: [HistoricalTagResult] = []
+    // Internal storage rows support commit diagnostics; only logical footage
+    // ranges are serialized across the API.
+    var footageResults: [HistoricalTagResult]? = nil
     var gaps: [Gap] = []
     var error: String? = nil
-    var message: String = "Validating historical edits; no changes committed yet."
-}
-struct HistoricalTagInspection: Codable {
-    let storeID: String
-    let cameraID: String
-    let shardID: String
-    let revision: String
-    let timing: ShardTimingMetadata
-    let endTicks: Int64
-    var frames: Int? = nil
-    let tags: VideoTagTimeline
+    var message: String = "Validating footage edits; no changes committed yet."
+    enum CodingKeys: String, CodingKey { case jobID, state, results, gaps, error, message }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(jobID, forKey: .jobID); try c.encode(state, forKey: .state)
+        try c.encode(footageResults ?? results, forKey: .results)
+        try c.encode(gaps, forKey: .gaps); try c.encodeIfPresent(error, forKey: .error)
+        try c.encode(message, forKey: .message)
+    }
 }
 enum HistoricalTags {
     static func revision(_ tags: VideoTagTimeline?) throws -> String {
@@ -116,7 +135,7 @@ enum HistoricalTags {
         return Int64(max(0, min(Double(end), ceil(ticks - tolerance))))
     }
     static func frameBoundary(_ frame: Int, ticks: [Int64], end: Int64) throws -> Int64 {
-        guard frame >= 0, frame <= ticks.count else { throw ServiceError("Frame boundary is outside this finalized shard.") }
+        guard frame >= 0, frame <= ticks.count else { throw ServiceError("Frame boundary is outside the available source footage.") }
         return frame == ticks.count ? end : ticks[frame]
     }
 }
@@ -125,6 +144,7 @@ enum HistoricalTags {
 // does not apply stored-property defaults when a JSON field is absent).
 extension HistoricalTagRequest.Boundary {
     init(from decoder: Decoder) throws {
+        try FootageJSON.rejectUnknown(decoder, allowed: ["timestamp", "frameOffset"])
         let c = try decoder.container(keyedBy: CodingKeys.self)
         timestamp = try c.decode(Double.self, forKey: .timestamp)
         frameOffset = try c.decodeIfPresent(Int.self, forKey: .frameOffset) ?? 0
@@ -132,6 +152,7 @@ extension HistoricalTagRequest.Boundary {
 }
 extension HistoricalTagRequest.Selection {
     init(from decoder: Decoder) throws {
+        try FootageJSON.rejectUnknown(decoder, allowed: ["file", "shardID", "sourceStoreID", "cameraID", "timeline", "epochID", "start", "end", "startFrame", "endFrame", "allFrames"])
         let c = try decoder.container(keyedBy: CodingKeys.self)
         file = try c.decodeIfPresent(String.self, forKey: .file)
         shardID = try c.decodeIfPresent(String.self, forKey: .shardID)
@@ -148,12 +169,48 @@ extension HistoricalTagRequest.Selection {
 }
 extension HistoricalTagRequest {
     init(from decoder: Decoder) throws {
+        try FootageJSON.rejectUnknown(decoder, allowed: ["jobID", "edits", "dryRun", "inspect"])
         let c = try decoder.container(keyedBy: CodingKeys.self)
         jobID = try c.decode(String.self, forKey: .jobID)
-        storeIDs = try c.decode([String].self, forKey: .storeIDs)
         edits = try c.decode([Edit].self, forKey: .edits)
-        expectedRevisions = try c.decodeIfPresent([String: String].self, forKey: .expectedRevisions)
         dryRun = try c.decodeIfPresent(Bool.self, forKey: .dryRun) ?? false
         inspect = try c.decodeIfPresent(Bool.self, forKey: .inspect) ?? false
+    }
+}
+
+// Storage identities remain internal. Public requests describe footage and the
+// recorder resolves every matching copy; a source-store reference only locates
+// the optional shard convenience selector.
+struct RecordingTagSnapshot {
+    let timing: ShardTimingMetadata
+    let endTicks: Int64
+    let frames: Int
+    let tags: VideoTagTimeline
+    let frameTicks: [Int64]
+}
+struct RecordingTagEdit {
+    let snapshot: RecordingTagSnapshot
+    let overrides: [VideoTagTimeline.Override]
+}
+struct FootageTagInspection: Codable, Equatable {
+    let cameraID: String
+    let timeline: MediaTimeline
+    let epochID: String
+    let start: Double
+    var end: Double
+    let tags: VideoTagTimeline.State
+}
+private enum FootageJSON {
+    struct Key: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+    static func rejectUnknown(_ decoder: Decoder, allowed: Set<String>) throws {
+        let keys = try decoder.container(keyedBy: Key.self).allKeys.map(\.stringValue)
+        if let key = keys.first(where: { !allowed.contains($0) }) {
+            throw ServiceError("Unsupported footage tag field '\(key)'. Destination stores cannot be selected.")
+        }
     }
 }

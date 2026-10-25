@@ -1,87 +1,106 @@
-# Historical tags (0.21.0)
+# Footage tags
 
-Historical edits are separate from `camera tag`: they never change current camera
-configuration, live frames, camera watch status, or recording intent. Keys and
-values remain opaque, case-sensitive strings. These are descriptive annotations,
-not NVR authorization rules. Applications may use them for UI gating, but an S3
-reader with credentials/password can still access the original objects directly.
+Tags belong to footage. A request identifies a time interval from a camera, and
+the NVR applies the annotation to every available Local and S3 copy of that
+footage. Stores and recording boundaries are persistence details, not tag owners.
+A camera UUID identifies the source of footage; editing it does not change camera
+configuration, future frames, watch status, or recording intent. `camera tag`
+remains the separate prospective default for arriving frames.
+
+Keys and values are opaque, case-sensitive strings. These descriptive annotations
+are not authorization rules: readers with S3 credentials/passwords can still read
+original objects directly.
 
 ## CLI
 
-All commands use the authenticated control socket, without sudo. Add
-`--runtime-dir PATH` for an isolated development agent. Target stores are explicit:
-repeat `--store NAME_OR_UUID` to edit multiple stores, or omit it for the normal
-store picker. There is no implicit propagation to other stores.
+Commands use the authenticated control socket without sudo. Add `--runtime-dir
+PATH` for an isolated agent. There is no destination store option or store picker.
+`--store`, JSON `storeIDs`, and public revision selectors are rejected. A file or
+source shard can locate footage as a convenience; it does not restrict which
+copies receive the annotation.
 
 ```sh
-# Frame numbers are zero-based; end is EXCLUSIVE (frames 120 through 359).
-hbnvr media tag set --store 'Local recordings' \
-  --file '/absolute/managed/camera/recording.mp4' --frames 120:360 \
-  --key recognition.person.alice --value present
+# Time-based addressing needs no recording filename or storage identity.
+hbnvr media tag set --camera 'Bedroom Camera' \
+  --timeline canonical --from '2026-10-25T14:30:00-07:00' \
+  --to '2026-10-25T14:31:00-07:00' --key recognition.person.alice --value present
 
-# A shard UUID is meaningful together with its source store.
-hbnvr media tag remove --store 'S3 recordings' \
-  --source-store 'S3 recordings' --shard SHARD_UUID --all-frames \
-  --key recognition.person.alice
-
-# canonical (default), received, and camera timelines are supported.
-hbnvr media tag set --store 'S3 recordings' --camera 'Bedroom Camera' \
-  --timeline canonical --from '2026-09-21T14:30:00-07:00' \
-  --to '2026-09-21T14:31:00-07:00' --key recognition.person.alice --value present
-
-# Select actual frames relative to a timestamp, without finding a filename.
-hbnvr media tag set --store 'Local recordings' --camera 'Bedroom Camera' \
-  --from '2026-09-21T14:30:00-07:00' --from-frame 12 \
-  --to '2026-09-21T14:30:00-07:00' --to-frame 30 \
+# Actual frame offsets from timestamps, not nominal-FPS calculations.
+hbnvr media tag set --camera 'Bedroom Camera' \
+  --from '2026-10-25T14:30:00-07:00' --from-frame 12 \
+  --to '2026-10-25T14:30:00-07:00' --to-frame 30 \
   --key example.note --value detected
 
-hbnvr media tag inspect --store 'Local recordings' \
-  --file '/absolute/managed/camera/recording.mp4' --all-frames
+# Source-file convenience: zero-based frames 120 through 359, end EXCLUSIVE.
+hbnvr media tag set --file '/absolute/managed/camera/recording.mp4' \
+  --frames 120:360 --key recognition.person.alice --value present
+
+# A source-store reference only locates the shard used for coordinates.
+hbnvr media tag remove --source-store 'S3 recordings' --shard SHARD_UUID \
+  --all-frames --key recognition.person.alice
+
+hbnvr media tag inspect --file '/absolute/managed/camera/recording.mp4' --all-frames
 hbnvr media tag status JOB_UUID
 ```
 
-`--value ''` sets an empty string; `remove` makes the key absent only within the
-selected interval. Other keys and all frames outside it retain their prior state.
-Use `--dry-run` to validate and inspect proposed changes without any writes, or
-`--expected-revision REVISION` to reject intervening edits to a single shard.
-Inspection emits JSON with store/camera/shard identity, original timing, duration,
-frame count when available, current opaque revision, and the authoritative tag
-timeline. Camera UUIDs continue to address retained history after camera removal.
+`--value ''` sets an empty string. `remove` makes a key absent only within the
+selected interval; other keys and frames outside it retain their prior state.
+Use `--dry-run` to validate and inspect proposed changes without writing them.
+Camera UUIDs continue to address retained footage after camera removal.
 
-Only finalized, indexed local recordings and confirmed, indexed S3 recordings
-participate. Active/interrupted files and pending S3 uploads are not edited. File
-paths must identify existing managed files, not arbitrary MP4s or symlinks; use
-the configured physical recording path, without `.` or `..` components. Store and
-shard UUIDs avoid path spelling/rename issues.
+Accepted footage can be edited while recording, after local finalization, while
+queued/spooled/uploading to S3, and after cloud delivery. Clients do not wait for
+finalization or discover recording boundaries. Edits are finite: future frames
+keep their prospective tags. The recorder follows selected footage through
+rollover or upload completion between inspection and commit.
 
-### Frame and time semantics
+Managed-file selectors reject arbitrary MP4s and symlinks. Use the configured
+physical recording path without `.` or `..` components. A shard selector retains
+`sourceStoreID` solely to identify its source coordinates.
 
-File/shard ranges use actual presentation-order samples, not nominal FPS. The
-exclusive end may equal the frame count. Timestamp-only cuts apply to frames
-whose presentation timestamps lie in `[from,to)`. A positive frame offset finds
-the first sample at or after the timestamp, then advances by that many samples.
-Offsets can cross contiguous shards in the same clock epoch, but not gaps,
-ambiguous overlaps, or clock discontinuities. The initial search window is 120
-seconds; unavailable footage is an error, not permission to guess. `--epoch UUID`
-disambiguates overlapping clock epochs. Camera time cannot be used if absent.
+## Frame and time semantics
 
-Local and S3 stores have independent shard IDs and boundaries. File-based
-propagation translates source frames through their common canonical clock epoch,
-then intersects that interval with each explicitly selected store's shards.
-Different epochs are never guessed to be equivalent. A target store with no
-matching footage rejects the batch before application. Partial coverage is
-reported in the job's `gaps`, in the selected timeline; no tags are fabricated
-for those gaps. Timestamp ranges can deliberately span distinct nonoverlapping
-epochs. Overlapping timestamp ranges require an epoch or shard selector.
+`canonical` (default), `received`, and `camera` timelines use fractional Unix
+seconds. Camera time is unavailable when the camera supplied no clock. `--epoch
+UUID` disambiguates overlapping clock epochs and is independent of file boundaries.
 
-Timestamp-only S3 edits use the private playback journal: no bucket listing,
-media download, media upload, or delete permission is required. Exact S3 frame
-addressing may download the referenced object and inspect compressed samples in
-RAM. It first uses saved credentials; if those cannot read, rerun with
-`--read-credentials` to enter temporary GetObject credentials. Use
-`--encryption-password` for an older metadata/media password. These inputs are
-never saved. The object's manifest size, SHA-256, and embedded identity must
-match. No decrypted remote media is written to disk.
+Timestamp-only cuts affect frames with presentation timestamps in `[from,to)`.
+Positive frame offsets find the first actual sample at or after the timestamp,
+then advance by the requested sample count. Offsets can cross contiguous
+recordings in one clock epoch, but never gaps, ambiguous overlaps, or clock
+resets. The initial search window is 120 seconds. A file/shard's exclusive frame
+end may equal its actual sample count. Missing exact sample indexes produce an
+error rather than a nominal-FPS estimate; timestamp-only editing stays available.
+
+The NVR translates convenience selectors into canonical source time and applies
+them to every matching copy. Local and S3 copies may have different recording IDs
+and boundaries. A store with no matching footage needs no write. A selection with
+no available footage fails; partial footage coverage appears in `gaps`, in the
+selected timeline. Different clock epochs are never guessed to be equivalent.
+Timestamp intervals may deliberately span distinct nonoverlapping epochs.
+
+Older recordings can have overlapping estimated final durations. The NVR resolves
+an overlap at the next recording's first sample only after verifying the same
+epoch, clock rate, source, RTP/UTC mapping, actual sample indexes, and the previous
+writer's extrapolated end. The earlier recording must have no sample at or after
+the boundary. Duplicate/interleaved samples, inconsistent clocks, and overlapping
+distinct epochs remain ambiguous. Older MP4 timescale rounding is accounted for;
+a sample whose uncertainty could reach the next recording is rejected.
+
+Coverage is half open: a range beginning at the next recording's start excludes
+the prior recording's empty estimated tail. Inspection does not rewrite media
+durations or timing indexes. New recordings preserve source-clock precision and
+use the next actual RTP interval at ordinary rollover. Shutdown or discontinuity
+can still require estimating the last duration; active edits cover only already
+accepted sample positions.
+
+Timestamp-only S3 edits use local metadata and require no listing, media download,
+media upload, or delete permission. Exact-frame selection or an older ambiguous
+overlap may need to read compressed samples in RAM. Saved credentials are used
+first; `--read-credentials` supplies temporary GetObject credentials and
+`--encryption-password` supplies an older media/metadata password. Neither is
+saved. Manifest size, SHA-256, and embedded identity must match. Decrypted remote
+media is never written to disk.
 
 ## JSON batches and IPC
 
@@ -90,14 +109,13 @@ match. No decrypted remote media is written to disk.
 ```json
 {
   "jobID": "11111111-1111-4111-8111-111111111111",
-  "storeIDs": ["22222222-2222-4222-8222-222222222222"],
   "edits": [
     {
       "selection": {
         "cameraID": "33333333-3333-4333-8333-333333333333",
         "timeline": "canonical",
-        "start": {"timestamp": 1790026200, "frameOffset": 12},
-        "end": {"timestamp": 1790026200, "frameOffset": 30}
+        "start": {"timestamp": 1792963800, "frameOffset": 0},
+        "end": {"timestamp": 1792963860, "frameOffset": 0}
       },
       "key": "recognition.person.alice",
       "value": "present"
@@ -107,105 +125,102 @@ match. No decrypted remote media is written to disk.
 }
 ```
 
-Omit `value` to remove a key. Omitted `frameOffset` defaults to zero, `timeline`
-to canonical, and `dryRun`/`inspect` to false. For file selection replace the
-time selector with `{"file":"/absolute/path","startFrame":120,"endFrame":360}`;
-for shard selection use `sourceStoreID` plus `shardID`. Use `allFrames:true`
-instead of frame boundaries for a whole file/shard. Optional `expectedRevisions`
-maps `STORE_UUID/SHARD_UUID` to inspection's revision. Unknown revision targets
-are rejected, not ignored. Edits apply in list order; later edits win for the
-same key over overlapping intervals. Validation and staging finish before any
-application begins. A batch for one shard is a single rewrite/revision.
+Omit `value` to remove a key. Defaults are `frameOffset:0`, `timeline:"canonical"`,
+and `dryRun:false`/`inspect:false`. File selection uses
+`{"file":"/absolute/path","startFrame":120,"endFrame":360}`; shard selection uses
+`sourceStoreID` plus `shardID`. `allFrames:true` replaces explicit frame boundaries.
+There is no destination store list or public expected-revision map. Obsolete and
+unknown request fields are rejected. Edits apply in list order; later overlapping
+edits for the same key win. Validation/preparation precede application.
+
+Inspection returns normalized spans with `cameraID`, `timeline`, `epochID`,
+`start`, `end`, and effective `tags`. Tag state has `values`, `knownAbsent`, and
+`complete`; absent legacy metadata stays explicitly unknown. Public results use
+footage time spans and `changed`, without destination store IDs, shard IDs,
+publication states, or revision tokens.
 
 Control protocol v1 operations:
 
-- `media.tags.start`: `historicalTags` holds the JSON request. Optional
-  `nvrInstanceID` must match. Optional `repairCredentials` and `repairPassword`
-  carry ephemeral read/decryption inputs using the existing repair types.
-- `media.tags.poll`: `tagJobID`; reply `tagJob` contains `state`, `message`,
-  per-shard `results` and `gaps`. Failed jobs include an error and any already
-  committed results. States: preparing, applying, completed, failed.
-- `media.tags.read`: completed inspection `tagJobID` plus `tagOffset` byte offset;
-  reply `tagData` is a base64 chunk of at most 32 KiB. A short chunk ends the
-  JSON inspection document. The CLI assembles these automatically.
+- `media.tags.start`: `historicalTags` holds the request. Optional `nvrInstanceID`
+  must match. Optional `repairCredentials`/`repairPassword` carry ephemeral inputs.
+- `media.tags.poll`: `tagJobID`; reply `tagJob` includes `state`, `message`, footage
+  `results`, and `gaps`. Failed jobs report an error; some copies may already be
+  committed, so inspect the footage range before retrying. States are preparing,
+  applying, completed, and failed.
+- `media.tags.read`: completed inspection `tagJobID` plus `tagOffset`; `tagData` is
+  a base64 chunk of at most 32 KiB. A short chunk ends the JSON document. The CLI
+  assembles these automatically.
 
-Jobs are bound to the authorized requesting UID. Only one editor runs at once;
-the last eight job statuses/inspection outputs remain available until restart.
-Reusing a job UUID with the same request returns its prior status; a different
-request with that UUID is rejected. Use a new UUID for a corrected failed job.
-Disconnecting the CLI does not cancel an accepted job. `preparing` is not a
-durability promise: restart may discard uncommitted preparation. Inspect durable
-metadata before retrying an uncertain job after restart. Applied overrides are
-idempotent, including explicit removals. No persistent job contains credentials.
+Jobs belong to the authorized requesting UID. One editor runs at a time; the last
+eight statuses/inspection outputs survive until restart. Reusing a job UUID with
+the same request returns prior status; a different request is rejected. Use a new
+UUID for a corrected failed job. Disconnecting does not cancel accepted work.
+Uncommitted preparation may be lost on restart. Inspect before retrying an
+uncertain job; finite overrides, including removals, are idempotent. Persistent
+metadata never includes ephemeral credentials.
 
-## Publication and recovery
+## Persistence and publication
 
-Local manifest schema 4 adds `tag_edits`, a short-lived durable replacement
-intent. Copies are staged alongside existing **plaintext local** MP4s with the
-same daemon ownership, 0600 mode, and inherited access policy. Original sample
-bytes and offsets are preserved; only the trailing private UUID tag box changes.
-After staging and syncing, the manifest commits the intended replacements, files
-are atomically renamed, and index identity/tag values are updated. Readers already
-holding an old descriptor can finish that revision; an old manifest snapshot may
-temporarily report unavailable until refreshed. Startup/maintenance rolls pending
-intents forward across either side of rename. Unexpected file identities are
-preserved for operator inspection. Staging before a committed intent can leave
-an orphan `.hbnvr-tags-*.tmp` after a crash; it is never adopted as footage or
-automatically deleted. A failed commit similarly preserves recovery files.
+Active writers apply overrides on their recording queue. Local checkpoints and
+live playback metadata reflect the edit; normal finalization includes it in the
+completed file. S3 RAM recordings include it in the finalized encrypted-as-needed
+media and upload descriptor. Active footage and its tags retain the recorder's
+existing durability guarantees.
 
-Each local camera-index batch has a durable intent; S3 store batches use an
-encrypted-as-needed `.tag-edit` journal before replacing private shard records.
-Those intents survive restart and roll forward. Multiple stores/camera indexes
-are **not** one distributed transaction: a later failure leaves earlier commits
-intact, and job results distinguish completed stores from merely prepared ones.
-Recording and control continue while the editor stages files or inspects media;
-only the short commit runs on each recording worker.
+Queued or in-flight S3 edits persist effective tags in the existing spool before
+acknowledgment, without replacing video bytes, key, hash, or upload destination.
+Completion uses current effective metadata instead of the old transport snapshot.
+Restart/replay retains the edited revision. Pending footage is not advertised as
+playable cloud media until successful upload delivery.
 
-S3 video and thumbnail objects are never replaced for an edit. Their embedded
-tags remain the creation-time snapshot. The authoritative manifest `tagMetadata`
-is replaced, and `tagRevision` changes. Playback lookup must use the whole current
-manifest timeline, not merge old embedded values back into it. Current-day daily
-and affected closed-day daily/monthly publications use the existing serialized
-publisher, respecting forced spooling and network backoff. `s3-queued` means
-durably accepted, not already delivered. Older in-flight manifest uploads cannot
-clear newly dirtied revisions. Original upload replay and repair must preserve
-edited records. Loss of both private journals and cloud manifests loses historical
-edits; unchanged media can recover only original tags. Never rebuild over a newer
-cloud manifest without first preserving those annotations.
+Finalized local plaintext MP4 edits preserve sample bytes and offsets, replacing
+only the trailing private tag box. Staged files retain daemon ownership, mode,
+and access policy. Manifest schema 4's `tag_edits` intent persists before atomic
+replacement and index updates. Startup/maintenance rolls committed intents
+forward; unexpected identities and uncommitted orphan staging files are retained
+for operator inspection. Existing readers can finish their old revision.
 
-Tag timeline version 2 retains version 1 `changes`/`unknownFromTicks` and adds
-finite `overrides`: `{start,end,key,value?}` in shard timescale ticks. An omitted
-value is a tombstone (known absence), not a request to fall back. Per-key spans
-are coalesced and split on overlap. Legacy unknown base state remains unknown:
-`state(at:)` exposes known values, known absences, and `complete:false`; it does
-not invent a complete empty dictionary. A missing timeline is likewise unknown.
-Encrypted recordings keep edited timelines encrypted in private journals and
-public manifests, even if encryption has since been disabled for new footage.
+Confirmed S3 edits use the encrypted-as-needed `.tag-edit` journal before replacing
+private playback records. Video and thumbnail objects remain unchanged; their
+embedded tags are the finalization-time snapshot. The current manifest's complete
+`tagMetadata` and `tagRevision` are authoritative. Readers must not merge older
+embedded values back in. Existing serialized manifest publication handles daily
+and monthly updates, forced spooling, and network backoff. Older callbacks cannot
+clear a newer revision, and original upload replay/repair preserves edits.
 
-Local history IPC can serve effective segment tag maps as of 0.22.0; see
-[the opt-in wire contract](MEDIA-PROTOCOL.md#segment-tag-maps-0220). This public
-projection treats unknown and absent as no value, without exposing tombstones.
-No Homebase/GUI tag interpretation is added. Future S3 consumers must refresh manifests for edits, including consulting
-them at a JPEG's actual sampled timestamp before tag-dependent thumbnail display.
-Current GUI thumbnails bypass manifests and current playback ignores tags.
-Already-buffered/downloaded media does not instantly acquire new annotations.
+A completed job means the local metadata change was accepted; cloud publication
+follows the existing delivery process. Multiple storage copies are not a single
+distributed transaction: a later failure retains earlier commits. A failed job
+does not claim successful coverage; inspect the range to establish its state. Losing both private journals and cloud manifests
+loses post-finalization edits; unchanged objects recover only their embedded tags.
 
-## Bounds and smoke checks
+Timeline version 2 retains base changes and adds finite `{start,end,key,value?}`
+overrides in internal recording ticks. Missing `value` is a known-absence tombstone.
+Per-key spans coalesce and split on overlap. Unknown legacy base state remains
+unknown. Encrypted footage keeps edited tag values encrypted in spool metadata,
+private journals, and public manifests even after encryption is disabled for new
+footage.
 
-- One active job; at most 8 stores, 64 edits, 64 resolved shards, 64 reported gaps.
-- IPC requests: 64 KiB; CLI batch input: 60,000 bytes. Time ranges: at most 24h.
-- Tag timelines: 4096 base changes, 4096 coalesced override spans, 512 KiB JSON;
-  effective dictionaries retain the existing 32-key / 8192-byte limits.
-- Exact-frame inspection: at most 1,000,000 frames per file, 2,000,000 retained
-  frame timestamps per job; S3 objects up to 256 MiB / 512 MiB total downloads.
-- Local staging: at most 512 MiB original file bytes per job, with room for each
-  replacement plus a 64 MiB reserve on the **actual local store volume**.
-- Preparation/inspection checks a five-minute deadline; remote asset inspection
-  is capped at 30 seconds. Inspection JSON is capped at 16 MiB. Oversized or
-  unsupported edits fail explicitly; recording tags are never silently truncated
-  to accommodate a historical edit.
+Local IPC serves effective [segment tag maps](MEDIA-PROTOCOL.md#segment-tag-maps-0220).
+Existing Homebase/GUI behavior is unchanged: current GUI thumbnails bypass manifests
+and playback ignores tags. S3 consumers must refresh manifests, including checking
+a thumbnail's actual sample timestamp before tag-dependent display. Already
+buffered/downloaded media does not instantly acquire new annotations.
 
-Build/test without installing or touching real cameras:
+## Bounds and checks
+
+- One active job; at most 64 edits, 64 internal recording segments, 64 reported gaps.
+- IPC request limit 64 KiB; CLI batch limit 60,000 bytes; time ranges at most 24h.
+- Tag timelines: 4096 base changes, 4096 override spans, 512 KiB JSON; effective
+  dictionaries remain bounded to 32 keys and 8192 bytes.
+- Exact-frame inspection: 1,000,000 frames per file and 2,000,000 retained frame
+  timestamps per job; remote objects at most 256 MiB, 512 MiB total downloaded.
+- Local staging: 512 MiB original bytes per job plus room for each replacement
+  and a 64 MiB reserve on the actual recording volume.
+- Preparation/inspection deadline: five minutes; remote inspection: 30 seconds;
+  inspection JSON: 16 MiB. Oversized edits fail instead of truncating tags.
+
+Build and test without installing or accessing real cameras:
 
 ```sh
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
@@ -214,8 +229,10 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild \
 python3 scripts/integration.py /tmp/hbnvr-build/Build/Products/Debug/hbnvr
 ```
 
-On an intentionally selected recording: inspect; save its revision; dry-run a
-small interval; apply with the expected revision; inspect again; retry the same
-edit and verify `changed:false`; confirm `camera tag list` is unchanged. For S3,
-confirm the media key/hash/size are unchanged and wait for manifest publication.
-Installation and commits remain separate user-directed actions.
+For disposable footage: inspect, dry-run, apply, inspect the normalized spans,
+repeat and verify `changed:false`, and confirm prospective camera tags are
+unchanged. Exercise active footage, rollover, pending S3 uploads, and restart.
+Forced spooling exercises pending metadata without contacting a bucket. After
+finalization, S3 edits must preserve the video key/hash/size; updated manifests
+become available through normal delivery. Installation and commits remain
+separate user-directed actions.

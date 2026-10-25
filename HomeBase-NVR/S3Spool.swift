@@ -94,14 +94,27 @@ struct S3ObjectMetadata: Codable, Equatable, Sendable {
     var endTicks: Int64? = nil
     var thumbnail: S3ThumbnailInfo? = nil
     var tagMetadata: StoredVideoTags? = nil
+    // Mutable effective tags travel with the immutable upload payload. The
+    // revision prevents an older replay from restoring the original tags.
+    var tagRevision: String? = nil
+    // Actual sample coordinates for pending footage; never infer nominal FPS.
+    var frameTicks: [Int64]? = nil
     var payloadFileName: String { (thumbnail == nil ? "video.mp4" : "thumbnail.jpg") + (encryption == nil ? "" : ".hbnvr") }
     var contentType: String { encryption != nil ? "application/octet-stream" : (thumbnail != nil ? "image/jpeg" : (key.hasSuffix(".mp4") ? "video/mp4" : (key.hasSuffix(".json") ? "application/json" : "text/plain"))) }
     func validateKind() throws {
         try tagMetadata?.validate()
+        guard tagRevision.map({ UUID(uuidString: $0) != nil }) ?? true else { throw ServiceError("Invalid pending tag revision.") }
+        if let frameTicks {
+            guard thumbnail == nil, let endTicks, frameTicks.first == 0,
+                  frameTicks.count <= 100_000, frameTicks.last! < endTicks,
+                  zip(frameTicks, frameTicks.dropFirst()).allSatisfy({ $0 < $1 }) else {
+                throw ServiceError("Invalid pending recording sample coordinates.")
+            }
+        }
         guard encryption == nil || tagMetadata?.timeline == nil else { throw ServiceError("Encrypted recording tags must not be plaintext in spool metadata.") }
         if let thumbnail {
             try thumbnail.validate()
-            guard thumbnail.tags == nil, tagMetadata == nil else { throw ServiceError("Thumbnail tags belong inside the JPEG, not its spool descriptor.") }
+            guard thumbnail.tags == nil, tagMetadata == nil, tagRevision == nil, frameTicks == nil else { throw ServiceError("Thumbnail tags belong inside the JPEG, not its spool descriptor.") }
             guard schemaVersion == 2, timing == nil, endTicks == nil, thumbnail.storeID == storeID, thumbnail.cameraID == cameraID,
                   capturedAt.timeIntervalSince1970 == thumbnail.slot, size > 0,
                   encryption == nil || encryption == RecordingEncryption.format,
@@ -413,7 +426,10 @@ final class S3Spool {
                 // 0.7.0–0.7.2 quarantine markers are inert. Keep them until a
                 // confirmed upload permits cleanup of the complete entry.
                 let names = Set(try Self.directoryContents(directory))
-                guard names.subtracting(["quarantined"]) == ["metadata.json", metadata.payloadFileName] else { throw ServiceError("Invalid spool entry files.") }
+                let metadataStaging = Set(names.filter {
+                    $0.hasPrefix(".metadata-") && UUID(uuidString: String($0.dropFirst(10))) != nil
+                })
+                guard names.subtracting(metadataStaging).subtracting(["quarantined"]) == ["metadata.json", metadata.payloadFileName] else { throw ServiceError("Invalid spool entry files.") }
                 let fd = try Self.openFile(directory + "/" + metadata.payloadFileName, access: access); defer { close(fd) }
                 var info = stat(); guard fstat(fd, &info) == 0, info.st_size == metadata.size else { throw ServiceError("Spool size mismatch.") }
                 if requiresEncryption {
@@ -430,6 +446,19 @@ final class S3Spool {
                     if n == 0 { break }; hash.update(data: Data(buffer.prefix(n)))
                 }
                 guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == metadata.sha256 else { throw ServiceError("Spool content hash mismatch.") }
+                // A crash before atomic metadata replacement leaves only an
+                // uncommitted temp file. After validating the authoritative
+                // descriptor and payload, discard that known staging name.
+                // Never adopt it, follow links, or touch unrelated entry files.
+                for name in metadataStaging {
+                    let temp = try Self.openFile(directory + "/" + name, access: access); defer { close(temp) }
+                    var stagedInfo = stat()
+                    guard fstat(temp, &stagedInfo) == 0, stagedInfo.st_size <= S3ObjectMetadata.maximumMetadataBytes else {
+                        throw ServiceError("Unexpected tag metadata staging file; preserved for inspection.")
+                    }
+                    try removeSpoolFile(leaf + "/" + name)
+                }
+                if !metadataStaging.isEmpty { try syncDirectory(directory) }
                 let final = path + "/" + id
                 if staging {
                     guard fsync(fd) == 0 else { throw ServiceError.posix("Sync recovered video") }
@@ -511,6 +540,39 @@ final class S3Spool {
         guard let info = try SecureFiles.info(final + "/" + metadata.payloadFileName) else { throw ServiceError("Published spool file disappeared.") }
         let entry = S3SpoolEntry(metadata: metadata, directory: final, fileIdentity: S3SpoolFileIdentity(info, access: access)); entries[metadata.id] = entry
         return entry
+    }
+    /// Change only effective tag metadata, leaving the pinned media inode and
+    /// upload destination/hash untouched, including during an in-flight PUT.
+    func replaceTags(_ metadata: S3ObjectMetadata) throws {
+        try validateLocation()
+        guard let entry = entries[metadata.id], readErrors[metadata.id] == nil else {
+            throw ServiceError("Pending footage metadata is unavailable.")
+        }
+        var previous = entry.metadata, next = metadata
+        previous.tagMetadata = nil; previous.tagRevision = nil
+        next.tagMetadata = nil; next.tagRevision = nil
+        guard previous == next else { throw ServiceError("Tag update changed immutable pending footage identity.") }
+        try metadata.validateKind()
+        let data = try JSONEncoder().encode(metadata)
+        guard data.count <= S3ObjectMetadata.maximumMetadataBytes else { throw ServiceError("Pending tag metadata is oversized.") }
+        try access.validateDirectory(entry.directory)
+        let fd = try Self.openFile(entry.directory + "/" + metadata.payloadFileName, expectedIdentity: entry.fileIdentity)
+        close(fd)
+        let directory = try openEntryDirectory(metadata.id); defer { close(directory) }
+        let old = try Self.openFile(entry.directory + "/metadata.json", access: access); close(old)
+        let temporary = ".metadata-" + UUID().uuidString
+        defer { unlinkat(directory, temporary, 0) }
+        // Use the spool's access policy and anchored directory, including on
+        // encrypted ignore-ownership volumes where SecureFiles is too strict.
+        try write(data, to: entry.directory + "/" + temporary)
+        guard renameat(directory, temporary, directory, "metadata.json") == 0 else {
+            throw ServiceError.posix("Replace pending tag metadata")
+        }
+        // Keep the process owner in sync even if the final durability barrier
+        // reports an error: a later upload callback must not roll this back.
+        entries[metadata.id] = S3SpoolEntry(metadata: metadata, directory: entry.directory, fileIdentity: entry.fileIdentity)
+        try syncDirectory(entry.directory)
+        try refreshUsage()
     }
     private static func reserve(path: String, bytes: Int64, free: (String) throws -> Int64, minimum: Int64) throws -> dev_t {
         reservationLock.lock(); defer { reservationLock.unlock() }

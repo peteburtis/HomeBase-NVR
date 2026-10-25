@@ -129,7 +129,9 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         guard required.allSatisfy({ track.sets[$0] != nil }), nals.contains(where: { media.codec == "H264" ? (1...5).contains(Int($0[0] & 31)) : ($0[0] >> 1) & 63 < 32 }) else { return }
         let observed = try track.clock.observe(media)
         if observed.discontinuity { try finish(track, camera: camera) }
-        if let writer = track.writer, media.frame.keyFrame, writer.elapsed(media.frame.timestamp) >= Double(try IntervalText.seconds(mediaConfiguration.shardDuration)) { try finish(track, camera: camera) }
+        if let writer = track.writer, media.frame.keyFrame, writer.elapsed(media.frame.timestamp) >= Double(try IntervalText.seconds(mediaConfiguration.shardDuration)) {
+            try finish(track, camera: camera, nextTimestamp: media.frame.timestamp)
+        }
         if track.writer == nil {
             guard media.frame.keyFrame, !upload.suspended else { return }
             let timing = ShardTimingMetadata(storeID: mediaConfiguration.id, cameraID: camera, media: media, time: observed.timing)
@@ -165,10 +167,10 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
             }
         }
     }
-    private func finish(_ track: Track, camera: String) throws {
+    private func finish(_ track: Track, camera: String, nextTimestamp: UInt32? = nil) throws {
         guard let writer = track.writer, let config = track.config else { return }
         track.writer = nil; track.config = nil
-        var bytes = try writer.finish()
+        var bytes = try writer.finish(nextTimestamp: nextTimestamp)
         let encrypted = config.s3?.clientEncryption?.enabled == true
         if encrypted {
             guard let password = config.s3?.clientEncryption?.password else { throw ServiceError("Encryption password unavailable; refusing plaintext recording.") }
@@ -177,6 +179,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         var metadata = S3ShardMetadata.make(store: config, camera: camera, name: track.name, capturedAt: writer.capturedAt,
             data: bytes, encrypted: encrypted, id: writer.timing?.shardID ?? UUID().uuidString)
         metadata.timing = writer.timing; metadata.endTicks = writer.endTicks
+        metadata.frameTicks = writer.frameTicks.count == writer.samples && writer.samples <= 32768 ? writer.frameTicks : nil
         metadata.tagMetadata = try StoredVideoTags.freeze(writer.tagTimeline, password: encrypted ? config.s3?.clientEncryption?.password : nil)
         upload.ready(metadata, data: bytes)
         lock.lock(); status.completedShards &+= 1; lock.unlock()
@@ -211,6 +214,56 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         try queue.sync {
             _ = try playback.repairKnownKeys()
             return playback.entries.values.map(\.shard)
+        }
+    }
+    func pendingTagSnapshots(password: String? = nil, cameraID: String? = nil, shardID: String? = nil,
+                             range: MediaRange? = nil, timeline: MediaTimeline = .canonical,
+                             epochID: String? = nil) throws -> [RecordingTagSnapshot] {
+        try queue.sync {
+            let active = try tracks.filter {
+                (cameraID == nil || $0.key == cameraID) && (shardID == nil || $0.value.writer?.timing?.shardID == shardID)
+            }.values.compactMap { try $0.writer?.tagSnapshot() }.filter { snapshot in
+                if let epochID, snapshot.timing.time.epochID != epochID { return false }
+                guard let range else { return true }
+                guard let anchor = timeline.anchor(snapshot.timing.time) else { return false }
+                return anchor < range.end && anchor + Double(snapshot.endTicks) / Double(snapshot.timing.timescale) > range.start
+            }
+            return active + (try upload.pendingTagSnapshots(password: password, cameraID: cameraID, shardID: shardID,
+                range: range, timeline: timeline, epochID: epochID))
+        }
+    }
+    func commitPendingTags(_ edits: [RecordingTagEdit], work: MediaWork, password: String? = nil) throws {
+        try queue.sync {
+            guard !shuttingDown else { throw ServiceError("S3 recording is stopping.") }
+            for edit in edits {
+                try work.check()
+                let id = edit.snapshot.timing.shardID
+                if let writer = tracks.values.compactMap(\.writer).first(where: { $0.timing?.shardID == id }) {
+                    guard writer.timing == edit.snapshot.timing,
+                          edit.overrides.allSatisfy({ $0.end <= edit.snapshot.endTicks }) else {
+                        throw ServiceError("Active footage changed while preparing tags.")
+                    }
+                    try writer.applyTags(edit.overrides)
+                } else if try !upload.applyPendingTags(edit, work: work, password: password) {
+                    // Rollover/upload completion may run between inspect and
+                    // commit. Resolve the same footage on this serial queue.
+                    guard let current = playback.entries[id]?.shard, current.timing == edit.snapshot.timing,
+                          edit.overrides.allSatisfy({ $0.start >= 0 && $0.end <= min(current.endTicks, edit.snapshot.endTicks) }) else {
+                        throw ServiceError("Selected S3 footage is no longer available.")
+                    }
+                    var timeline = try current.tagMetadata?.thaw(password: password ?? configuration.s3?.clientEncryption?.password) ?? .unknown
+                    for override in edit.overrides { try timeline.apply(override) }
+                    var replacement = current
+                    let encrypted = current.encryption != nil || current.tagMetadata?.encrypted != nil
+                        || configuration.s3?.clientEncryption?.enabled == true
+                    let key = password ?? configuration.s3?.clientEncryption?.password
+                    guard !encrypted || key != nil else { throw ServiceError("Encrypted tag updates require an encryption password; refusing plaintext.") }
+                    replacement.tagMetadata = try StoredVideoTags.freeze(timeline, password: encrypted ? key : nil)
+                    replacement.tagRevision = UUID().uuidString
+                    try playback.editTags([.init(expected: current, replacement: replacement)])
+                }
+            }
+            playback.tick(); publishStatus()
         }
     }
     func commitHistorical(_ edits: [S3PlaybackPublisher.TagReplacement], expected: RecordingStoreConfiguration) throws {
