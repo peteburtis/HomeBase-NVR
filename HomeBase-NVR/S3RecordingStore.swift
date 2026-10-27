@@ -33,7 +33,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         var thumbnail = S3ThumbnailSelection()
     }
     init(configuration: RecordingStoreConfiguration, spoolRoot: String, factory: @escaping S3TransportFactory = AWSS3Transport.make,
-         volumeReader: @escaping (String) throws -> S3SpoolVolume = S3SpoolVolume.read, log: @escaping (String) -> Void) throws {
+         volumeReader: @escaping (String) throws -> S3SpoolVolume = S3SpoolVolume.read, tagEvents: FootageTagEvents? = nil, log: @escaping (String) -> Void) throws {
         try configuration.s3?.clientEncryption?.validate(requirePassword: true)
         config = configuration; mediaConfiguration = configuration; self.log = log
         queue = DispatchQueue(label: "hbnvr.s3." + configuration.id, qos: .utility)
@@ -41,7 +41,7 @@ final class S3RecordingStore: RecordingDestination, @unchecked Sendable {
         let spool = try S3Spool.open(storeID: configuration.id, defaultRoot: spoolRoot, settings: configuration.s3!.settings,
                                      clientEncrypted: configuration.s3?.clientEncryption?.enabled == true, volumeReader: volumeReader)
         let indexPath = URL(fileURLWithPath: spoolRoot).deletingLastPathComponent().path + "/playback/" + configuration.id
-        let publisher = S3PlaybackPublisher(configuration: configuration, path: indexPath, queue: queue, factory: factory,
+        let publisher = S3PlaybackPublisher(configuration: configuration, path: indexPath, queue: queue, factory: factory, tagEvents: tagEvents,
             changed: { [weak self] in self?.publishStatus() })
         playback = publisher
         upload = S3UploadManager(configuration: configuration, spool: spool, queue: queue, factory: factory, playback: publisher, changed: { [weak self] in self?.publishStatus() })

@@ -168,7 +168,8 @@ final class RecordingStoreManager: @unchecked Sendable {
     private let log: (String) -> Void
     private let spoolRoot: String
     private let transportFactory: S3TransportFactory
-    init(spoolRoot: String = Paths.system.base + "/private/spool", transportFactory: @escaping S3TransportFactory = AWSS3Transport.make, log: @escaping (String) -> Void = { _ in }) { self.spoolRoot = spoolRoot; self.transportFactory = transportFactory; self.log = log }
+    private let tagEvents: FootageTagEvents?
+    init(spoolRoot: String = Paths.system.base + "/private/spool", transportFactory: @escaping S3TransportFactory = AWSS3Transport.make, tagEvents: FootageTagEvents? = nil, log: @escaping (String) -> Void = { _ in }) { self.spoolRoot = spoolRoot; self.transportFactory = transportFactory; self.tagEvents = tagEvents; self.log = log }
     func install(_ config: RecordingStoreConfiguration, recoverUnavailable: Bool = false) throws {
         lock.lock(); let existing = destinations[config.id] as? S3RecordingStore; lock.unlock()
         if let existing, config.type == "S3" {
@@ -183,19 +184,19 @@ final class RecordingStoreManager: @unchecked Sendable {
             // Prepare the new, empty spool before retiring the old instance. A
             // missing drive or permissions failure leaves the old store intact.
             try config.validate()
-            let replacement = try S3RecordingStore(configuration: config, spoolRoot: spoolRoot, factory: transportFactory, log: log)
+            let replacement = try S3RecordingStore(configuration: config, spoolRoot: spoolRoot, factory: transportFactory, tagEvents: tagEvents, log: log)
             _ = existing.finish(timeout: 0) // Already disabled, flushed, and empty.
             lock.lock(); destinations[config.id] = replacement; lock.unlock()
             return
         }
         if config.type == "S3" {
-            let destination = try S3RecordingStore(configuration: config, spoolRoot: spoolRoot, factory: transportFactory, log: log)
+            let destination = try S3RecordingStore(configuration: config, spoolRoot: spoolRoot, factory: transportFactory, tagEvents: tagEvents, log: log)
             lock.lock(); destinations[config.id] = destination; unavailable[config.id] = nil; unavailableS3.remove(config.id); lock.unlock()
             return
         }
         try remove(config.id)
         let destination: LocalRecordingStore
-        do { destination = try LocalRecordingStore(configuration: config, recoverUnavailable: recoverUnavailable, log: log) }
+        do { destination = try LocalRecordingStore(configuration: config, recoverUnavailable: recoverUnavailable, tagEvents: tagEvents, log: log) }
         catch {
             guard !config.enabled else { throw error }
             lock.lock()

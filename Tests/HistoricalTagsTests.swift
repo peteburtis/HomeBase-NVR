@@ -330,6 +330,10 @@ final class HistoricalTagsTests: XCTestCase {
         XCTAssertEqual(spans.count, 1)
         XCTAssertEqual(spans.first?.tags.values["current"], "yes")
         XCTAssertEqual(try XCTUnwrap(spans.first).end, later.canonicalUTC + 1.0 / 90000, accuracy: 0.000001)
+        let authoritative = try f.engine().snapshot(.init(cameraID: f.camera,
+            ranges: [.init(start: later.canonicalUTC, end: later.canonicalUTC + 1)], keys: ["current"]))
+        XCTAssertEqual(authoritative.first?.tags.values["current"], "yes")
+        XCTAssertEqual(try XCTUnwrap(authoritative.first).end, later.canonicalUTC + 1.0 / 90000, accuracy: 0.000001)
         let frameSelection = HistoricalTagRequest.Selection(shardID: pending.id, sourceStoreID: f.configs[0].id,
             startFrame: 0, endFrame: 1)
         _ = try await f.engine().run(.init(jobID: UUID().uuidString,
@@ -352,11 +356,15 @@ final class HistoricalTagsTests: XCTestCase {
             json.withCString { _ = sqlite3_bind_text(statement, 2, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
             XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE); sqlite3_finalize(statement)
             if alreadyRenamed { XCTAssertEqual(renameat(dir.fd, pending.stagedName, dir.fd, pending.filename), 0) }
-            let writer = try LocalRecordingManifest(directory: dir, identity: .init(storeID: f.configs[0].id, cameraID: f.camera), owner: geteuid(), recoverInterrupted: false)
+            let events = FootageTagEvents(instanceID: UUID().uuidString), before = try events.snapshotToken()
+            let writer = try LocalRecordingManifest(directory: dir, identity: .init(storeID: f.configs[0].id, cameraID: f.camera), owner: geteuid(), recoverInterrupted: false, tagEvents: events)
+            XCTAssertThrowsError(try events.validate(before))
+            XCTAssertEqual(try events.snapshotToken().revision, 1)
             XCTAssertEqual(try writer.historicalTags(id: row.id), tags)
             XCTAssertEqual(try writer.recordings().first?.inode, pending.newFile.inode)
             XCTAssertEqual(try VideoTagMP4.read(Data(contentsOf: URL(fileURLWithPath: dir.path + "/" + row.filename))), tags)
             try writer.recoverTagEdits()
+            XCTAssertEqual(try events.snapshotToken().revision, 1)
         }
     }
     func testS3ManifestOnlyEditSurvivesReplayRepairAndRestartWithoutMediaUpload() async throws {

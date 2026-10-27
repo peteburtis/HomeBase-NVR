@@ -442,6 +442,10 @@ final class HistoricalBoundaryTests: XCTestCase {
         let unreadable = HistoricalTagEngine(configs: [config], manager: manager,
             factory: { _, _ in throw ServiceError("No object-read access") },
             credentials: nil, password: nil, cancellation: Cancellation())
+        let snapshot = try unreadable.snapshot(.init(cameraID: f.camera,
+            ranges: [.init(start: f.first.start, end: f.second.end)], keys: ["person", "untouched"]))
+        XCTAssertFalse(snapshot.isEmpty, "Metadata snapshots do not need S3 GetObject even for legacy overlap")
+        XCTAssertTrue(snapshot.allSatisfy { $0.tags.values["untouched"] == "retained" })
         do { _ = try await unreadable.run(request) { _ in }; XCTFail("Unverified remote overlap was accepted") }
         catch { XCTAssertTrue(error is ServiceError) }
         XCTAssertEqual(try manager.historicalS3(config.id).historicalShards().sorted { $0.start < $1.start }, original)

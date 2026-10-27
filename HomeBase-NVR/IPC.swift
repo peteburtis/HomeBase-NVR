@@ -29,6 +29,7 @@ struct Request: Codable {
     var historicalTags: HistoricalTagRequest? = nil
     var tagJobID: String? = nil
     var tagOffset: Int? = nil
+    var tagQuery: FootageTagQuery? = nil
 }
 struct AgentStatus: Codable {
     let ready: Bool
@@ -57,6 +58,8 @@ struct Reply: Codable {
     var tags: [String: String]? = nil
     var tagJob: HistoricalTagStatus? = nil
     var tagData: Data? = nil
+    var tagChange: FootageTagChange? = nil
+    var tagSnapshot: FootageTagSnapshot? = nil
     static func failure(_ error: ServiceError) -> Reply { Reply(protocolVersion: 1, status: nil, error: error.message, code: error.code) }
 }
 
@@ -205,6 +208,8 @@ enum AgentReadiness {
 
 final class AgentServer {
     private let cameraEvents = NVRCameraEvents()
+    private lazy var tagEvents = FootageTagEvents(instanceID: cameraEvents.instanceID)
+    private let tagReads = FootageTagReads()
     private let liveSessions = LiveVideoSessions()
     private lazy var playbackCatalog = PlaybackCatalog(instanceID: cameraEvents.instanceID)
     private lazy var mediaSessions = MediaSessions(provider: LocalMediaProvider(
@@ -213,10 +218,10 @@ final class AgentServer {
             return try self.stores.list()
         }, live: { [weak self] camera in self?.streams.liveTime(camera: camera) }),
         authorize: { [weak self] uid in self?.authorization.permits(uid: uid) ?? false })
-    private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, log: { [weak self] message in self?.log(message) })
+    private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, tagEvents: tagEvents, log: { [weak self] message in self?.log(message) })
     private let setupJobs: S3SetupJobs
     private let repairJobs: S3RepairJobs
-    private let tagJobs = HistoricalTagJobs()
+    private lazy var tagJobs = HistoricalTagJobs(events: tagEvents)
     private let tagReaderFactory: S3RepairReaderFactory
     private let transportFactory: S3TransportFactory
     private lazy var streams = StreamingCoordinator(log: { [weak self] message in self?.log(message) },
@@ -249,7 +254,7 @@ final class AgentServer {
         else { FileHandle.standardError.write(Data((message + "\n").utf8)) }
     }
     func run() throws {
-        defer { cameraEvents.stop(); mediaSessions.stop(); liveSessions.stop(); playbackCatalog.stop() }
+        defer { cameraEvents.stop(); tagEvents.stop(); tagReads.stop(); mediaSessions.stop(); liveSessions.stop(); playbackCatalog.stop() }
         let path = SocketIO.path(directory)
         // Validate length before acquiring resources.
         try SocketIO.address(path) { _, _ in () }
@@ -296,6 +301,8 @@ final class AgentServer {
             if !handle(client, started: started) { close(client) }
         }
         cameraEvents.stop()
+        tagEvents.stop()
+        tagReads.stop()
         playbackCatalog.stop()
         mediaSessions.stop()
         liveSessions.stop()
@@ -338,6 +345,33 @@ final class AgentServer {
                 try tagJobs.requireIdle()
             }
             switch request.operation {
+            case "media.tags.watch":
+                if let instance = request.nvrInstanceID, instance != cameraEvents.instanceID {
+                    throw ServiceError(.unavailable, "NVR instance changed; reconnect before watching tags.")
+                }
+                try tagEvents.subscribe(fd, authorize: { [weak self] in self?.authorization.permits(uid: uid) ?? false })
+                return true
+            case "media.tags.snapshot":
+                guard request.nvrInstanceID == cameraEvents.instanceID, let query = request.tagQuery else {
+                    throw ServiceError(.unavailable, "Current NVR instance and tagQuery are required.")
+                }
+                try query.validate()
+                let configs = try stores.list()
+                for config in configs { try repairJobs.requireIdle(config.id) }
+                let events = tagEvents, manager = recordings, factory = tagReaderFactory
+                try tagReads.open(fd, authorize: { [weak self] in self?.authorization.permits(uid: uid) ?? false }) { work in
+                    let (token, spans) = try events.readSnapshot(work: work) {
+                        // Each retry must discard the previous engine's cached nodes.
+                        let engine = HistoricalTagEngine(configs: configs, manager: manager, factory: factory,
+                            credentials: nil, password: nil, cancellation: work.cancellation, work: work)
+                        return try engine.snapshot(query)
+                    }
+                    var result = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
+                    result.tagSnapshot = FootageTagSnapshot(instanceID: events.instanceID,
+                        revision: token.revision, cameraID: query.cameraID, spans: spans)
+                    return result
+                }
+                return true
             case "media.tags.start":
                 guard let edit = request.historicalTags else { throw ServiceError("historicalTags is required.") }
                 if let instance = request.nvrInstanceID, instance != cameraEvents.instanceID { throw ServiceError("NVR instance changed; reconnect before editing history.") }
@@ -665,17 +699,168 @@ final class NVRCameraEvents {
     }
 }
 
+/// One latest invalidation per subscriber; missed revisions require a new
+/// metadata snapshot. No event journal or work queue survives a connection.
+final class FootageTagEvents: @unchecked Sendable {
+    struct Token: Equatable { let generation: UInt64; let revision: UInt64 }
+    let instanceID: String
+    private let lock = NSCondition()
+    private var revision: UInt64 = 0
+    private var generation: UInt64 = 0
+    private var mutations = 0
+    private var pendingReset = false
+    private var pendingRanges: [FootageTagRange] = []
+    private var subscribers: [UUID: SnapshotSubscriber] = [:]
+    private var stopped = false
+    init(instanceID: String) { self.instanceID = instanceID }
+    private func locked<T>(_ body: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try body() }
+    func beginMutation() { locked { mutations += 1; generation &+= 1 } }
+    func endMutation(ranges: [FootageTagRange] = [], reset: Bool = false) {
+        locked {
+            defer { lock.broadcast() }
+            precondition(mutations > 0)
+            generation &+= 1; mutations -= 1
+            pendingReset = pendingReset || reset
+            if !pendingReset {
+                if pendingRanges.count + ranges.count > 256 { pendingReset = true }
+                else { pendingRanges += ranges }
+            }
+            if pendingReset { pendingRanges.removeAll() }
+            guard mutations == 0, pendingReset || !pendingRanges.isEmpty else { return }
+            revision &+= 1
+            let event = FootageTagChange(instanceID: instanceID, revision: revision,
+                reset: pendingReset, ranges: Self.coalesced(pendingRanges))
+            pendingReset = false; pendingRanges.removeAll()
+            let data = (try? Self.encode(event)) ?? (try? Self.encode(.init(instanceID: instanceID,
+                revision: revision, reset: true, ranges: [])))
+            if let data, !stopped { for subscriber in subscribers.values { subscriber.offer(data) } }
+        }
+    }
+    func snapshotToken() throws -> Token {
+        try locked {
+            guard !stopped, mutations == 0 else { throw ServiceError(.unavailable, "Footage tags are changing; retry the snapshot.") }
+            return Token(generation: generation, revision: revision)
+        }
+    }
+    func validate(_ token: Token) throws {
+        try locked {
+            guard !stopped, mutations == 0, token.generation == generation, token.revision == revision else {
+                throw ServiceError(.unavailable, "Footage tags changed during the snapshot; retry the range.")
+            }
+        }
+    }
+    /// A short edit is contention, not an unavailable recorder. Wait for an idle
+    /// generation and discard any read that overlaps an edit, including errors
+    /// caused by its intermediate state. The caller's deadline and admission
+    /// limit still apply; writers never wait for readers to finish.
+    func readSnapshot<Value>(work: MediaWork, read: () throws -> Value) throws -> (Token, Value) {
+        while true {
+            let token = try locked {
+                while true {
+                    try work.check()
+                    guard !stopped else { throw ServiceError(.unavailable, "Footage tag service stopped.") }
+                    if mutations == 0 { return Token(generation: generation, revision: revision) }
+                    // Cancellation and peer closure do not signal this condition.
+                    _ = lock.wait(until: Date().addingTimeInterval(min(0.05,
+                        max(0, work.deadline - ProcessInfo.processInfo.systemUptime))))
+                }
+            }
+            let result = Result { try read() }
+            try work.check()
+            let current = locked {
+                !stopped && mutations == 0 && token.generation == generation && token.revision == revision
+            }
+            if current { return (token, try result.get()) }
+        }
+    }
+    func subscribe(_ fd: Int32, authorize: @escaping () -> Bool) throws {
+        try locked {
+            guard !stopped, subscribers.count < 8 else { throw ServiceError(.unavailable, "Tag subscription limit reached; retry later.") }
+            let id = UUID(), data = try Self.encode(.init(instanceID: instanceID, revision: revision, reset: true, ranges: []))
+            let subscriber = SnapshotSubscriber(fd: fd, initial: data, preserveInitial: true, authorize: authorize) { [weak self] in
+                self?.locked { self?.subscribers[id] = nil }
+            }
+            subscribers[id] = subscriber; subscriber.start()
+        }
+    }
+    func stop() {
+        let values = locked {
+            stopped = true; lock.broadcast()
+            let values = Array(subscribers.values); subscribers.removeAll(); return values
+        }
+        values.forEach { $0.stop() }
+    }
+    static func coalesced(_ ranges: [FootageTagRange]) -> [FootageTagRange] {
+        var result: [FootageTagRange] = []
+        for value in ranges.sorted(by: { ($0.cameraID, $0.epochID, $0.start) < ($1.cameraID, $1.epochID, $1.start) }) {
+            if let last = result.last, last.cameraID == value.cameraID, last.epochID == value.epochID,
+               value.start <= last.end + max(value.start.ulp, last.end.ulp) * 2 {
+                result[result.count - 1].end = max(last.end, value.end)
+            } else { result.append(value) }
+        }
+        return result.sorted { ($0.cameraID, $0.start, $0.epochID) < ($1.cameraID, $1.start, $1.epochID) }
+    }
+    private static func encode(_ event: FootageTagChange) throws -> Data {
+        var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil); reply.tagChange = event
+        let data = try JSONEncoder().encode(reply)
+        guard event.ranges.count <= 64, data.count <= SocketIO.limit else { throw ServiceError(.invalidMessage, "Tag invalidation exceeds its range or byte limit.") }
+        return data
+    }
+}
+
+/// Eight admitted one-shot workers, with no pending queue or persistent jobs.
+/// Store queue waits cannot be interrupted; expired results are discarded and
+/// occupied workers continue to count against admission until they return.
+final class FootageTagReads: @unchecked Sendable {
+    private let lock = NSLock()
+    private var clients: [UUID: (Int32, Cancellation)] = [:]
+    private var stopped = false
+    func open(_ fd: Int32, authorize: @escaping () -> Bool, read: @escaping (MediaWork) throws -> Reply) throws {
+        lock.lock()
+        guard !stopped, clients.count < 8 else { lock.unlock(); throw ServiceError(.unavailable, "Tag snapshot reader limit reached; retry later.") }
+        let id = UUID(), cancellation = Cancellation()
+        clients[id] = (fd, cancellation); lock.unlock()
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        DispatchQueue.global(qos: .utility).async { [self] in
+            defer { lock.lock(); clients[id] = nil; close(fd); lock.unlock() }
+            let work = MediaWork(cancellation: cancellation, deadline: deadline, peer: fd)
+            let reply: Reply
+            do {
+                guard authorize() else { throw ServiceError(.permission, "Tag snapshot access was revoked.") }
+                try work.check(); let result = try read(work); try work.check()
+                guard authorize() else { throw ServiceError(.permission, "Tag snapshot access was revoked.") }
+                let data = try JSONEncoder().encode(result)
+                guard data.count <= SocketIO.limit else { throw ServiceError(.invalidMessage, "Tag snapshot exceeds 64 KiB; narrow the ranges or keys.") }
+                try SocketIO.write(data, fd: fd, deadline: deadline, cancellation: cancellation)
+                return
+            } catch {
+                reply = .failure((error as? ServiceError) ?? ServiceError(.unavailable, "Tag metadata snapshot is unavailable."))
+            }
+            if let data = try? JSONEncoder().encode(reply) {
+                try? SocketIO.write(data, fd: fd, deadline: min(deadline, ProcessInfo.processInfo.systemUptime + 1), cancellation: cancellation)
+            }
+        }
+    }
+    func stop() {
+        lock.lock(); stopped = true
+        for (fd, cancellation) in clients.values { cancellation.stop(); _ = shutdown(fd, SHUT_RDWR) }
+        lock.unlock()
+    }
+}
+
 final class SnapshotSubscriber: @unchecked Sendable {
     private let fd: Int32
     private let condition = NSCondition()
     private var pending: Data?
+    private var first: Data?
     private var latest: Data
     private var stopped = false
     private var closed = false
     private let ended: () -> Void
     private let authorize: () -> Bool
-    init(fd: Int32, initial: Data, authorize: @escaping () -> Bool = { true }, ended: @escaping () -> Void) {
-        self.fd = fd; pending = initial; latest = initial; self.ended = ended; self.authorize = authorize
+    init(fd: Int32, initial: Data, preserveInitial: Bool = false, authorize: @escaping () -> Bool = { true }, ended: @escaping () -> Void) {
+        self.fd = fd; pending = preserveInitial ? nil : initial; first = preserveInitial ? initial : nil
+        latest = initial; self.ended = ended; self.authorize = authorize
     }
     func offer(_ data: Data) {
         condition.lock(); defer { condition.unlock() }
@@ -696,11 +881,12 @@ final class SnapshotSubscriber: @unchecked Sendable {
         while true {
             condition.lock()
             let heartbeat = Date().addingTimeInterval(30)
-            while pending == nil && !stopped {
+            while first == nil && pending == nil && !stopped {
                 if !condition.wait(until: heartbeat) { break }
             }
             if stopped { condition.unlock(); return }
-            if let pending { latest = pending }; pending = nil
+            if let first { latest = first; self.first = nil }
+            else { if let pending { latest = pending }; pending = nil }
             let data = latest
             condition.unlock()
             guard authorize() else { return }

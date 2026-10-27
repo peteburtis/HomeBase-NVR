@@ -200,6 +200,69 @@ struct FootageTagInspection: Codable, Equatable {
     var end: Double
     let tags: VideoTagTimeline.State
 }
+
+/// Short authoritative reads of metadata already held by the recorder. These
+/// requests never download footage, create jobs, or target a storage copy.
+struct FootageTagQuery: Codable, Equatable {
+    struct Range: Codable, Equatable {
+        let start: Double
+        var end: Double
+        var epochID: String? = nil
+    }
+    let cameraID: String
+    let ranges: [Range]
+    let keys: [String]
+    func validate() throws {
+        guard UUID(uuidString: cameraID) != nil, (1...64).contains(ranges.count),
+              (1...32).contains(keys.count), Set(keys).count == keys.count,
+              ranges.allSatisfy({ $0.start.isFinite && $0.end.isFinite && $0.start >= 0
+                  && $0.end > $0.start && $0.end - $0.start <= 300 && $0.end < 253402300799
+                  && ($0.epochID.map { !$0.isEmpty && $0.utf8.count <= 128
+                      && !$0.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) } ?? true) }),
+              ranges.reduce(0, { $0 + $1.end - $1.start }) <= 3600 else {
+            throw ServiceError(.invalidMessage, "Tag snapshots require a camera UUID, 1–64 ranges of at most 300 seconds (3600 total), and 1–32 distinct keys.")
+        }
+        try VideoTags.validate(Dictionary(uniqueKeysWithValues: keys.map { ($0, "") }))
+    }
+}
+struct FootageTagRange: Codable, Equatable {
+    let cameraID: String
+    let epochID: String
+    let start: Double
+    var end: Double
+}
+struct FootageTagChange: Codable, Equatable {
+    var version = 1
+    let instanceID: String
+    let revision: UInt64
+    let reset: Bool
+    let ranges: [FootageTagRange]
+}
+struct FootageTagSnapshot: Codable {
+    var version = 1
+    let instanceID: String
+    let revision: UInt64
+    let cameraID: String
+    let spans: [FootageTagInspection]
+}
+extension FootageTagQuery {
+    init(from decoder: Decoder) throws {
+        try FootageJSON.rejectUnknown(decoder, allowed: ["cameraID", "ranges", "keys"])
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cameraID = try c.decode(String.self, forKey: .cameraID)
+        ranges = try c.decode([Range].self, forKey: .ranges)
+        keys = try c.decode([String].self, forKey: .keys)
+    }
+}
+extension FootageTagQuery.Range {
+    init(from decoder: Decoder) throws {
+        try FootageJSON.rejectUnknown(decoder, allowed: ["start", "end", "epochID"])
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        start = try c.decode(Double.self, forKey: .start)
+        end = try c.decode(Double.self, forKey: .end)
+        epochID = try c.decodeIfPresent(String.self, forKey: .epochID)
+    }
+}
 private enum FootageJSON {
     struct Key: CodingKey {
         var stringValue: String

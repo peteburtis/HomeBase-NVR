@@ -1,5 +1,10 @@
 # HomeBase-NVR / hbnvr
 
+Version **0.25.0** adds bounded historical tag notifications and authoritative metadata
+snapshots over the control socket. Clients refresh already-loaded history after edits,
+reconnects, or missed events without downloading video or waiting for S3 manifests.
+See [historical tag updates](MEDIA-PROTOCOL.md#historical-tag-updates-0250).
+
 Version **0.24.0**: footage tag edits now apply to every matching Local and S3 copy through one
 source/time-range request. Destination store selection is removed. Active
 recordings, queued uploads, and confirmed recordings accept the same API; the

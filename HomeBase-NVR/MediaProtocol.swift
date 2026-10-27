@@ -114,6 +114,8 @@ enum MediaLimits {
     static let tagRanges = 65_536
 }
 struct MediaSessionInfo: Codable {
+    var historicalTagWatch = "media.tags.watch"
+    var historicalTagSnapshot = "media.tags.snapshot"
     var segmentTagsVersion = 1
     var maxSegmentTagBytes = MediaLimits.tagBytes
     var maxTaggedSegmentFrames = MediaLimits.taggedFrames

@@ -240,6 +240,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     // Metadata only, no MP4 bytes, connections, or pinned file descriptors.
     private var manifestRetries: [ManifestRetry] = []
     private let hooks: Hooks
+    private let tagEvents: FootageTagEvents?
     private var opening = Retry()
     private var nextRetention: TimeInterval = 0
     private var retentionWarning: String?
@@ -264,11 +265,12 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
     }
 
     init(configuration: RecordingStoreConfiguration, recoverUnavailable: Bool = false,
-         hooks: Hooks = Hooks(), log: @escaping (String) -> Void = { _ in }) throws {
+         hooks: Hooks = Hooks(), tagEvents: FootageTagEvents? = nil, log: @escaping (String) -> Void = { _ in }) throws {
         try configuration.validate()
         self.configuration = configuration
         self.log = log
         self.hooks = hooks
+        self.tagEvents = tagEvents
         shardSeconds = try IntervalText.seconds(configuration.shardDuration)
         retentionSeconds = try IntervalText.seconds(configuration.retentionPeriod)
         queue = DispatchQueue(label: "hbnvr.local-store.\(configuration.id)")
@@ -387,7 +389,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
                 let index: LocalRecordingManifest
                 if let existing = manifests[directory.path] { index = existing }
                 else {
-                    index = try LocalRecordingManifest(directory: directory, identity: identity, owner: configuration.ownerUID, recoverInterrupted: false)
+                    index = try LocalRecordingManifest(directory: directory, identity: identity, owner: configuration.ownerUID, recoverInterrupted: false, tagEvents: tagEvents)
                     manifests[directory.path] = index
                 }
                 try index.commitTagEdits(edits, revisions: revisions)
@@ -571,7 +573,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
             throw ServiceError("Camera directory identity changed before manifest retry; index was preserved.")
         }
         let manifest = try LocalRecordingManifest(directory: directory, identity: identity,
-            owner: configuration.ownerUID, recoverInterrupted: false)
+            owner: configuration.ownerUID, recoverInterrupted: false, tagEvents: tagEvents)
         try manifest.completeRetained(value)
         try hooks.before(.manifestCommitted, identity.cameraID)
     }
@@ -676,7 +678,7 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
                 throw ServiceError.posix("Inspect local manifest")
             }
         }
-        let value = try LocalRecordingManifest(directory: directory, identity: identity, owner: configuration.ownerUID)
+        let value = try LocalRecordingManifest(directory: directory, identity: identity, owner: configuration.ownerUID, tagEvents: tagEvents)
         manifests[directory.path] = value
         return value
     }

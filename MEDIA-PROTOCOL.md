@@ -681,3 +681,70 @@ resolved with the same exact-frame projection as `includeTags` frame requests.
 It incorporates historical edits across finalized, active-disk, and RAM sources.
 Unknown/legacy metadata projects to no values. Tags remain opaque to HBNVR;
 clients choose their presentation. JPEG bytes and framing are unchanged.
+
+
+### Historical tag updates (0.25.0)
+
+Historical edits change footage metadata independently of live camera tags. The
+ordinary control socket exposes two additive operations, advertised as
+`historicalTagWatch` and `historicalTagSnapshot` in `media.open` capabilities.
+Both use the existing protocol-version-1 newline JSON envelope and current
+control-socket authorization. No media bytes are sent by either operation.
+
+`media.tags.watch` transfers the connection to a bounded subscription. It accepts
+an optional `nvrInstanceID` check and immediately returns:
+
+```json
+{"protocolVersion":1,"tagChange":{"version":1,"instanceID":"NVR-UUID","revision":0,"reset":true,"ranges":[]}}
+```
+
+Each later change uses the same `tagChange` envelope. `reset:false` carries up to
+64 canonical, half-open footage ranges `{cameraID,epochID,start,end}`. These are
+invalidations, not tag operations: refresh overlapping loaded ranges with the
+snapshot request. Arbitrary tag keys and removals use the same mechanism. Edits
+with received/camera time selectors and frame/shard convenience selectors are
+resolved to canonical footage coordinates before notification. A successful
+change is announced after its job is idle; an uncertain partial commit or later
+durable recovery announces `reset:true`. Ordinary recording append/finalization,
+inspection, dry runs, and unchanged edits do not emit changes.
+
+Every subscription starts with a reset, including reconnects. Revisions belong
+to one NVR instance and increase only when changes are emitted. Each subscriber
+holds one pending event; a slow reader can miss revisions. A changed instance,
+revision gap, or reset requires refreshing all loaded tag ranges. Equal-revision
+30-second heartbeat repeats are ignored, including repeated reset heartbeats.
+There is no replay log. At most eight subscriptions are admitted; stalled writes
+close after five seconds. An oversized invalidation becomes a reset.
+
+`media.tags.snapshot` is an independent one-shot control request:
+
+```json
+{"protocolVersion":1,"operation":"media.tags.snapshot","nvrInstanceID":"NVR-UUID","tagQuery":{"cameraID":"CAMERA-UUID","ranges":[{"start":1790000000,"end":1790000060,"epochID":"EPOCH-UUID"}],"keys":["privacy","application.opaque"]}}
+```
+
+`epochID` is optional per range; all coordinates are canonical UTC seconds. The
+response carries `tagSnapshot` with `version:1`, `instanceID`, `revision`,
+`cameraID`, and `spans`. Each span is
+`{cameraID,timeline:"canonical",epochID,start,end,tags:{values,knownAbsent,complete}}`.
+Only requested keys appear. `complete` means every requested key has an agreed
+value or is known absent; disagreement between retained copies is unknown.
+Missing spans are unavailable metadata, not proof of empty tags. Distinct clock
+epochs remain distinct. Apply these states in place of previously fetched media
+or S3 tag maps over the requested ranges, and treat any uncovered portion as
+unknown. Never restore an older tag map over a newer snapshot. A response with
+an obsolete instance/revision must be discarded and refreshed.
+
+Snapshots read active/pending writer metadata and retained local/S3 metadata,
+including accepted historical edits not yet delivered to cloud manifests. They
+never download S3 MP4s or inspect video frame indexes, even at legacy overlapping
+boundaries. Requested ranges are limited to 1–64, each at most 300 seconds and
+3600 seconds in total; keys are 1–32 distinct valid opaque tag keys. Results are
+limited to 1024 spans and 64 KiB, with at most 64 underlying recording copies.
+Narrow requests that exceed these limits. Eight workers are admitted with a
+five-second work deadline, no pending queue, and no persistent job. A store queue
+wait may finish after the deadline; its result is discarded and its worker slot
+remains occupied until it returns. Reads wait for active historical mutations or
+durable recovery and retry from fresh metadata if an edit overlaps the read, all
+within the same deadline. Only a consistent result is returned. Cancellation,
+peer closure, shutdown, and stable storage failures still terminate the request.
+Writes never wait for snapshot readers.

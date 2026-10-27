@@ -2,7 +2,7 @@ import Foundation
 import Darwin
 import MachO
 
-enum BuildInfo { static let version = "0.24.0" }
+enum BuildInfo { static let version = "0.25.0" }
 
 enum FailureCode: Int32, Codable {
     case failure = 1, unavailable = 3, permission = 4, incompatible = 5, timeout = 6, invalidMessage = 7
@@ -28,13 +28,22 @@ typealias ProcessRunner = (String, [String]) throws -> ProcessResult
 
 enum Processes {
     static func run(_ executable: String, _ arguments: [String]) throws -> ProcessResult {
-        let process = Process(), pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
-        process.standardOutput = pipe; process.standardError = pipe
-        do { try process.run() } catch { throw ServiceError("Could not run \(executable): \(error)") }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return ProcessResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+        try autoreleasepool {
+            let process = Process(), pipe = Pipe()
+            // Authorization runs repeatedly inside long-lived socket workers.
+            // Foundation can retain the pipe until their outer pool drains;
+            // release both descriptors here, including when launch fails.
+            defer {
+                try? pipe.fileHandleForReading.close()
+                try? pipe.fileHandleForWriting.close()
+            }
+            process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
+            process.standardOutput = pipe; process.standardError = pipe
+            do { try process.run() } catch { throw ServiceError("Could not run \(executable): \(error)") }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return ProcessResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+        }
     }
     static func require(_ result: ProcessResult, _ operation: String) throws {
         guard result.status == 0 else { throw ServiceError("\(operation) failed (\(result.status)): \(result.output.trimmingCharacters(in: .whitespacesAndNewlines))") }

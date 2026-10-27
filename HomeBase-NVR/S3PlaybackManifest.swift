@@ -64,6 +64,7 @@ final class S3PlaybackPublisher: @unchecked Sendable {
     private let factory: S3TransportFactory
     private let now: () -> Date
     private let changed: () -> Void
+    private let tagEvents: FootageTagEvents?
     private var configuration: RecordingStoreConfiguration
     private(set) var entries: [String: Record] = [:]
     private var dirty: [Target: UInt64] = [:]
@@ -86,11 +87,12 @@ final class S3PlaybackPublisher: @unchecked Sendable {
     var pendingPublications: Int { dirty.count }
 
     init(configuration: RecordingStoreConfiguration, path: String, queue: DispatchQueue,
-         factory: @escaping S3TransportFactory, now: @escaping () -> Date = Date.init,
+         factory: @escaping S3TransportFactory, now: @escaping () -> Date = Date.init, tagEvents: FootageTagEvents? = nil,
          changed: @escaping () -> Void = {}, checkpoint: @escaping (String) throws -> Void = { _ in }) {
         self.configuration = configuration; self.path = path; self.queue = queue
         self.factory = factory; self.now = now; self.changed = changed
         self.checkpoint = checkpoint
+        self.tagEvents = tagEvents
         today = Self.day(now().timeIntervalSince1970)
         do { try load() } catch { warning = Self.localWarning(error) }
     }
@@ -230,9 +232,9 @@ final class S3PlaybackPublisher: @unchecked Sendable {
         try SecureFiles.atomicWrite(data, to: path + "/.tag-edit", mode: 0o600)
         try syncDirectory()
         try checkpoint("tag-intent")
-        try recoverTagEdits()
+        try recoverTagEdits(notify: false)
     }
-    private func recoverTagEdits() throws {
+    private func recoverTagEdits(notify: Bool = true) throws {
         let journal = path + "/.tag-edit"
         guard let info = try SecureFiles.info(journal) else { return }
         guard info.st_mode & S_IFMT == S_IFREG, info.st_uid == geteuid(), info.st_nlink == 1,
@@ -251,12 +253,17 @@ final class S3PlaybackPublisher: @unchecked Sendable {
             try validate(record)
             guard let old = entries[record.shard.id], Self.sameMedia(old.shard, record.shard) else { throw ServiceError("Tag recovery conflicts with stored media identity.") }
         }
+        let observing = notify && records.contains { entries[$0.shard.id]?.shard != $0.shard }
+        if observing { tagEvents?.beginMutation() }
+        var changed = false
+        defer { if observing { tagEvents?.endMutation(reset: changed) } }
         for record in records {
             try SecureFiles.atomicWrite(try JSONEncoder().encode(record), to: path + "/" + record.shard.id + ".json", mode: 0o600)
             try checkpoint("tag-record")
         }
         try syncDirectory()
         for record in records { entries[record.shard.id] = record; mark(record.shard) }
+        changed = observing
         guard unlink(journal) == 0 else { throw ServiceError.posix("Finish historical tag recovery") }
         try syncDirectory()
     }

@@ -4,6 +4,35 @@ import Darwin
 
 final class FoundationTests: XCTestCase {
     let owner = Controller(uid: 501, accountUUID: UUID(uuidString: "00000000-0000-0000-0000-000000000501")!)
+    private func openDescriptorCount() -> Int {
+        (0..<4096).reduce(0) { count, fd in
+            count + (fcntl(Int32(fd), F_GETFD) >= 0 ? 1 : 0)
+        }
+    }
+    func testRepeatedProcessRunsReleasePipesWithoutAutoreleasePoolDrain() throws {
+        // Installed IPC authorization repeatedly runs dscl on long-lived workers.
+        // An outer autorelease pool must not retain one pipe per authorization.
+        _ = try Processes.run("/usr/bin/printf", ["warmup"])
+        let before = openDescriptorCount()
+        for _ in 0..<32 {
+            let result = try Processes.run("/usr/bin/printf", ["authorized"])
+            XCTAssertEqual(result.status, 0)
+            XCTAssertEqual(result.output, "authorized")
+        }
+        XCTAssertLessThanOrEqual(openDescriptorCount(), before + 2)
+    }
+    func testFailedProcessLaunchesReleaseBothPipeEnds() {
+        let before = openDescriptorCount()
+        for _ in 0..<32 {
+            XCTAssertThrowsError(try Processes.run("/nonexistent-hbnvr-test-executable", []))
+        }
+        XCTAssertLessThanOrEqual(openDescriptorCount(), before + 2)
+    }
+    func testProcessOutputAndExitStatusSurvivePipeCleanup() throws {
+        let result = try Processes.run("/bin/sh", ["-c", "printf stdout; printf stderr >&2; exit 7"])
+        XCTAssertEqual(result.status, 7)
+        XCTAssertEqual(result.output, "stdoutstderr")
+    }
     func testLocalAuthorizationOnlyAcceptsAgentUser() {
         let auth = Authorization.local(501)
         XCTAssertTrue(auth.permits(uid: 501)); XCTAssertFalse(auth.permits(uid: 502)); XCTAssertFalse(auth.permits(uid: 0))

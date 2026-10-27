@@ -76,13 +76,15 @@ final class LocalRecordingManifest {
     private let owner: uid_t
     private let readOnly: Bool
     private let identity: LocalRecordingLayout.Identity
+    private let tagEvents: FootageTagEvents?
     private var databaseDevice: dev_t = 0
     private var databaseInode: ino_t = 0
 
     init(directory: LocalRecordingLayout.Directory, identity: LocalRecordingLayout.Identity,
-         owner: uid_t, readOnly: Bool = false, recoverInterrupted: Bool = true) throws {
+         owner: uid_t, readOnly: Bool = false, recoverInterrupted: Bool = true, tagEvents: FootageTagEvents? = nil) throws {
         self.directory = directory; self.owner = owner; self.readOnly = readOnly
         self.identity = identity
+        self.tagEvents = tagEvents
         try LocalRecordingLayout.verify(path: directory.path, fd: directory.fd, owner: owner)
         var info = stat()
         let exists = fstatat(directory.fd, Self.filename, &info, AT_SYMLINK_NOFOLLOW) == 0
@@ -398,9 +400,9 @@ final class LocalRecordingManifest {
                 try execute("INSERT INTO tag_edits VALUES (?,?)", [.text(edit.shardID), .text(String(decoding: try JSONEncoder().encode(edit), as: UTF8.self))])
             }
         }
-        try recoverTagEdits()
+        try recoverTagEdits(notify: false)
     }
-    func recoverTagEdits() throws {
+    func recoverTagEdits(notify: Bool = true) throws {
         guard !readOnly else { return }
         try checkFiles()
         let statement = try prepare("SELECT pending_json FROM tag_edits LIMIT 129")
@@ -415,6 +417,10 @@ final class LocalRecordingManifest {
             guard code == SQLITE_DONE else { throw failure("read pending tags", code) }
         }
         guard edits.count <= 128 else { throw ServiceError("Too many pending local tag edits; files preserved.") }
+        let observing = notify && !edits.isEmpty
+        if observing { tagEvents?.beginMutation() }
+        var changed = false
+        defer { if observing { tagEvents?.endMutation(reset: changed) } }
         for edit in edits {
             try checkFiles()
             try edit.tags.validate()
@@ -434,6 +440,7 @@ final class LocalRecordingManifest {
                       fstatat(directory.fd, edit.stagedName, &staged, AT_SYMLINK_NOFOLLOW) == 0,
                       LocalTagFile.matches(staged, edit.newFile) else { throw ServiceError("Pending tag edit file identity changed; files preserved.") }
                 guard renameat(directory.fd, edit.stagedName, directory.fd, edit.filename) == 0 else { throw ServiceError.posix("Publish edited recording") }
+                changed = true
             }
             guard fsync(directory.fd) == 0 else { throw ServiceError.posix("Persist edited recording") }
             try transaction {
@@ -443,6 +450,7 @@ final class LocalRecordingManifest {
                 guard sqlite3_changes(database) == 1 else { throw ServiceError("Pending tag edit lost its manifest row; file preserved.") }
                 try execute("DELETE FROM tag_edits WHERE shard_id=?", [.text(edit.shardID)])
             }
+            changed = true
         }
     }
     func playbackRecordings(from start: Double, to end: Double, timeline: MediaTimeline) throws -> [Recording] {
