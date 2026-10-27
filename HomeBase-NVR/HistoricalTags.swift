@@ -192,6 +192,13 @@ struct RecordingTagEdit {
     let snapshot: RecordingTagSnapshot
     let overrides: [VideoTagTimeline.Override]
 }
+/// A client's before-image of one local manifest row. Nil tags mean unknown,
+/// not an empty (and therefore explicitly untagged) timeline.
+struct LocalTagReadSnapshot {
+    let timing: ShardTimingMetadata
+    let endTicks: Int64
+    let tags: VideoTagTimeline?
+}
 struct FootageTagInspection: Codable, Equatable {
     let cameraID: String
     let timeline: MediaTimeline

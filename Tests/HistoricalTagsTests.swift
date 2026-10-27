@@ -91,11 +91,11 @@ final class HistoricalTagsTests: XCTestCase {
         }
     }
     func fixture(stores: Int = 1, codec: CMVideoCodecType = kCMVideoCodecType_H264,
-                 firstStoreGap: Range<Int>? = nil) throws -> Fixture {
+                 firstStoreGap: Range<Int>? = nil, tagEvents: FootageTagEvents? = nil) throws -> Fixture {
         let root = "/private/tmp/hbnvr-history-tags-" + UUID().uuidString
         try SecureFiles.ensureDirectory(root, owner: geteuid(), mode: 0o700)
         let configs = try (0..<stores).map { try StoreTests().config(root + "/store\($0)") }
-        let manager = RecordingStoreManager(spoolRoot: root + "/spool")
+        let manager = RecordingStoreManager(spoolRoot: root + "/spool", tagEvents: tagEvents)
         for config in configs { try manager.install(config) }
         let camera = UUID().uuidString, start = Date().timeIntervalSince1970 - 3600
         var timeline = RecordingTimeline(), samples: [EncodedMedia] = []
@@ -334,6 +334,10 @@ final class HistoricalTagsTests: XCTestCase {
             ranges: [.init(start: later.canonicalUTC, end: later.canonicalUTC + 1)], keys: ["current"]))
         XCTAssertEqual(authoritative.first?.tags.values["current"], "yes")
         XCTAssertEqual(try XCTUnwrap(authoritative.first).end, later.canonicalUTC + 1.0 / 90000, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(authoritative.last).end,
+            later.canonicalUTC + Double(pending.endTicks) / Double(pending.timescale), accuracy: 0.000001,
+            "Client snapshots use the manifest checkpoint, including its provisional tail")
+        XCTAssertTrue(try XCTUnwrap(authoritative.last).tags.knownAbsent.contains("current"))
         let frameSelection = HistoricalTagRequest.Selection(shardID: pending.id, sourceStoreID: f.configs[0].id,
             startFrame: 0, endFrame: 1)
         _ = try await f.engine().run(.init(jobID: UUID().uuidString,
@@ -366,6 +370,93 @@ final class HistoricalTagsTests: XCTestCase {
             try writer.recoverTagEdits()
             XCTAssertEqual(try events.snapshotToken().revision, 1)
         }
+    }
+    func testLocalTagFailureRetainsOldMetadataUntilRecoveryCommits() throws {
+        let f = try fixture(), (directory, reader) = try f.index()
+        let row = try XCTUnwrap(reader.recordings().first)
+        let original = try reader.historicalTags(id: row.id)
+        var replacement = try XCTUnwrap(original)
+        try replacement.apply(.init(start: 0, end: row.endTicks, key: "private", value: "true"))
+        let source = LocalMediaProvider.Source(directory: directory, owner: geteuid(), row: row,
+            range: .init(start: row.start, end: row.end))
+        let pending = try LocalTagFile.stage(source: source, tags: replacement, jobID: UUID().uuidString, work: MediaWork())
+        let events = FootageTagEvents(instanceID: UUID().uuidString)
+        let writer = try LocalRecordingManifest(directory: directory,
+            identity: .init(storeID: f.configs[0].id, cameraID: f.camera), owner: geteuid(),
+            recoverInterrupted: false, tagEvents: events)
+        var sql: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.path + "/" + LocalRecordingManifest.filename, &sql), SQLITE_OK)
+        defer { sqlite3_close(sql) }
+        XCTAssertEqual(sqlite3_exec(sql, """
+            CREATE TRIGGER fail_tag_commit BEFORE UPDATE OF file_device ON recordings
+            BEGIN SELECT RAISE(ABORT, 'injected tag commit failure'); END
+            """, nil, nil, nil), SQLITE_OK)
+        XCTAssertThrowsError(try writer.commitTagEdits([pending],
+            revisions: [row.id: HistoricalTags.revision(original)]))
+        // The file is already new, but the old metadata remains readable and
+        // no notification claims that the tag publication has completed.
+        XCTAssertEqual(try VideoTagMP4.read(Data(contentsOf: URL(fileURLWithPath: directory.path + "/" + row.filename))), replacement)
+        let (before, captured) = try events.readLocalSnapshot(storeID: f.configs[0].id, work: MediaWork()) { overlays in
+            try XCTUnwrap(overlays[row.id])
+        }
+        XCTAssertEqual(before.revision, 0)
+        XCTAssertEqual(captured.tags, original)
+        XCTAssertEqual(captured.endTicks, row.endTicks)
+        XCTAssertNil(captured.tags?.tags(at: 0)?["private"])
+        let query = FootageTagQuery(cameraID: f.camera,
+            ranges: [.init(start: row.start, end: row.end)], keys: ["private"])
+        let (_, projected) = try events.readLocalSnapshot(storeID: f.configs[0].id, work: MediaWork()) {
+            try f.engine().snapshot(query, overlays: $0)
+        }
+        XCTAssertTrue(projected.first?.tags.knownAbsent.contains("private") == true,
+            "A cold client query succeeds while the file and manifest identities disagree")
+        // An unsuccessful retry must keep the original before-image.
+        XCTAssertThrowsError(try writer.recoverTagEdits())
+        let (_, retried) = try events.readLocalSnapshot(storeID: f.configs[0].id, work: MediaWork()) { $0[row.id] }
+        XCTAssertEqual(retried?.tags, original)
+        XCTAssertEqual(sqlite3_exec(sql, "DROP TRIGGER fail_tag_commit", nil, nil, nil), SQLITE_OK)
+        try writer.recoverTagEdits()
+        let (after, empty) = try events.readLocalSnapshot(storeID: f.configs[0].id, work: MediaWork()) { $0.isEmpty }
+        XCTAssertTrue(empty)
+        XCTAssertEqual(after.revision, 1)
+        XCTAssertEqual(try writer.historicalTags(id: row.id), replacement)
+        try writer.recoverTagEdits()
+        XCTAssertEqual(try events.snapshotToken().revision, 1)
+    }
+    func testRetentionDropsBeforeImageFromFailedTagPublication() throws {
+        let f = try fixture(), (directory, reader) = try f.index()
+        let row = try XCTUnwrap(reader.recordings().first)
+        let original = try reader.historicalTags(id: row.id)
+        var replacement = try XCTUnwrap(original)
+        try replacement.apply(.init(start: 0, end: row.endTicks, key: "private", value: "true"))
+        let source = LocalMediaProvider.Source(directory: directory, owner: geteuid(), row: row,
+            range: .init(start: row.start, end: row.end))
+        let pending = try LocalTagFile.stage(source: source, tags: replacement, jobID: UUID().uuidString, work: MediaWork())
+        let events = FootageTagEvents(instanceID: UUID().uuidString)
+        let writer = try LocalRecordingManifest(directory: directory,
+            identity: .init(storeID: f.configs[0].id, cameraID: f.camera), owner: geteuid(),
+            recoverInterrupted: false, tagEvents: events)
+        var sql: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.path + "/" + LocalRecordingManifest.filename, &sql), SQLITE_OK)
+        defer { sqlite3_close(sql) }
+        XCTAssertEqual(sqlite3_exec(sql, """
+            CREATE TRIGGER fail_tag_commit BEFORE UPDATE OF file_device ON recordings
+            BEGIN SELECT RAISE(ABORT, 'injected tag commit failure'); END
+            """, nil, nil, nil), SQLITE_OK)
+        XCTAssertThrowsError(try writer.commitTagEdits([pending],
+            revisions: [row.id: HistoricalTags.revision(original)]))
+        let (before, retained) = try events.readLocalSnapshot(storeID: f.configs[0].id, work: MediaWork()) { $0[row.id] }
+        XCTAssertEqual(before.revision, 0)
+        XCTAssertEqual(retained?.tags, original)
+
+        XCTAssertEqual(unlinkat(directory.fd, row.filename, 0), 0)
+        try writer.remove(filename: row.filename)
+        let (after, empty) = try events.readLocalSnapshot(storeID: f.configs[0].id, work: MediaWork()) { $0.isEmpty }
+        XCTAssertTrue(empty)
+        XCTAssertEqual(after.revision, 1)
+        XCTAssertTrue(try reader.localTagSnapshots(range: .init(start: row.start, end: row.end)).isEmpty)
+        try writer.remove(filename: row.filename)
+        XCTAssertEqual(try events.snapshotToken().revision, 1, "An already-absent row must not publish another change")
     }
     func testS3ManifestOnlyEditSurvivesReplayRepairAndRestartWithoutMediaUpload() async throws {
         let helper = S3PlaybackManifestTests(), config = try helper.config(), camera = UUID().uuidString, root = try helper.root()

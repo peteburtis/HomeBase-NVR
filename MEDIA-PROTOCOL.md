@@ -703,10 +703,13 @@ Each later change uses the same `tagChange` envelope. `reset:false` carries up t
 invalidations, not tag operations: refresh overlapping loaded ranges with the
 snapshot request. Arbitrary tag keys and removals use the same mechanism. Edits
 with received/camera time selectors and frame/shard convenience selectors are
-resolved to canonical footage coordinates before notification. A successful
-change is announced after its job is idle; an uncertain partial commit or later
-durable recovery announces `reset:true`. Ordinary recording append/finalization,
-inspection, dry runs, and unchanged edits do not emit changes.
+resolved to canonical footage coordinates. Each changed local shard is announced
+after its durable commit and removal of its temporary before-image, so consumers
+can immediately read the committed value. A batch can publish shards separately;
+it need not wait for other local copies or S3 delivery. Failed commits retain
+their before-image until recovery succeeds. Changing the selected local source
+announces `reset:true`. Ordinary recording append/finalization, inspection, dry
+runs, and unchanged edits do not emit changes.
 
 Every subscription starts with a reset, including reconnects. Revisions belong
 to one NVR instance and increase only when changes are emitted. Each subscriber
@@ -727,24 +730,32 @@ response carries `tagSnapshot` with `version:1`, `instanceID`, `revision`,
 `cameraID`, and `spans`. Each span is
 `{cameraID,timeline:"canonical",epochID,start,end,tags:{values,knownAbsent,complete}}`.
 Only requested keys appear. `complete` means every requested key has an agreed
-value or is known absent; disagreement between retained copies is unknown.
+value or is known absent; disagreement between overlapping shards is unknown.
 Missing spans are unavailable metadata, not proof of empty tags. Distinct clock
 epochs remain distinct. Apply these states in place of previously fetched media
 or S3 tag maps over the requested ranges, and treat any uncovered portion as
-unknown. Never restore an older tag map over a newer snapshot. A response with
-an obsolete instance/revision must be discarded and refreshed.
+unknown. Never restore an older tag map over a newer accepted snapshot. Discard
+an obsolete instance or source-reset response. A coherent older revision may
+complete across an ordinary tag change; refresh affected ranges afterward.
 
-Snapshots read active/pending writer metadata and retained local/S3 metadata,
-including accepted historical edits not yet delivered to cloud manifests. They
-never download S3 MP4s or inspect video frame indexes, even at legacy overlapping
-boundaries. Requested ranges are limited to 1–64, each at most 300 seconds and
+Snapshots use the first local store by store ID, matching local playback
+discovery, including disabled stores with retained history. Its manifest is the
+stable source of truth. Active recordings use persisted metadata checkpoints,
+which can lag accepted frames. While a shard's tags are being committed, a small
+memory layer supplies the prior whole row, including unknown and absent values.
+The layer is dropped before its notification is published. These reads do not
+wait on recording queues or participate in MP4 rewriting or S3 publication.
+S3-only configurations return code 5 (`incompatible`); clients retain embedded
+media tags instead of interpreting this as an empty tag set. Stored local and
+S3 tag editing/inspection still updates all matching copies as before.
+
+Requested ranges are limited to 1–64, each at most 300 seconds and
 3600 seconds in total; keys are 1–32 distinct valid opaque tag keys. Results are
 limited to 1024 spans and 64 KiB, with at most 64 underlying recording copies.
 Narrow requests that exceed these limits. Eight workers are admitted with a
-five-second work deadline, no pending queue, and no persistent job. A store queue
-wait may finish after the deadline; its result is discarded and its worker slot
-remains occupied until it returns. Reads wait for active historical mutations or
-durable recovery and retry from fresh metadata if an edit overlaps the read, all
-within the same deadline. Only a consistent result is returned. Cancellation,
-peer closure, shutdown, and stable storage failures still terminate the request.
-Writes never wait for snapshot readers.
+five-second work deadline, no pending queue, and no persistent job. A read that
+races installation or removal of the layer retries within that deadline; an
+ongoing write leaves the old read view available. SQLite reads retain their
+bounded busy timeout. Cancellation, peer closure, shutdown, and stable storage
+failures still terminate the request. No read-view lock is held during disk I/O,
+and tag writers do not wait for client requests to finish.

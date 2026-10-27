@@ -192,7 +192,7 @@ enum LocalRecordingErrorLog {
 
 /// Built-in destination. File/container concerns never escape this implementation.
 final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
-    enum Operation { case openDestination, createShard, beginManifest, checkpointManifest, completeManifest, retryManifest, manifestCommitted, append, finalize, retention }
+    enum Operation { case openDestination, createShard, beginManifest, checkpointManifest, completeManifest, retryManifest, manifestCommitted, editTags, append, finalize, retention }
     struct Hooks {
         var now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
         var before: (Operation, String?) throws -> Void = { _, _ in }
@@ -348,9 +348,26 @@ final class LocalRecordingStore: RecordingDestination, @unchecked Sendable {
                     guard let id = track.recordingID, let manifest = track.manifest else {
                         throw ServiceError("Recording metadata is unavailable for tag edit.")
                     }
-                    try manifest.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount, tags: replacement.timeline)
+                    if let tagEvents {
+                        guard let previous = try manifest.historicalRecordings(id: id).first else {
+                            throw ServiceError("Recording metadata disappeared during tag edit.")
+                        }
+                        let tags = try manifest.historicalTags(id: id)
+                        tagEvents.beginLocalEdit(storeID: configuration.id,
+                            snapshot: .init(timing: previous.timing, endTicks: previous.endTicks, tags: tags))
+                    }
+                    do {
+                        try hooks.before(.editTags, track.camera)
+                        try manifest.progress(id: id, endTicks: writer.endTicks, frames: writer.sampleCount, tags: replacement.timeline)
+                    } catch {
+                        // progress is one SQLite transaction and rolls back on
+                        // error; neither disk nor the writer has changed.
+                        tagEvents?.finishLocalEdit(storeID: configuration.id, shardID: id)
+                        throw error
+                    }
                     writer.replaceTags(replacement)
                     track.lastManifestCheckpoint = hooks.now()
+                    tagEvents?.finishLocalEdit(storeID: configuration.id, shardID: id, endTicks: writer.endTicks)
                 } else {
                     var applied = false
                     let provider = LocalMediaProvider(configurations: { [self.configuration] })

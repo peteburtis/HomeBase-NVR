@@ -93,6 +93,30 @@ final class LocalManifestTests: XCTestCase {
         XCTAssertThrowsError(try db!.complete(id: row.id, filename: row.file, endTicks: 900000, frames: 150))
         XCTAssertThrowsError(try reader.remove(filename: row.file))
     }
+    func testClientTagSnapshotsUseCheckpointMetadataWithoutInspectingMediaFiles() throws {
+        let f = try fixture(), writer = try f.open()
+        let active = try recorded(f, writer, complete: false)
+        let tags = VideoTagTimeline(changes: [.init(ticks: 0, frame: 0, tags: ["private": "true"])])
+        try writer.progress(id: active.id, endTicks: 450000, frames: 150, tags: tags)
+        let reader = try f.open(readOnly: true)
+        let snapshots = try reader.localTagSnapshots(range: .init(start: 99, end: 111))
+        let value = try XCTUnwrap(snapshots.first)
+        XCTAssertEqual(snapshots.count, 1)
+        XCTAssertEqual(value.timing.shardID, active.id)
+        XCTAssertEqual(value.endTicks, 450000)
+        XCTAssertEqual(value.tags, tags)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: f.directory.path + "/" + active.file))
+        XCTAssertTrue(try reader.localTagSnapshots(range: .init(start: 105, end: 110)).isEmpty)
+        try writer.interrupt(id: active.id)
+        XCTAssertTrue(try reader.localTagSnapshots(range: .init(start: 99, end: 111)).isEmpty)
+
+        let finalized = try recorded(f, writer, number: 2, start: 120)
+        try FileManager.default.removeItem(atPath: f.directory.path + "/" + finalized.file)
+        let legacy = try XCTUnwrap(reader.localTagSnapshots(range: .init(start: 120, end: 130)).first)
+        XCTAssertEqual(legacy.timing.shardID, finalized.id)
+        XCTAssertNil(legacy.tags, "Missing legacy tags must remain unknown metadata")
+        XCTAssertThrowsError(try reader.localTagSnapshots(range: .init(start: 130, end: 120)))
+    }
     func testManifestLossNeverScansOrBackfillsOldFootage() throws {
         let f = try fixture(), databasePath = f.directory.path + "/" + LocalRecordingManifest.filename
         var db: LocalRecordingManifest? = try f.open()

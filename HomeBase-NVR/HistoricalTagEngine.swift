@@ -30,6 +30,12 @@ final class HistoricalTagEngine: @unchecked Sendable {
             revision = try HistoricalTags.revision(pending.tags)
             ticks = pending.frameTicks.isEmpty ? nil : pending.frameTicks
         }
+        init(config: RecordingStoreConfiguration, snapshot: LocalTagReadSnapshot) throws {
+            self.config = config; local = nil; remote = nil; pending = nil
+            timing = snapshot.timing; end = snapshot.endTicks
+            original = snapshot.tags; edited = snapshot.tags ?? .unknown
+            revision = try HistoricalTags.revision(snapshot.tags)
+        }
     }
     let configs: [RecordingStoreConfiguration]
     let manager: RecordingStoreManager
@@ -375,26 +381,43 @@ final class HistoricalTagEngine: @unchecked Sendable {
         }
         return merged
     }
-    /// Metadata-only canonical view. In particular this deliberately does not
-    /// call selectedSpans: legacy overlapping tails require media inspection
-    /// for edits, while a read can safely report their tag disagreement unknown.
-    func snapshot(_ query: FootageTagQuery) throws -> [FootageTagInspection] {
+    /// Client reads follow playback's first local store, including disabled
+    /// stores with retained history. Editing/inspection still resolves all copies.
+    static func clientStore(_ configs: [RecordingStoreConfiguration]) -> RecordingStoreConfiguration? {
+        configs.filter { $0.type == "Local" }.min { $0.id < $1.id }
+    }
+    /// The manifest is the stable source; before-images shadow entire rows while
+    /// they are being replaced. No recording queue, MP4 copy, or S3 I/O is needed.
+    func snapshot(_ query: FootageTagQuery, overlays: [String: LocalTagReadSnapshot] = [:]) throws -> [FootageTagInspection] {
         try query.validate(); try work.check()
+        guard let config = Self.clientStore(configs) else {
+            throw ServiceError(.incompatible, "Live footage tag snapshots require a local recording store.")
+        }
         var selections: [Selection] = []
         var grouped: [String: [Span]] = [:]
         var requested: [String: [MediaRange]] = [:]
         for range in query.ranges {
             let bounds = MediaRange(start: range.start, end: range.end)
-            for config in configs {
-                for node in try find(in: config, camera: query.cameraID, range: bounds, epoch: range.epochID) {
-                    let epoch = node.timing.time.epochID
-                    let span = Span(node: node, start: node.timing.time.canonicalUTC,
-                        end: node.timing.time.canonicalUTC + Double(node.end) / Double(node.timing.timescale))
-                    if !(grouped[epoch]?.contains(where: { $0.node.identity == node.identity }) ?? false) {
-                        grouped[epoch, default: []].append(span)
-                    }
-                    requested[epoch, default: []].append(bounds)
+            var rows: [String: LocalTagReadSnapshot] = [:]
+            try LocalMediaProvider(configurations: { [config] }, ram: nil).visitIndexes(camera: query.cameraID, work: work) { _, _, index in
+                for row in try index.localTagSnapshots(range: bounds) where overlays[row.timing.shardID] == nil {
+                    rows[row.timing.shardID] = row
                 }
+            }
+            for (id, row) in overlays { rows[id] = row }
+            for row in rows.values where row.timing.cameraID == query.cameraID && row.endTicks > 0 {
+                let start = row.timing.time.canonicalUTC
+                let end = start + Double(row.endTicks) / Double(row.timing.timescale)
+                guard start < bounds.end, end > bounds.start,
+                      range.epochID == nil || row.timing.time.epochID == range.epochID else { continue }
+                let node = try remember(Node(config: config, snapshot: row))
+                let epoch = node.timing.time.epochID
+                let span = Span(node: node, start: node.timing.time.canonicalUTC,
+                    end: node.timing.time.canonicalUTC + Double(node.end) / Double(node.timing.timescale))
+                if !(grouped[epoch]?.contains(where: { $0.node.identity == node.identity }) ?? false) {
+                    grouped[epoch, default: []].append(span)
+                }
+                requested[epoch, default: []].append(bounds)
             }
         }
         for epoch in requested.keys.sorted() {
@@ -605,8 +628,6 @@ final class HistoricalTagJobs: @unchecked Sendable {
     private let lock = NSLock()
     private var jobs: [String: Job] = [:]
     private var order: [String] = []
-    private let events: FootageTagEvents?
-    init(events: FootageTagEvents? = nil) { self.events = events }
     private func locked<T>(_ body: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try body() }
     func requireIdle() throws { try locked { if jobs.values.contains(where: { $0.active }) { throw ServiceError("A historical tag job is active; wait before changing recording configuration or repairing metadata.") } } }
     func start(_ request: HistoricalTagRequest, uid: uid_t, configs: [RecordingStoreConfiguration], manager: RecordingStoreManager,
@@ -620,15 +641,12 @@ final class HistoricalTagJobs: @unchecked Sendable {
             guard !jobs.values.contains(where: { $0.active }) else { throw ServiceError("Another historical tag job is active; retry when it finishes.") }
             while order.count >= 8 { jobs.removeValue(forKey: order.removeFirst()) }
             let job = Job(request, uid: uid); jobs[request.jobID] = job; order.append(request.jobID)
-            let mutating = !request.inspect && !request.dryRun
-            if mutating { events?.beginMutation() }
             let engine = HistoricalTagEngine(configs: configs, manager: manager, factory: factory,
                 credentials: credentials, password: password, cancellation: job.cancellation)
             job.task = Task.detached(priority: .utility) { [self, job] in
                 do {
                     let (status, data) = try await engine.run(request) { status in self.locked { job.status = status } }
                     locked { job.status = status; job.data = data; job.task = nil }
-                    if mutating { events?.endMutation(ranges: engine.changedRanges) }
                 } catch {
                     locked {
                         job.status.state = "failed"
@@ -637,7 +655,6 @@ final class HistoricalTagJobs: @unchecked Sendable {
                         job.status.message = "Some footage copies may already be updated. Inspect the footage range before retrying."
                         job.task = nil
                     }
-                    if mutating { events?.endMutation(reset: engine.mutationAttempted) }
                 }
             }
             return job.status

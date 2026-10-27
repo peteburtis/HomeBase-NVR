@@ -221,7 +221,7 @@ final class AgentServer {
     private lazy var recordings = RecordingStoreManager(spoolRoot: system ? Paths.system.base + "/private/spool" : directory + "/spool", transportFactory: transportFactory, tagEvents: tagEvents, log: { [weak self] message in self?.log(message) })
     private let setupJobs: S3SetupJobs
     private let repairJobs: S3RepairJobs
-    private lazy var tagJobs = HistoricalTagJobs(events: tagEvents)
+    private let tagJobs = HistoricalTagJobs()
     private let tagReaderFactory: S3RepairReaderFactory
     private let transportFactory: S3TransportFactory
     private lazy var streams = StreamingCoordinator(log: { [weak self] message in self?.log(message) },
@@ -283,6 +283,7 @@ final class AgentServer {
         defer { if !cleanedUp { tagJobs.stop(); setupJobs.stop(); repairJobs.stop(); streams.stop(); recordings.stop() } }
         let initialStores = try stores.list()
         recordings.load(initialStores)
+        tagEvents.selectLocalStore(initialStores)
         let initialCameras = try cameras.configurations()
         try cameraEvents.replace(initialCameras)
         playbackCatalog.replace(stores: initialStores, cameras: initialCameras)
@@ -338,6 +339,7 @@ final class AgentServer {
                 if request.operation.hasPrefix("cameras.") || (request.operation.hasPrefix("stores.") && !request.operation.hasPrefix("stores.repair.")),
                    let values = try? cameras.configurations(), let configs = try? stores.list() {
                     playbackCatalog.replace(stores: configs, cameras: values)
+                    tagEvents.selectLocalStore(configs)
                 }
             }
             var reply = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
@@ -357,14 +359,17 @@ final class AgentServer {
                 }
                 try query.validate()
                 let configs = try stores.list()
-                for config in configs { try repairJobs.requireIdle(config.id) }
+                guard let source = HistoricalTagEngine.clientStore(configs) else {
+                    throw ServiceError(.incompatible, "Live footage tag snapshots require a local recording store.")
+                }
+                try repairJobs.requireIdle(source.id)
                 let events = tagEvents, manager = recordings, factory = tagReaderFactory
                 try tagReads.open(fd, authorize: { [weak self] in self?.authorization.permits(uid: uid) ?? false }) { work in
-                    let (token, spans) = try events.readSnapshot(work: work) {
+                    let (token, spans) = try events.readLocalSnapshot(storeID: source.id, configuration: source, work: work) { overlays in
                         // Each retry must discard the previous engine's cached nodes.
                         let engine = HistoricalTagEngine(configs: configs, manager: manager, factory: factory,
                             credentials: nil, password: nil, cancellation: work.cancellation, work: work)
-                        return try engine.snapshot(query)
+                        return try engine.snapshot(query, overlays: overlays)
                     }
                     var result = Reply(protocolVersion: 1, status: nil, error: nil, code: nil)
                     result.tagSnapshot = FootageTagSnapshot(instanceID: events.instanceID,
@@ -704,73 +709,106 @@ final class NVRCameraEvents {
 final class FootageTagEvents: @unchecked Sendable {
     struct Token: Equatable { let generation: UInt64; let revision: UInt64 }
     let instanceID: String
-    private let lock = NSCondition()
+    private let lock = NSLock()
     private var revision: UInt64 = 0
     private var generation: UInt64 = 0
-    private var mutations = 0
-    private var pendingReset = false
-    private var pendingRanges: [FootageTagRange] = []
+    private var overlays: [String: [String: LocalTagReadSnapshot]] = [:]
+    private struct StoreBinding: Equatable {
+        let directory: String
+        let ownerUID: uid_t
+        let ownerUUID: UUID
+        init(_ config: RecordingStoreConfiguration) {
+            directory = config.directory; ownerUID = config.ownerUID; ownerUUID = config.ownerUUID
+        }
+    }
+    private var localBindings: [String: StoreBinding] = [:]
+    private var localSource: RecordingStoreConfiguration?
+    private var sourceConfigured = false
     private var subscribers: [UUID: SnapshotSubscriber] = [:]
     private var stopped = false
     init(instanceID: String) { self.instanceID = instanceID }
     private func locked<T>(_ body: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try body() }
-    func beginMutation() { locked { mutations += 1; generation &+= 1 } }
-    func endMutation(ranges: [FootageTagRange] = [], reset: Bool = false) {
+
+    /// Called after store installation/removal has settled, before publishing
+    /// the source change. A reset also restores capability after S3-only use.
+    func selectLocalStore(_ configs: [RecordingStoreConfiguration]) {
         locked {
-            defer { lock.broadcast() }
-            precondition(mutations > 0)
-            generation &+= 1; mutations -= 1
-            pendingReset = pendingReset || reset
-            if !pendingReset {
-                if pendingRanges.count + ranges.count > 256 { pendingReset = true }
-                else { pendingRanges += ranges }
+            let next = HistoricalTagEngine.clientStore(configs)
+            let changed = localSource != next
+            let bindings = Dictionary(uniqueKeysWithValues: configs.filter { $0.type == "Local" }.map { ($0.id, StoreBinding($0)) })
+            for id in Array(overlays.keys) where bindings[id] == nil ||
+                (localBindings[id] != nil && localBindings[id] != bindings[id]) {
+                overlays[id] = nil
+                generation &+= 1
             }
-            if pendingReset { pendingRanges.removeAll() }
-            guard mutations == 0, pendingReset || !pendingRanges.isEmpty else { return }
-            revision &+= 1
-            let event = FootageTagChange(instanceID: instanceID, revision: revision,
-                reset: pendingReset, ranges: Self.coalesced(pendingRanges))
-            pendingReset = false; pendingRanges.removeAll()
-            let data = (try? Self.encode(event)) ?? (try? Self.encode(.init(instanceID: instanceID,
-                revision: revision, reset: true, ranges: [])))
-            if let data, !stopped { for subscriber in subscribers.values { subscriber.offer(data) } }
+            localBindings = bindings
+            localSource = next; sourceConfigured = true
+            if changed { generation &+= 1; publish(ranges: [], reset: true) }
         }
+    }
+    func beginLocalEdit(storeID: String, snapshot: LocalTagReadSnapshot) {
+        locked {
+            // Recovery must retain the original before-image after a partial
+            // failure, even when the retry observes some new on-disk state.
+            guard overlays[storeID]?[snapshot.timing.shardID] == nil else { return }
+            overlays[storeID, default: [:]][snapshot.timing.shardID] = snapshot
+            generation &+= 1
+        }
+    }
+    func finishLocalEdit(storeID: String, shardID: String, endTicks: Int64? = nil) {
+        locked {
+            guard let old = overlays[storeID]?.removeValue(forKey: shardID) else { return }
+            if overlays[storeID]?.isEmpty == true { overlays[storeID] = nil }
+            generation &+= 1
+            // Drop the before-image first. Any consumer of this notification
+            // must now read the committed manifest, at this new revision.
+            if !sourceConfigured || localSource?.id == storeID {
+                let extent = max(old.endTicks, endTicks ?? old.endTicks)
+                guard extent > 0 else { return }
+                publish(ranges: [.init(cameraID: old.timing.cameraID, epochID: old.timing.time.epochID,
+                    start: old.timing.time.canonicalUTC,
+                    end: old.timing.time.canonicalUTC + Double(extent) / Double(old.timing.timescale))])
+            }
+        }
+    }
+    private func publish(ranges: [FootageTagRange], reset: Bool = false) {
+        revision &+= 1
+        let event = FootageTagChange(instanceID: instanceID, revision: revision,
+            reset: reset, ranges: Self.coalesced(ranges))
+        let data = (try? Self.encode(event)) ?? (try? Self.encode(.init(instanceID: instanceID,
+            revision: revision, reset: true, ranges: [])))
+        if let data, !stopped { for subscriber in subscribers.values { subscriber.offer(data) } }
     }
     func snapshotToken() throws -> Token {
         try locked {
-            guard !stopped, mutations == 0 else { throw ServiceError(.unavailable, "Footage tags are changing; retry the snapshot.") }
+            guard !stopped else { throw ServiceError(.unavailable, "Footage tag service stopped.") }
             return Token(generation: generation, revision: revision)
         }
     }
     func validate(_ token: Token) throws {
         try locked {
-            guard !stopped, mutations == 0, token.generation == generation, token.revision == revision else {
-                throw ServiceError(.unavailable, "Footage tags changed during the snapshot; retry the range.")
+            guard !stopped, token.generation == generation else {
+                throw ServiceError(.unavailable, "Footage tag read view changed; retry the range.")
             }
         }
     }
-    /// A short edit is contention, not an unavailable recorder. Wait for an idle
-    /// generation and discard any read that overlaps an edit, including errors
-    /// caused by its intermediate state. The caller's deadline and admission
-    /// limit still apply; writers never wait for readers to finish.
-    func readSnapshot<Value>(work: MediaWork, read: () throws -> Value) throws -> (Token, Value) {
+    /// Copy the small temporary layer under a short lock, then read SQLite
+    /// without holding it. Installation/removal races retry both values and
+    /// errors; an ongoing write keeps a stable generation and never blocks reads.
+    func readLocalSnapshot<Value>(storeID: String, configuration: RecordingStoreConfiguration? = nil, work: MediaWork,
+                                  read: ([String: LocalTagReadSnapshot]) throws -> Value) throws -> (Token, Value) {
         while true {
-            let token = try locked {
-                while true {
-                    try work.check()
-                    guard !stopped else { throw ServiceError(.unavailable, "Footage tag service stopped.") }
-                    if mutations == 0 { return Token(generation: generation, revision: revision) }
-                    // Cancellation and peer closure do not signal this condition.
-                    _ = lock.wait(until: Date().addingTimeInterval(min(0.05,
-                        max(0, work.deadline - ProcessInfo.processInfo.systemUptime))))
-                }
-            }
-            let result = Result { try read() }
             try work.check()
-            let current = locked {
-                !stopped && mutations == 0 && token.generation == generation && token.revision == revision
+            let (token, before) = try locked {
+                guard !stopped else { throw ServiceError(.unavailable, "Footage tag service stopped.") }
+                guard !sourceConfigured || (localSource?.id == storeID && (configuration == nil || localSource == configuration)) else {
+                    throw ServiceError(.unavailable, "Local tag source changed; retry the snapshot.")
+                }
+                return (Token(generation: generation, revision: revision), overlays[storeID] ?? [:])
             }
-            if current { return (token, try result.get()) }
+            let result = Result { try read(before) }
+            try work.check()
+            if locked({ !stopped && token.generation == generation }) { return (token, try result.get()) }
         }
     }
     func subscribe(_ fd: Int32, authorize: @escaping () -> Bool) throws {
@@ -785,7 +823,7 @@ final class FootageTagEvents: @unchecked Sendable {
     }
     func stop() {
         let values = locked {
-            stopped = true; lock.broadcast()
+            stopped = true
             let values = Array(subscribers.values); subscribers.removeAll(); return values
         }
         values.forEach { $0.stop() }

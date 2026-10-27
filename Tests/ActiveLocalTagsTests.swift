@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import Darwin
+import SQLite3
 
 final class ActiveLocalTagsTests: XCTestCase {
     private struct Fixture {
@@ -18,13 +19,15 @@ final class ActiveLocalTagsTests: XCTestCase {
                 identity: .init(storeID: configuration.id, cameraID: camera), owner: geteuid(), readOnly: true))
         }
     }
-    private func fixture(duration: String = "1m", shortNextInterval: Bool = false) throws -> Fixture {
+    private func fixture(duration: String = "1m", shortNextInterval: Bool = false,
+                         tagEvents: FootageTagEvents? = nil,
+                         before: @escaping (LocalRecordingStore.Operation, String?) throws -> Void = { _, _ in }) throws -> Fixture {
         let root = "/private/tmp/hbnvr-active-tags-" + UUID().uuidString
         try SecureFiles.ensureDirectory(root, owner: geteuid(), mode: 0o700)
         var configuration = try StoreTests().config(root + "/local")
         configuration.shardDuration = duration
-        var hooks = LocalRecordingStore.Hooks(); hooks.automaticMaintenance = false
-        let store = try LocalRecordingStore(configuration: configuration, hooks: hooks)
+        var hooks = LocalRecordingStore.Hooks(); hooks.automaticMaintenance = false; hooks.before = before
+        let store = try LocalRecordingStore(configuration: configuration, hooks: hooks, tagEvents: tagEvents)
         addTeardownBlock { _ = store.finish(timeout: 30); try? FileManager.default.removeItem(atPath: root) }
         let camera = UUID().uuidString, epoch = UUID().uuidString
         let start = Date().timeIntervalSince1970 - 3600
@@ -115,6 +118,63 @@ final class ActiveLocalTagsTests: XCTestCase {
         f.append(8..<12)
         XCTAssertEqual(try f.store.pendingTagSnapshots().first?.frames, 12)
         XCTAssertNil(f.store.snapshot().lastError)
+    }
+
+    func testActiveTagEditServesManifestCheckpointUntilWriterPublishes() throws {
+        let events = FootageTagEvents(instanceID: UUID().uuidString)
+        var expected: LocalTagReadSnapshot?, observed = false
+        let f = try fixture(tagEvents: events) { operation, _ in
+            guard case .editTags = operation else { return }
+            let previous = try XCTUnwrap(expected)
+            let (token, captured) = try events.readLocalSnapshot(storeID: previous.timing.storeID, work: MediaWork()) {
+                try XCTUnwrap($0[previous.timing.shardID])
+            }
+            XCTAssertEqual(token.revision, 0)
+            XCTAssertEqual(captured.endTicks, previous.endTicks)
+            XCTAssertEqual(captured.tags, previous.tags)
+            observed = true
+        }
+        f.append(0..<8)
+        let pending = try XCTUnwrap(f.store.pendingTagSnapshots().first)
+        let (_, reader) = try f.index(), row = try XCTUnwrap(reader.recordings().first)
+        expected = .init(timing: row.timing, endTicks: row.endTicks, tags: try reader.historicalTags(id: row.id))
+        try f.store.commitPendingTags([.init(snapshot: pending, overrides: [
+            .init(start: 0, end: pending.endTicks, key: "private", value: "true")
+        ])], work: MediaWork())
+        XCTAssertTrue(observed)
+        let (token, empty) = try events.readLocalSnapshot(storeID: f.configuration.id, work: MediaWork()) { $0.isEmpty }
+        XCTAssertTrue(empty)
+        XCTAssertEqual(token.revision, 1)
+        XCTAssertEqual(try reader.historicalTags(id: row.id)?.tags(at: 0)?["private"], "true")
+        XCTAssertEqual(try f.store.pendingTagSnapshots().first?.tags.tags(at: 0)?["private"], "true")
+    }
+
+    func testFailedActiveTagEditReleasesUnchangedCheckpoint() throws {
+        let events = FootageTagEvents(instanceID: UUID().uuidString)
+        let f = try fixture(tagEvents: events)
+        f.append(0..<8)
+        let pending = try XCTUnwrap(f.store.pendingTagSnapshots().first)
+        let (directory, reader) = try f.index()
+        let checkpoint = try XCTUnwrap(reader.recordings().first)
+        let original = try reader.historicalTags(id: pending.timing.shardID)
+        var sql: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(directory.path + "/" + LocalRecordingManifest.filename, &sql), SQLITE_OK)
+        defer { sqlite3_close(sql) }
+        XCTAssertEqual(sqlite3_exec(sql, """
+            CREATE TRIGGER fail_active_tags BEFORE UPDATE OF tags_json ON recordings
+            BEGIN SELECT RAISE(ABORT, 'injected active tag failure'); END
+            """, nil, nil, nil), SQLITE_OK)
+        XCTAssertThrowsError(try f.store.commitPendingTags([.init(snapshot: pending, overrides: [
+            .init(start: 0, end: pending.endTicks, key: "private", value: "true")
+        ])], work: MediaWork()))
+        let (_, empty) = try events.readLocalSnapshot(storeID: f.configuration.id, work: MediaWork()) { $0.isEmpty }
+        XCTAssertTrue(empty)
+        XCTAssertEqual(try reader.recordings().first?.endTicks, checkpoint.endTicks)
+        XCTAssertEqual(try reader.historicalTags(id: pending.timing.shardID), original)
+        XCTAssertEqual(try f.store.pendingTagSnapshots().first?.tags, pending.tags)
+        XCTAssertEqual(sqlite3_exec(sql, "DROP TRIGGER fail_active_tags", nil, nil, nil), SQLITE_OK)
+        f.append(8..<12)
+        XCTAssertEqual(try f.store.pendingTagSnapshots().first?.frames, 12)
     }
 
     func testAccumulatorRejectsCombinedTagLimitWithoutLosingPreviousChanges() throws {
